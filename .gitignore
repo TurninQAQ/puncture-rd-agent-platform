@@ -25,3 +25,4 @@ dist/
 .vscode/
 trace-output/
 eval-output/
+/var/

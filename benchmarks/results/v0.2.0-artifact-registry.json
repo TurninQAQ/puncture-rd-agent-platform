@@ -1,0 +1,39 @@
+{
+  "benchmark_date_utc": "2026-07-10",
+  "source_ref": "v0.2.0",
+  "environment": {
+    "platform": "Linux-5.15.0-185-generic-x86_64-with-glibc2.35",
+    "python": "3.10.12"
+  },
+  "memory": {
+    "records": 10000,
+    "setup_seconds": 0.341834,
+    "metadata_lookup_us": {
+      "p50": 4.735,
+      "p95": 5.773
+    },
+    "idempotency_lookup_us": {
+      "p50": 15.619,
+      "p95": 20.279
+    }
+  },
+  "sqlite": {
+    "records": 10000,
+    "setup_seconds": 13.180656,
+    "metadata_lookup_us": {
+      "p50": 129.951,
+      "p95": 136.703
+    },
+    "idempotency_lookup_us": {
+      "p50": 146.926,
+      "p95": 153.949
+    }
+  },
+  "notes": [
+    "Single local process and local filesystem only.",
+    "The SQLite result is not a PostgreSQL, MinIO, multi-node, or production-SLA claim.",
+    "A dedicated case/idempotency/status index reduced an earlier SQLite lookup p95 from about 3377 us to below 200 us in this environment.",
+    "The final SQLite measurement includes database/WAL/SHM permission checks on every transaction."
+  ],
+  "schema_version": "1"
+}

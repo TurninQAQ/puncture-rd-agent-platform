@@ -132,7 +132,7 @@ sha256(tool_name + tool_version + sorted_input_artifact_ids
 
 ```bash
 python3 run_tests.py
-python3 -m unittest discover -s tests/artifacts -p 'test_*.py' -v
+PYTHONPATH="$PWD/src:$PWD" python3 -m unittest discover -s tests/artifacts -p 'test_*.py' -v
 ```
 
 ## 10. Acceptance
@@ -142,3 +142,19 @@ python3 -m unittest discover -s tests/artifacts -p 'test_*.py' -v
 - AVAILABLE 不可覆盖，INVALID/MISSING 制品不可复用，URI 不向 LLM/API 元数据泄漏。
 - 任一输出都能追溯到输入 artifact、工具版本、参数和几何指纹。
 - 实现者提交测试结果、性能基线、已知限制和契约变更声明。
+
+## 11. v0.2.0 implementation profile
+
+The checked-in implementation now contains:
+
+- `InMemoryArtifactRegistry`: deterministic test double with case-scoped idempotency;
+- `SQLiteArtifactRegistry`: durable single-node metadata registry using WAL, foreign keys, busy timeout, `BEGIN IMMEDIATE`, conditional updates and active-scope uniqueness;
+- `LocalArtifactStore`: same-filesystem private staging, service-side SHA-256, fsync and atomic immutable publication;
+- `ArtifactPublicationService`: one-process coordination of registration, object publication, finalization, authorized reads and redacted access audit;
+- canonical JSON and tool invocation idempotency-key generation;
+- recursive persisted-lineage cycle detection;
+- restart, concurrency, lock-timeout, rollback, traversal, symlink, orphan-cleanup and 10k benchmark evidence.
+
+This profile is intentionally limited to one application node and one local storage volume. It is suitable for development, interview demonstration and controlled internal single-node deployment. It is not HA. Multiple API/Celery workers or shared remote storage require PostgreSQL plus MinIO/S3 leases/transactions while preserving the same contracts and tests.
+
+Benchmark evidence: `benchmarks/results/v0.2.0-artifact-registry.json`.

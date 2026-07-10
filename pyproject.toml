@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "puncture-rd-agent-platform"
-version = "0.1.0"
+version = "0.2.0"
 description = "Contract-first scaffold for an internal puncture robotics R&D agent"
 requires-python = ">=3.10"
 dependencies = []
@@ -22,6 +22,18 @@ implementation = [
 ]
 test = ["pytest>=8.0"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
+[tool.setuptools]
+packages = [
+  "contracts",
+  "puncture_agent",
+  "puncture_agent.agent",
+  "puncture_agent.api",
+  "puncture_agent.artifacts",
+  "puncture_agent.mocks",
+  "puncture_agent.model_gateway",
+  "puncture_agent.observability",
+  "puncture_agent.rag",
+  "puncture_agent.runtime",
+  "puncture_agent.tooling",
+]
+package-dir = { contracts = "contracts", puncture_agent = "src/puncture_agent" }

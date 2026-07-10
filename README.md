@@ -2,7 +2,7 @@
 
 企业内部穿刺机器人研发协同 Agent 的 Contract-First 骨架工程。
 
-本仓库当前阶段只提供：
+本仓库当前提供：
 
 - 固定的输入输出契约；
 - 10 个算法工具的 Stub/Mock；
@@ -10,8 +10,9 @@
 - 可运行的 Mock 端到端流程；
 - Contract Tests；
 - 可单独交给其他模型实现的任务卡与验收文档。
+- 已实现的 Module 0：SQLite 持久化 Artifact Registry、原子本地对象存储、幂等发布与访问审计。
 
-当前阶段不实现：真实 MCS 解析、TensorRT 推理、医学图像算法、路径规划、安全评估、Qwen/vLLM 部署、Elasticsearch RAG 或真实 LangGraph。
+当前仍未实现：真实 MCS 解析、TensorRT 推理、医学图像算法、路径规划、安全评估、Qwen/vLLM 部署、Elasticsearch RAG 或真实 LangGraph。后续按 `docs/versioning.md` 分模块实现和发布。
 
 ## Core rule
 
@@ -26,7 +27,7 @@ python3 run_tests.py
 PYTHONPATH="$PWD/src:$PWD" python3 -m puncture_agent.api.demo
 ```
 
-当前基线：101 项标准库测试通过；Mock Demo 会串联 Qwen Gateway、RAG、Agent Graph、工具调用、确定性 Verifier 和 Run Event。
+当前基线：172 项标准库测试通过；Mock Demo 会串联 Qwen Gateway、RAG、Agent Graph、工具调用、确定性 Verifier 和 Run Event。
 
 ## Reading order
 
@@ -35,10 +36,11 @@ PYTHONPATH="$PWD/src:$PWD" python3 -m puncture_agent.api.demo
 3. `docs/technology-stack.md`
 4. `docs/open-source-baseline.md`
 5. `docs/module-delegation-playbook.md`
-6. `contracts/README.md`
-7. 对应的 `specs/*.md`
-8. 对应的 `tasks/task-*.md`
-9. Contract Tests
+6. `docs/versioning.md`
+7. `contracts/README.md`
+8. 对应的 `specs/*.md`
+9. 对应的 `tasks/task-*.md`
+10. Contract Tests
 
 ## Module implementation order
 

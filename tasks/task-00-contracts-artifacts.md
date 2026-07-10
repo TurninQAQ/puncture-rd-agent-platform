@@ -41,7 +41,7 @@
 
 ```bash
 python3 run_tests.py
-python3 -m unittest discover -s tests/artifacts -p 'test_*.py' -v
+PYTHONPATH="$PWD/src:$PWD" python3 -m unittest discover -s tests/artifacts -p 'test_*.py' -v
 ```
 
 ## Forbidden

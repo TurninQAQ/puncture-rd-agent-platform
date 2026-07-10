@@ -93,9 +93,15 @@ class InMemoryArtifactRegistry:
 
     def __init__(self) -> None:
         self._records: dict[str, _ArtifactRecord] = {}
-        self._available_by_idempotency_key: dict[str, str] = {}
+        self._artifact_by_idempotency_scope: dict[tuple[str, str], str] = {}
         self._children: dict[str, set[str]] = {}
         self._lock = RLock()
+
+    @property
+    def coordination_key(self) -> str:
+        """Stable only for this in-process registry instance."""
+
+        return f"memory-registry:{id(self)}"
 
     def begin_registration(
         self,
@@ -117,11 +123,36 @@ class InMemoryArtifactRegistry:
             raise ArtifactRegistryError("INVALID_ARGUMENT", "required registration field is empty")
         if len(parent_artifact_ids) != len(set(parent_artifact_ids)):
             raise ArtifactRegistryError("INVALID_ARGUMENT", "parent artifact IDs must be unique")
+        if not isinstance(artifact_type, ArtifactType):
+            raise ArtifactRegistryError("INVALID_ARGUMENT", "artifact_type must be canonical ArtifactType")
+        metadata_value = dict(metadata or {})
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in metadata_value.items()
+        ):
+            raise ArtifactRegistryError("INVALID_ARGUMENT", "metadata keys and values must be strings")
 
         with self._lock:
-            reusable = self.find_available_by_idempotency_key(idempotency_key)
-            if reusable is not None:
-                return reusable.to_public_view()
+            scope = (case_id, idempotency_key)
+            existing_id = self._artifact_by_idempotency_scope.get(scope)
+            if existing_id is not None:
+                existing = self._records[existing_id]
+                if not self._registration_matches(
+                    existing,
+                    artifact_type=artifact_type,
+                    producer_name=producer_name,
+                    producer_version=producer_version,
+                    parent_artifact_ids=parent_artifact_ids,
+                    geometry=geometry,
+                    metadata=metadata_value,
+                ):
+                    raise ArtifactRegistryError(
+                        "IDEMPOTENCY_CONFLICT",
+                        "idempotency key was already used with different registration inputs",
+                    )
+                if existing.status in {ArtifactStatus.PENDING, ArtifactStatus.AVAILABLE}:
+                    return existing.to_public_view()
+                self._artifact_by_idempotency_scope.pop(scope, None)
 
             new_id = artifact_id or f"art-{uuid4().hex}"
             if new_id in self._records:
@@ -148,11 +179,12 @@ class InMemoryArtifactRegistry:
                 idempotency_key=idempotency_key,
                 producer_name=producer_name,
                 producer_version=producer_version,
-                parent_artifact_ids=tuple(parent_artifact_ids),
+                parent_artifact_ids=tuple(sorted(parent_artifact_ids)),
                 geometry=geometry,
-                metadata=dict(metadata or {}),
+                metadata=metadata_value,
             )
             self._records[new_id] = record
+            self._artifact_by_idempotency_scope[scope] = new_id
             for parent_id in parent_artifact_ids:
                 self._children.setdefault(parent_id, set()).add(new_id)
             self._children.setdefault(new_id, set())
@@ -174,10 +206,13 @@ class InMemoryArtifactRegistry:
             if record.status is not ArtifactStatus.PENDING:
                 raise ArtifactRegistryError("INVALID_STATE", f"cannot finalize {record.status.value} artifact")
 
-            existing_id = self._available_by_idempotency_key.get(record.idempotency_key)
+            scope = (record.case_id, record.idempotency_key)
+            existing_id = self._artifact_by_idempotency_scope.get(scope)
             if existing_id is not None and existing_id != artifact_id:
                 existing = self._records[existing_id]
                 if existing.checksum_sha256 != checksum:
+                    record.status = ArtifactStatus.INVALID
+                    record.failure_reason = "IDEMPOTENCY_CHECKSUM_CONFLICT"
                     raise ArtifactRegistryError("IDEMPOTENCY_CONFLICT", "idempotency key maps to different content")
                 record.status = ArtifactStatus.INVALID
                 record.failure_reason = "DUPLICATE_OUTPUT"
@@ -186,7 +221,7 @@ class InMemoryArtifactRegistry:
             record.status = ArtifactStatus.AVAILABLE
             record.checksum_sha256 = checksum
             record.size_bytes = size_bytes
-            self._available_by_idempotency_key[record.idempotency_key] = artifact_id
+            self._artifact_by_idempotency_scope[scope] = artifact_id
             return self._to_ref(record)
 
     def fail(self, artifact_id: str, reason: str) -> ArtifactPublicView:
@@ -200,6 +235,7 @@ class InMemoryArtifactRegistry:
                 raise ArtifactRegistryError("INVALID_STATE", "only PENDING artifacts can fail")
             record.status = ArtifactStatus.INVALID
             record.failure_reason = reason
+            self._release_idempotency_claim(record)
             return record.to_public_view()
 
     def invalidate(self, artifact_id: str, reason: str) -> ArtifactPublicView:
@@ -211,7 +247,7 @@ class InMemoryArtifactRegistry:
                 raise ArtifactRegistryError("INVALID_STATE", "only AVAILABLE artifacts can be invalidated")
             record.status = ArtifactStatus.INVALID
             record.failure_reason = reason
-            self._available_by_idempotency_key.pop(record.idempotency_key, None)
+            self._release_idempotency_claim(record)
             return record.to_public_view()
 
     def mark_missing(self, artifact_id: str, reason: str) -> ArtifactPublicView:
@@ -225,7 +261,7 @@ class InMemoryArtifactRegistry:
                 raise ArtifactRegistryError("INVALID_STATE", "only AVAILABLE artifacts can become MISSING")
             record.status = ArtifactStatus.MISSING
             record.failure_reason = reason
-            self._available_by_idempotency_key.pop(record.idempotency_key, None)
+            self._release_idempotency_claim(record)
             return record.to_public_view()
 
     def get_metadata(self, artifact_id: str) -> ArtifactPublicView:
@@ -241,19 +277,43 @@ class InMemoryArtifactRegistry:
                 raise ArtifactRegistryError("PERMISSION_DENIED", "principal cannot resolve artifact URI")
             return record.internal_uri
 
-    def find_available_by_idempotency_key(self, key: str) -> ArtifactRef | None:
+    def find_available_by_idempotency_key(
+        self,
+        key: str,
+        *,
+        case_id: str | None = None,
+    ) -> ArtifactRef | None:
         with self._lock:
-            artifact_id = self._available_by_idempotency_key.get(key)
-            if artifact_id is None:
+            if case_id is not None:
+                artifact_ids = [self._artifact_by_idempotency_scope.get((case_id, key))]
+            else:
+                artifact_ids = [
+                    artifact_id
+                    for (scoped_case_id, scoped_key), artifact_id
+                    in self._artifact_by_idempotency_scope.items()
+                    if scoped_key == key
+                ]
+            artifact_ids = [artifact_id for artifact_id in artifact_ids if artifact_id is not None]
+            if not artifact_ids:
                 return None
-            record = self._records.get(artifact_id)
+            if len(set(artifact_ids)) > 1:
+                raise ArtifactRegistryError(
+                    "AMBIGUOUS_IDEMPOTENCY_KEY",
+                    "case_id is required when an idempotency key exists in multiple cases",
+                )
+            record = self._records.get(artifact_ids[0])
             if record is None or record.status is not ArtifactStatus.AVAILABLE:
                 return None
             return self._to_ref(record)
 
     # Backward-compatible name used by the written specification.
-    def find_ready_by_idempotency_key(self, key: str) -> ArtifactRef | None:
-        return self.find_available_by_idempotency_key(key)
+    def find_ready_by_idempotency_key(
+        self,
+        key: str,
+        *,
+        case_id: str | None = None,
+    ) -> ArtifactRef | None:
+        return self.find_available_by_idempotency_key(key, case_id=case_id)
 
     def get_lineage(self, artifact_id: str) -> ArtifactLineage:
         with self._lock:
@@ -269,6 +329,33 @@ class InMemoryArtifactRegistry:
         if record is None:
             raise ArtifactRegistryError("NOT_FOUND", f"artifact {artifact_id} was not found")
         return record
+
+    def _release_idempotency_claim(self, record: _ArtifactRecord) -> None:
+        scope = (record.case_id, record.idempotency_key)
+        if self._artifact_by_idempotency_scope.get(scope) == record.artifact_id:
+            self._artifact_by_idempotency_scope.pop(scope, None)
+
+    @staticmethod
+    def _registration_matches(
+        record: _ArtifactRecord,
+        *,
+        artifact_type: ArtifactType,
+        producer_name: str,
+        producer_version: str,
+        parent_artifact_ids: tuple[str, ...],
+        geometry: VolumeGeometry | None,
+        metadata: Mapping[str, str] | None,
+    ) -> bool:
+        geometry_fingerprint = geometry.geometry_fingerprint if geometry else None
+        record_fingerprint = record.geometry.geometry_fingerprint if record.geometry else None
+        return (
+            record.artifact_type is artifact_type
+            and record.producer_name == producer_name
+            and record.producer_version == producer_version
+            and tuple(sorted(record.parent_artifact_ids)) == tuple(sorted(parent_artifact_ids))
+            and record_fingerprint == geometry_fingerprint
+            and record.metadata == dict(metadata or {})
+        )
 
     @staticmethod
     def _to_ref(record: _ArtifactRecord) -> ArtifactRef:
