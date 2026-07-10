@@ -29,3 +29,34 @@ jobs:
         run: bash -n deploy/qwen-vllm/entrypoint.sh
       - name: Test
         run: python run_tests.py
+
+  release-tag:
+    needs: standard-library-tests
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      startsWith(github.event.head_commit.message, 'release: v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate release marker and publish annotated tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml | head -n 1)"
+          tag="v${version}"
+          subject="$(git log -1 --pretty=%s)"
+          test "$subject" = "release: ${tag}"
+          test -f "docs/releases/${tag}.md"
+          if git ls-remote --exit-code origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "${tag} already exists"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "${tag}: CI-verified module release"
+          git push origin "refs/tags/${tag}"

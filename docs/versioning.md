@@ -37,5 +37,11 @@ A module is released only after:
 7. commit and tag are pushed to `origin`;
 8. the pushed commit/tag are verified against the remote.
 
+A commit whose exact subject is `release: vX.Y.Z` delegates steps 6–7 to CI.
+The release-tag job runs only after the Python 3.10/3.11/3.12 test matrix passes,
+validates that `pyproject.toml` and `docs/releases/vX.Y.Z.md` agree, and then
+publishes the annotated tag. The tag's presence therefore records a green remote
+release gate rather than a local-only assertion.
+
 Small fixes within an unfinished module may be pushed as ordinary commits, but
 the version tag is created only when the module acceptance gate is complete.
