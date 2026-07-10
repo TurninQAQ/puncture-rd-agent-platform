@@ -46,7 +46,7 @@ def validate_base_url(base_url: str) -> tuple[str, str, int]:
         raise ValueError("base_url must not contain credentials")
     if parsed.query or parsed.fragment:
         raise ValueError("base_url must not contain a query or fragment")
-    if not parsed.path.startswith("/"):
+    if parsed.path and not parsed.path.startswith("/"):
         raise ValueError("base_url path is invalid")
     effective_port = port if port is not None else (443 if scheme == "https" else 80)
     return scheme, parsed.hostname.lower(), effective_port

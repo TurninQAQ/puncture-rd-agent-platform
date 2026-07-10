@@ -23,6 +23,7 @@ Semantic Versioning while it is below 1.0.
 ### Verification
 
 - Local dependency-free run: 241 passed and 7 gated skips out of 248 tests; CI installs pinned `httpx` to execute 2 transport-integration tests, while 5 live vLLM tests remain `NOT_RUN` without a private endpoint.
+- A source-pinned `httpx==0.28.1` compatibility run executes the real pooled-client tests: 243 passed and only the 5 live vLLM tests skipped.
 - Compile, shell syntax, whitespace and repository secret-pattern checks pass.
 - No live GPU latency, throughput or memory claim is made by this source release.
 
