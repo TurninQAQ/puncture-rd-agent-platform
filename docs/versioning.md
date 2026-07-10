@@ -16,7 +16,13 @@ The repository uses semantic versions and one release per completed module.
 | `v0.8.0` | OpenTelemetry and production Eval pipeline |
 
 Detailed release evidence is stored under `docs/releases/`, for example
-`docs/releases/v0.2.0.md`.
+`docs/releases/v0.2.0.md` and `docs/releases/v0.3.0.md`.
+
+Source release and operational deployment evidence are separate. A module may be
+released when its code, offline protocol tests and deployable assets pass the
+completion gate, while a hardware-specific live deployment remains explicitly
+`NOT_RUN`. Such a release must not publish latency, throughput, GPU-memory or
+model-validity claims until the live evidence record is complete.
 
 ## Completion gate
 

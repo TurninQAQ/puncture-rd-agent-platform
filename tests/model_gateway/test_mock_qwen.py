@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sys
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +23,7 @@ from puncture_agent.model_gateway import (  # noqa: E402
     VllmGatewayConfig,
     VllmModelGateway,
 )
+from puncture_agent.model_gateway.http_transport import HttpResponse  # noqa: E402
 
 
 TOOL = ToolDefinition(
@@ -139,6 +142,46 @@ class MockQwenGatewayTests(unittest.TestCase):
         self.assertEqual(events[-1].event_type, "completed")
         self.assertEqual(events[-1].response.text, "one two three")
 
+    def test_stream_failures_are_structured_terminal_events(self) -> None:
+        wrong_mode = list(
+            self.gateway.stream(
+                ModelRequest(
+                    request_id="stream-wrong-mode",
+                    messages=(ChatMessage(role="user", content="hello"),),
+                )
+            )
+        )
+        self.assertEqual(len(wrong_mode), 1)
+        self.assertEqual(wrong_mode[0].event_type, "error")
+        self.assertEqual(wrong_mode[0].error["code"], "MODEL_REQUEST_REJECTED")
+
+        forced = list(
+            self.gateway.stream(
+                ModelRequest(
+                    request_id="stream-forced-error",
+                    messages=(ChatMessage(role="user", content="fail"),),
+                    metadata={"force_error": {"code": "MODEL_TIMEOUT", "retryable": True}},
+                    stream=True,
+                )
+            )
+        )
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(forced[0].event_type, "error")
+        self.assertEqual(forced[0].error["code"], "MODEL_TIMEOUT")
+        self.assertTrue(forced[0].error["retryable"])
+
+    def test_generate_rejects_stream_mode(self) -> None:
+        with self.assertRaises(ModelGatewayError) as context:
+            self.gateway.generate(
+                ModelRequest(
+                    request_id="generate-wrong-mode",
+                    messages=(ChatMessage(role="user", content="hello"),),
+                    stream=True,
+                )
+            )
+        self.assertEqual(context.exception.code, "MODEL_REQUEST_REJECTED")
+        self.assertEqual(context.exception.details["attempts"], 0)
+
     def test_forced_retryable_failure_is_available_for_graph_tests(self) -> None:
         request = ModelRequest(
             request_id="error-1",
@@ -150,10 +193,33 @@ class MockQwenGatewayTests(unittest.TestCase):
         self.assertEqual(context.exception.code, "MODEL_TIMEOUT")
         self.assertTrue(context.exception.retryable)
 
-    def test_production_adapter_remains_an_explicit_stub(self) -> None:
-        adapter = VllmModelGateway(VllmGatewayConfig(base_url="http://127.0.0.1:8000/v1", model="qwen"))
-        with self.assertRaises(NotImplementedError):
-            adapter.health()
+    def test_production_adapter_transition_keeps_mock_gpu_independent(self) -> None:
+        class ModelListTransport:
+            def request(
+                self,
+                method: str,
+                path: str,
+                *,
+                headers: Mapping[str, str],
+                json_body: Mapping[str, Any] | None,
+                timeout: float,
+                stream: bool = False,
+            ) -> HttpResponse:
+                self.last_request = (method, path, headers, json_body, timeout, stream)
+                return HttpResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=b'{"object":"list","data":[{"id":"qwen"}]}',
+                )
+
+        transport = ModelListTransport()
+        adapter = VllmModelGateway(
+            VllmGatewayConfig(base_url="http://127.0.0.1:8000/v1", model="qwen"),
+            transport=transport,
+        )
+
+        self.assertEqual(adapter.health().status, "UP")
+        self.assertEqual(transport.last_request[0:2], ("GET", "/models"))
 
 
 if __name__ == "__main__":

@@ -1,32 +1,36 @@
-# Task 01 — Implement the Real Qwen / vLLM Model Gateway
+# Task 01 — Complete the Contract-v2 Qwen / vLLM Gateway
 
 ## Copyable assignment
 
-You are implementing the production model adapter for an existing contract-first
-Agent scaffold. Replace only the explicit `VllmModelGateway` stub. Preserve the
-deterministic mock and every public input/output contract so other modules continue
-to integrate without changes.
+Implement and verify the production protocol adapter that connects this
+contract-first Agent repository to a private vLLM OpenAI-compatible endpoint
+serving one exact Qwen model ID. The work must remain usable without a GPU through
+fake-transport tests, while live deployment and benchmark proof stay explicitly
+gated.
 
-No medical imaging algorithm is part of this task.
+Do not implement medical imaging algorithms, MCP execution, RAG, LangGraph, or a
+cloud-model fallback in this task.
 
-## Read these files first
-
-Read completely, in this order:
+## Read completely before editing
 
 1. `specs/qwen-vllm-service.md`
-2. `src/puncture_agent/model_gateway/models.py`
-3. `src/puncture_agent/model_gateway/client.py`
-4. `src/puncture_agent/model_gateway/mock_qwen.py`
-5. `tests/contract/test_model_rag_contracts.py`
-6. `tests/model_gateway/test_mock_qwen.py`
+2. `docs/testing-qwen-vllm.md`
+3. `src/puncture_agent/model_gateway/models.py`
+4. `src/puncture_agent/model_gateway/client.py`
+5. `src/puncture_agent/model_gateway/http_transport.py`
+6. `src/puncture_agent/model_gateway/mock_qwen.py`
+7. `tests/contract/test_model_rag_contracts.py`
+8. `tests/model_gateway/test_mock_qwen.py`
+9. `tests/model_gateway/test_vllm_gateway.py`
+10. `docs/qwen-deployment-runbook.md`
 
-Do not infer a different interface from a framework tutorial. The repository
-contracts take precedence.
+Repository contracts take precedence over framework tutorials. If implementation
+and specification disagree, report the exact disagreement before broadening the
+public contract.
 
-## Goal
+## Goal and callable interface
 
-Implement a Qwen model gateway that talks to a private vLLM OpenAI-compatible
-endpoint and returns only normalized repository objects:
+Complete these methods:
 
 ```python
 health() -> GatewayHealth
@@ -34,243 +38,334 @@ generate(ModelRequest) -> ModelResponse
 stream(ModelRequest) -> Iterator[ModelStreamEvent]
 ```
 
+The public contract version is `MODEL_GATEWAY_CONTRACT_VERSION = "2"`.
+Provider client/response types must not escape `model_gateway/`.
+
 ## Allowed implementation area
 
-Primary area:
+Primary code and tests:
 
 ```text
 src/puncture_agent/model_gateway/
+tests/contract/test_model_rag_contracts.py
 tests/model_gateway/
 ```
 
-If a dependency or configuration file outside these paths must change, explain the
-reason before changing it. Do not modify RAG, graph, medical tools, or their tests.
+Deployment-specific work belongs under:
 
-Do not delete or weaken mock/contract tests. Do not replace tests with assertions
-that merely check “no exception.”
+```text
+deploy/qwen-vllm/
+docs/qwen-deployment-runbook.md
+```
 
-## Contracts that must remain unchanged
+Do not change RAG, graph, MCP, or medical-tool implementations. Do not delete or
+weaken existing assertions. A production dependency may be added only when the
+standard-library import path and offline tests remain usable.
 
-- `ChatMessage`
-- `ToolDefinition`
-- `ModelRequest`
-- `ToolCall`
-- `TokenUsage`
-- `ModelResponse`
-- `ModelStreamEvent`
-- `GatewayHealth`
-- `VllmGatewayConfig`
-- `ModelGatewayError` observable fields: `code`, `retryable`, `details`
-- the three `ModelGateway` methods
+## Fixed contract-v2 decisions
 
-You may add private helpers and new internal files. If you believe a public contract
-is insufficient, stop and report the exact missing field and caller impact instead
-of silently changing it.
+These decisions are complete. Do not reopen them inside the implementation.
+
+### 1. Assistant tool-call replay
+
+`ChatMessage.tool_calls` is a tuple of repository `ToolCall` objects and is legal
+only for the assistant role. Serialize it to OpenAI assistant `tool_calls`, with
+arguments as a strict JSON string. Preserve each call ID so following tool messages
+can reference it. Reject duplicate assistant call IDs locally.
+
+### 2. Tool mode versus structured-result mode
+
+`ModelRequest.tools` and `ModelRequest.response_schema` are mutually exclusive.
+Construction must fail before network I/O when both are supplied.
+
+### 3. Generate and stream methods
+
+- `generate()` accepts only `request.stream is False` and sends `stream=false`.
+- `stream()` accepts only `request.stream is True` and sends `stream=true`.
+- A mismatch raises local non-retryable
+  `ModelGatewayError(code="MODEL_REQUEST_REJECTED")` with `details.attempts=0`
+  and makes zero transport calls for `generate()`. For `stream()`, iteration must
+  yield that failure as the only structured terminal `error` event.
+
+### 4. One-choice policy
+
+The repository explicitly sends `n=1`. Non-stream responses must contain exactly
+one choice at integer index 0. Streaming frames may contain zero choices only for a usage
+frame; all other data frames contain exactly one choice at index 0. Multiple
+choices, missing/alternative indices, and malformed choices fail with
+`MODEL_PROTOCOL_ERROR`. Never concatenate or silently ignore alternatives.
+
+### 5. Exact model-ID policy
+
+`VllmGatewayConfig.model` is the exact served ID. Health requires that exact value
+in `/models`. Every completion/SSE response must report the same non-empty model
+ID. Missing or different IDs fail with `MODEL_PROTOCOL_ERROR`. Do not accept an
+alias or dynamically switch model.
+
+### 6. Unknown usage
+
+If usage exists, validate it and return `usage_known=True`. If it is absent, return
+zero counts with `usage_known=False`. Never represent unknown usage as known zero.
+
+### 7. Structured terminal stream errors
+
+`stream()` must return exactly one terminal event:
+
+- success: `ModelStreamEvent(event_type="completed", response=...)`;
+- failure: `ModelStreamEvent(event_type="error", error=...)`.
+
+The error object requires these fields: non-empty string `code`,
+non-empty safe string `message`, boolean `retryable`, and object `details`. The
+event has no delta, tool-call, or response payload.
+Do not expose `ModelGatewayError` to the iterator consumer. Initial transient
+failures may retry before any visible event. Once a text/tool event has been
+yielded, do not retry and do not emit `completed` after an error.
 
 ## Required implementation behavior
 
-### 1. Configuration and client lifecycle
+### A. Configuration and lifecycle
 
-- Use `VllmGatewayConfig.base_url`, `model`, `api_key`, `timeout_seconds`, and
-  `max_retries`.
-- Reuse a client/connection pool rather than constructing one per request.
-- Never log the API key.
-- Validate that the configured model is available during health probing.
-- Dependency choice may be the official OpenAI client, `httpx`, or a small standard
-  library transport, but provider objects must not escape this module.
+1. Validate `base_url` as HTTP(S), with host and without embedded credentials,
+   query, or fragment.
+2. Use `model`, `api_key`, optional `ca_bundle_path`, `timeout_seconds`, and
+   `max_retries` exactly. `timeout_seconds` is one total gateway-operation
+   deadline, including retries and the complete SSE lifetime.
+3. Reuse one bounded connection pool for the gateway lifetime.
+4. Provide deterministic close/context-manager behavior.
+5. Keep the API key out of source, logs, details, exception messages, fixtures,
+   and provider-body diagnostics.
 
-### 2. Request mapping
+### B. Transport security
 
-- Serialize system, user, assistant, and tool messages.
-- Preserve `name` and `tool_call_id` when present.
-- Convert `ToolDefinition` into OpenAI function-tool format.
-- Forward temperature and maximum token count.
-- Request provider-supported constrained JSON when `response_schema` is supplied.
-- Do not forward arbitrary `ModelRequest.metadata`; use an explicit allowlist if a
-  provider option is genuinely needed.
+1. Verify TLS certificates for HTTPS.
+2. Disable environment proxy inheritance.
+3. Reject cross-origin redirects; do not leak `Authorization` on redirects.
+4. Bound response bodies, SSE totals, and individual SSE events while reading.
+5. Normalize TLS failure as non-retryable `MODEL_TLS_ERROR` and URL/redirect/body
+   policy failure as non-retryable `MODEL_SECURITY_ERROR`.
+6. Reject CR or LF in `request_id` before constructing `X-Request-ID`.
+7. Normalize timeouts separately from connection failures.
 
-### 3. Non-streaming parsing
+### C. Request serialization
 
-- Parse plain assistant text.
-- Parse one or multiple tool calls.
-- Parse tool arguments from JSON strings to objects.
-- Reject an unknown tool name with `UNKNOWN_TOOL`.
-- Validate arguments against the corresponding request schema.
-- Parse and locally validate structured output.
-- Normalize finish reason and usage.
-- Measure latency using a monotonic clock.
-- Raise `EMPTY_MODEL_RESPONSE` when no usable payload exists.
+1. Serialize every role, optional name, tool-result call ID, and assistant history
+   call without data loss.
+2. Convert each `ToolDefinition` to OpenAI function-tool format.
+3. Forward only model, messages, temperature, max tokens, one-completion policy,
+   stream settings, tools, and response format.
+4. Never forward arbitrary `ModelRequest.metadata`.
+5. Reject non-JSON/NaN schema values before network I/O.
+6. Use OpenAI-style strict JSON Schema `response_format` for structured mode.
 
-### 4. Streaming parsing
+### D. Strict decoding
 
-- Parse SSE/provider chunks without exposing them directly.
-- Emit contiguous `sequence` numbers starting at zero.
-- Buffer fragmented tool names and argument JSON.
-- Emit a `tool_call` event only after a complete valid call is available.
-- Emit exactly one `completed` event on success.
-- On terminal failure, emit/raise consistently as documented; never emit a success
-  event afterward.
-- The completed event must carry the normalized final `ModelResponse`.
+Use a single strict JSON decoder for completion bodies, SSE payloads, tool
+arguments, and structured content. It must reject:
 
-### 5. Error and retry policy
+- duplicate object keys;
+- `NaN`, `Infinity`, and `-Infinity`;
+- invalid UTF-8;
+- a non-object where an object is required.
 
-Implement the table in `specs/qwen-vllm-service.md`. At minimum:
+Do not use a later dictionary conversion that has already discarded duplicate-key
+evidence.
 
-```text
-MODEL_TIMEOUT                 retryable
-MODEL_UNAVAILABLE             retryable
-MODEL_RATE_LIMITED            retryable
-MODEL_PERMISSION_DENIED       non-retryable
-MODEL_REQUEST_REJECTED        non-retryable
-MODEL_PROTOCOL_ERROR          non-retryable
-TOOL_ARGUMENT_PARSE_ERROR     non-retryable
-TOOL_ARGUMENT_SCHEMA_ERROR    non-retryable
-STRUCTURED_OUTPUT_SCHEMA_ERROR non-retryable
-EMPTY_MODEL_RESPONSE          non-retryable
-```
+### E. Non-stream response parsing
 
-Use bounded exponential backoff with jitter. Honor `Retry-After` if available.
-`max_retries` means retries after the first attempt. Include attempt count and safe
-provider status in error details.
+1. Enforce the exact one-choice/model rules.
+2. Parse ordinary text, including provider content-parts only when their shape is
+   explicitly supported.
+3. Parse one or multiple tool calls.
+4. Require unique, non-empty tool call IDs.
+5. Reject unoffered tools with `UNKNOWN_TOOL`.
+6. Parse arguments as strict JSON objects and validate against the exact offered
+   schema.
+7. Parse and locally validate structured output.
+8. Normalize finish reason and provider response ID.
+9. Return explicit known/unknown usage.
+10. Measure latency with a monotonic clock.
+11. Fail with `EMPTY_MODEL_RESPONSE` when no usable payload exists.
 
-Do not retry schema errors by silently asking the model to “fix JSON” inside the
-gateway. Higher-level Agent policy decides whether another generation is allowed.
+### F. Streaming parsing
 
-### 6. Health and observability
+1. Parse arbitrary UTF-8 and SSE byte fragmentation.
+2. Support comments, CRLF/LF, multi-line `data`, `[DONE]`, and usage-only frames.
+3. Enforce the exact choice/model policy on every relevant frame.
+4. Buffer tool call ID/name/argument fragments by non-negative tool index.
+5. Emit a tool event only after the complete call passes name, JSON, duplicate-ID,
+   and schema validation.
+6. Emit contiguous sequence numbers beginning at zero.
+7. Preserve text/tool calls/usage/provider ID in the final `ModelResponse`.
+8. Emit exactly one completed or structured error terminal event.
+9. After output visibility, normalize disconnect/timeout/protocol/schema failures
+   to an error event without retry.
 
-- Return `UP`, `DEGRADED`, or `DOWN` with configured model and provider.
-- Use a short health timeout.
-- Record model, provider response ID, request ID, retry count, latency, TTFT when
-  streaming, usage, and normalized error.
-- Redact secrets and configurable sensitive prompt/tool fields.
+### G. Retries and normalized failures
 
-## Suggested internal design
+Implement the matrix in `specs/qwen-vllm-service.md`, including HTTP 408, 429,
+500/502/503/504, TLS, security failures, and all non-retryable parse/schema codes.
 
-This is a suggestion, not a required filename layout:
+Rules:
 
-```text
-model_gateway/
-├── models.py                 # fixed
-├── client.py                 # interface + production class
-├── mock_qwen.py              # fixed deterministic mock
-├── serialization.py          # internal request mapper
-├── parsing.py                # internal response/SSE parser
-├── transport.py              # replaceable HTTP abstraction
-└── retry.py                  # bounded policy
-```
+- `max_retries` means retries after the first attempt;
+- exponential backoff and jitter are bounded;
+- a valid delta-seconds or HTTP-date `Retry-After` is honored and bounded;
+- attempts and safe status are added to details;
+- retry exhaustion is explicit;
+- no model switch or hidden “repair JSON” generation occurs;
+- no retry occurs after a visible stream event.
 
-Keep the HTTP transport injectable so unit tests can return scripted responses
-without network access.
+### H. Health and safe observability
 
-## Minimum unit tests to add
+`health()` calls `GET /models` with no generation, no retry, and a timeout no
+greater than five seconds.
 
-Use a fake transport or local fake server; unit tests must run without vLLM/GPU.
+- `UP`: exact configured model present;
+- `DEGRADED`: endpoint reachable but model-list shape/secondary checks invalid;
+- `DOWN`: unavailable, unauthorized/security failure, or exact model absent.
 
-### Success tests
+Expose only safe details. Record request ID, exact model, provider response ID,
+attempt count, normalized code, latency/TTFT, terminal state, and usage-known
+status. Do not record prompts, RAG text, tool arguments, or provider bodies.
 
-1. all message roles serialize correctly;
-2. tool definitions serialize to function-tool format;
-3. plain response maps to `ModelResponse`;
-4. single and multiple tool calls parse correctly;
-5. structured output passes local schema validation;
-6. usage and provider response ID are preserved;
-7. fragmented stream text reconstructs correctly;
-8. fragmented tool argument JSON reconstructs before emission;
-9. stream sequence is contiguous with one terminal event;
-10. health reports the configured model.
+## Required offline tests
 
-### Failure tests
+Tests use an injectable fake transport or local in-process fake. They require no
+network, model download, Docker, or GPU.
 
-1. unknown tool;
-2. malformed tool argument JSON;
-3. missing required tool property;
-4. unexpected property when additional properties are forbidden;
-5. structured output schema mismatch;
-6. empty provider response;
-7. timeout then success;
-8. HTTP 429 then success, including `Retry-After` handling;
-9. repeated HTTP 503 and retry exhaustion;
-10. HTTP 401/403 without retry;
-11. disconnect during SSE;
-12. missing configured model in health response;
-13. error/log representation does not contain a configured secret.
+### Contract/input tests
 
-For every failure test assert exact normalized code, `retryable`, number of attempts,
-and absence of an executable tool call.
+1. contract version is `2`;
+2. assistant replay accepts valid calls and rejects wrong role/duplicate IDs;
+3. tools and response schema are mutually exclusive;
+4. unknown usage sentinel is valid;
+5. error stream event requires exactly one structured payload;
+6. method/stream mismatch returns non-retryable `MODEL_REQUEST_REJECTED` with
+   attempts zero and causes zero transport calls;
+7. CR/LF request ID is blocked before HTTP.
 
-## Test commands
+### Serialization success tests
 
-Run from the repository root:
+1. every message role and optional field;
+2. assistant tool-call replay JSON shape;
+3. multiple tool definitions;
+4. structured `response_format`;
+5. metadata and secrets not forwarded;
+6. exact configured model and one-completion request policy.
+
+### Non-stream success tests
+
+1. plain text;
+2. one and multiple tool calls;
+3. structured output;
+4. provider response ID and latency;
+5. usage present (`usage_known=True`);
+6. usage absent (`usage_known=False`).
+
+### Fail-closed parser tests
+
+1. zero, multiple, non-object, and index-not-zero choices;
+2. missing/mismatched response model;
+3. malformed JSON and invalid UTF-8;
+4. duplicate JSON keys and non-finite values;
+5. unknown tool;
+6. malformed/non-object tool arguments;
+7. duplicate tool call IDs;
+8. missing/extra/wrong-type tool fields;
+9. structured output missing, malformed, or schema-invalid;
+10. inconsistent/negative usage;
+11. empty provider payload;
+12. oversized body.
+
+### Retry and security tests
+
+1. timeout and HTTP 408 then success;
+2. HTTP 429 then success for numeric and date `Retry-After`;
+3. repeated HTTP 503 until exact retry exhaustion;
+4. 401/403 without retry;
+5. 400/404/413/422 without retry;
+6. TLS/security failures without retry;
+7. environment proxy disabled;
+8. cross-origin redirect rejected without credential leak;
+9. error string/details/repr do not contain a configured secret or provider body.
+
+### Streaming tests
+
+1. UTF-8/SSE/text fragmentation;
+2. fragmented tool ID/name/arguments;
+3. usage-only frame;
+4. contiguous sequences and one completed event;
+5. one structured error event for pre-output exhaustion;
+6. mid-stream timeout/disconnect after a delta, with zero retry;
+7. malformed tool/schema/model/choice after a delta, with error and no completed;
+8. duplicate streamed call IDs;
+9. stream/event size limits;
+10. no executable tool event before complete validation.
+
+For failure tests assert the exact code, retryability, attempt count, transport call
+count, terminal event type, and absence of an executable invalid tool.
+
+## Offline commands
+
+Run from the repository root exactly as documented in
+`docs/testing-qwen-vllm.md`. At minimum:
 
 ```bash
 python3 tests/contract/test_model_rag_contracts.py -v
 python3 -m unittest discover -s tests/model_gateway -p 'test*.py' -v
-python3 -m unittest discover -s tests -p 'test*.py' -v
+python3 run_tests.py
+python3 -m compileall -q contracts src tests
 ```
 
-If the full discovery command does not include `tests/contract` because the test
-directory is not yet a package, the direct contract command is mandatory.
+Run the deployment asset checks and shell syntax checks described in the testing
+document when deployment files change.
 
-Optional live tests must be skipped by default and require:
+## Optional live verification
+
+Live work is skipped by default. It requires explicit opt-in and an already
+approved private endpoint. Use only sanitized prompts and aggregate evidence.
+
+Required environment contract:
 
 ```text
 RUN_VLLM_INTEGRATION=1
-VLLM_BASE_URL=...
-VLLM_MODEL=...
+VLLM_BASE_URL=http(s)://.../v1
+VLLM_MODEL=<exact-served-model-id>
+# Leave VLLM_API_KEY unset locally; inject it from a secret manager in production.
+VLLM_TIMEOUT_SECONDS=60
+VLLM_MAX_RETRIES=1
 ```
 
-Never embed a real token in a test.
-
-## Manual live verification
-
-Against the private service, verify:
-
-1. `/health` or equivalent model-list probe;
-2. plain Chinese and English chat;
-3. a forced tool call with valid JSON arguments;
-4. a structured intent-classification response;
-5. SSE streaming and TTFT collection;
-6. a request near the configured context limit;
-7. concurrency at 1, 4, and the intended deployment load.
-
-Create a benchmark note containing:
-
-```text
-model name and exact revision
-vLLM version
-GPU type and count
-tensor parallel size
-quantization
-maximum context
-prompt/output token distribution
-concurrency
-TTFT, TPOT, tokens/s
-P50/P95 end-to-end latency
-peak GPU memory
-tool-call and structured-output schema-valid rate
-```
+Verify exact-model health, plain chat, assistant tool-call replay over two turns,
+forced tool selection, structured output, SSE/TTFT, an approved long-context case,
+and intended concurrency. A skip is `NOT_RUN`, not `PASS`.
 
 ## Definition of done
 
-- Existing tests pass unchanged.
-- New adapter unit tests cover all required success/failure behavior.
-- No unit test requires a GPU or network.
-- Live tests are explicitly gated.
-- Unknown/malformed tool calls never reach the caller as executable calls.
-- Structured output is locally validated.
-- Retries are bounded and exactly match policy.
-- Streaming has deterministic event framing.
-- No credentials or confidential prompts appear in source/test fixtures.
-- A short implementation note explains dependency choice and how to run live tests.
+1. Every fixed contract-v2 decision is implemented and tested.
+2. All offline commands pass in a clean environment.
+3. Invalid tool and structured outputs are blocked in every negative fixture.
+4. Retry calls/delays match the policy exactly.
+5. Streaming always ends in one structured terminal event and never retries after
+   visible output.
+6. Transport security tests cover URL, proxy, redirect, TLS, header, and size
+   boundaries.
+7. No unit test needs network/GPU/Docker.
+8. Deployment/live status and benchmark status are recorded as `PASS`, `FAIL`, or
+   `NOT_RUN` without fabricated numbers.
+9. A final report states files changed, commands, exact results, live evidence,
+   compatibility assumptions, and unresolved risks.
 
 ## Required final report from the implementing model
 
 Return:
 
 1. files changed;
-2. protocol/serialization decisions;
-3. tests added and their commands;
-4. exact test results;
-5. live tests run or explicitly not run;
-6. unresolved compatibility assumptions about the chosen Qwen/vLLM version;
-7. benchmark results only if actually measured.
+2. contract/serialization/security decisions implemented;
+3. tests added and exact commands run;
+4. pass/fail counts;
+5. live tests and benchmark as `PASS`, `FAIL`, or `NOT_RUN`;
+6. exact Qwen revision, vLLM image/version, parser/template settings if live work
+   occurred;
+7. limitations or follow-up work;
+8. no performance claim unless the evidence template is fully populated.

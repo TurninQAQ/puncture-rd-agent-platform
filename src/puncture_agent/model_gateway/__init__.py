@@ -3,6 +3,7 @@
 from .client import ModelGateway, ModelGatewayError, VllmModelGateway
 from .mock_qwen import MockQwenGateway
 from .models import (
+    MODEL_GATEWAY_CONTRACT_VERSION,
     ChatMessage,
     GatewayHealth,
     ModelRequest,
@@ -16,6 +17,7 @@ from .models import (
 )
 
 __all__ = [
+    "MODEL_GATEWAY_CONTRACT_VERSION",
     "ChatMessage",
     "GatewayHealth",
     "MockQwenGateway",

@@ -51,9 +51,9 @@ resolve constraints
 
 ## 4. Replaceable modules
 
-当前所有外部能力均有 Mock。后续实现必须保持输入输出不变，只替换内部逻辑：
+所有外部能力均保留 Mock 以支持离线测试；生产适配器按模块逐步替换，并保持稳定输入输出：
 
-- `model_gateway`: Mock Qwen -> vLLM/Qwen
+- `model_gateway`: Mock Qwen + 已实现的 vLLM/Qwen 生产适配器
 - `rag`: in-memory documents -> Elasticsearch/OpenSearch RAG
 - `tooling`: fixed mock outputs -> C++/TensorRT/Python algorithms
 - `agent`: mock state runner -> LangGraph StateGraph
@@ -66,4 +66,3 @@ resolve constraints
 - 必要危险 Mask 缺失时不能输出 SAFE/NORMAL。
 - 无可行路径时不能自动缩小安全距离。
 - 最终安全状态由 deterministic verifier 决定。
-

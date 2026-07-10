@@ -1,0 +1,6 @@
+.env
+model-cache/
+benchmark-results/
+secrets/
+*.log
+

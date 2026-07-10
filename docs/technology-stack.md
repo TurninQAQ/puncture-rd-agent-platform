@@ -1,6 +1,6 @@
 # Technology Stack and Interview Keywords
 
-本项目的重点不是医学算法本身，而是把既有算法能力改造成可检索、可编排、可恢复、可评测、可审计的企业 Agent Runtime。下面列出建议实际学习和实现的技术栈；Mock 阶段只锁接口，不表示已经部署这些组件。
+本项目的重点不是医学算法本身，而是把既有算法能力改造成可检索、可编排、可恢复、可评测、可审计的企业 Agent Runtime。下面列出实际实现与后续模块使用的技术栈；每一项是否完成代码验收或现场部署，以对应 Release Record 为准。
 
 ## 1. Core Agent stack
 

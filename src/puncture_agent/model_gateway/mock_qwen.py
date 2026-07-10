@@ -1,4 +1,4 @@
-"""Deterministic Qwen test double used until a real vLLM service is connected."""
+"""Deterministic Qwen development double for offline graph and contract tests."""
 
 from __future__ import annotations
 
@@ -42,6 +42,15 @@ class MockQwenGateway:
         )
 
     def generate(self, request: ModelRequest) -> ModelResponse:
+        if request.stream:
+            raise ModelGatewayError(
+                "MODEL_REQUEST_REJECTED",
+                "generate requires request.stream to be false",
+                details={"attempts": 0},
+            )
+        return self._generate_response(request)
+
+    def _generate_response(self, request: ModelRequest) -> ModelResponse:
         force_error = request.metadata.get("force_error")
         if isinstance(force_error, Mapping):
             raise ModelGatewayError(
@@ -92,7 +101,19 @@ class MockQwenGateway:
         )
 
     def stream(self, request: ModelRequest) -> Iterator[ModelStreamEvent]:
-        response = self.generate(request)
+        if not request.stream:
+            error = ModelGatewayError(
+                "MODEL_REQUEST_REJECTED",
+                "stream requires request.stream to be true",
+                details={"attempts": 0},
+            )
+            yield self._error_event(request, error, sequence=0)
+            return
+        try:
+            response = self._generate_response(request)
+        except ModelGatewayError as error:
+            yield self._error_event(request, error, sequence=0)
+            return
         sequence = 0
         if response.text:
             words = response.text.split(" ")
@@ -118,6 +139,31 @@ class MockQwenGateway:
             event_type="completed",
             sequence=sequence,
             response=response,
+        )
+
+    @staticmethod
+    def _error_event(
+        request: ModelRequest,
+        error: ModelGatewayError,
+        *,
+        sequence: int,
+    ) -> ModelStreamEvent:
+        safe_details = {
+            key: value
+            for key, value in error.details.items()
+            if key in {"attempts", "available_tools"}
+        }
+        safe_details["output_visible"] = False
+        return ModelStreamEvent(
+            request_id=request.request_id,
+            event_type="error",
+            sequence=sequence,
+            error={
+                "code": error.code,
+                "message": "mock model stream failed",
+                "retryable": error.retryable,
+                "details": safe_details,
+            },
         )
 
     @staticmethod

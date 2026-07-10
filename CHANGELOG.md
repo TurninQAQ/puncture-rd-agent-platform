@@ -5,6 +5,27 @@ Semantic Versioning while it is below 1.0.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-10
+
+### Added
+
+- Production `VllmModelGateway` for private Qwen/vLLM OpenAI-compatible chat, tool calling, structured output and SSE.
+- Pooled `httpx` transport with explicit lifecycle, TLS verification, disabled ambient proxies/redirects and bounded payload handling.
+- Contract v2 assistant tool-call replay, explicit unknown-usage sentinel and strongly structured terminal stream errors.
+- Qwen3/vLLM Compose deployment profile, safe entrypoint, health/smoke/benchmark scripts, GPU sizing worksheet and rollout/rollback runbook.
+- Environment-gated live gateway suite and deterministic deployment-asset tests.
+
+### Security
+
+- Added strict JSON duplicate/non-finite/complexity rejection, exact served-model and choice validation, header-control protection and secret-redacted errors.
+- Added bounded retry/deadline handling, safe `Retry-After`, fail-closed tool/schema validation and no stream retry after visible output.
+
+### Verification
+
+- Local dependency-free run: 241 passed and 7 gated skips out of 248 tests; CI installs pinned `httpx` to execute 2 transport-integration tests, while 5 live vLLM tests remain `NOT_RUN` without a private endpoint.
+- Compile, shell syntax, whitespace and repository secret-pattern checks pass.
+- No live GPU latency, throughput or memory claim is made by this source release.
+
 ## [0.2.0] - 2026-07-10
 
 ### Added
