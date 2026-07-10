@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0",
+  "graph_id": "planning_safety",
+  "description": "Mockable candidate-path generation, safety filtering and intraoperative-risk workflow.",
+  "start": "START",
+  "end": "END",
+  "max_steps": 40,
+  "nodes": [
+    {"id": "ensure_required_artifacts", "kind": "action", "handler": "ensure_required_artifacts"},
+    {"id": "artifact_router", "kind": "router", "handler": "artifact_router"},
+    {"id": "resolve_planning_constraints", "kind": "action", "handler": "resolve_planning_constraints"},
+    {"id": "generate_candidate_paths", "kind": "action", "handler": "generate_candidate_paths"},
+    {"id": "candidate_router", "kind": "router", "handler": "candidate_router"},
+    {"id": "evaluate_path_safety", "kind": "action", "handler": "evaluate_path_safety"},
+    {"id": "evaluate_intraoperative_risk", "kind": "action", "handler": "evaluate_intraoperative_risk"},
+    {"id": "verify_skin_penetration", "kind": "action", "handler": "verify_skin_penetration"},
+    {"id": "finalize_planning", "kind": "action", "handler": "finalize_planning"}
+  ],
+  "edges": [
+    {"source": "START", "target": "ensure_required_artifacts", "condition": {"operator": "always"}},
+    {"source": "ensure_required_artifacts", "target": "artifact_router", "condition": {"operator": "always"}},
+    {"source": "artifact_router", "target": "finalize_planning", "condition": {"field": "metadata.required_artifacts_ready", "operator": "eq", "value": false}},
+    {"source": "artifact_router", "target": "resolve_planning_constraints", "condition": {"operator": "always"}},
+    {"source": "resolve_planning_constraints", "target": "generate_candidate_paths", "condition": {"operator": "always"}},
+    {"source": "generate_candidate_paths", "target": "candidate_router", "condition": {"operator": "always"}},
+    {"source": "candidate_router", "target": "finalize_planning", "condition": {"field": "candidate_paths", "operator": "falsy"}},
+    {"source": "candidate_router", "target": "evaluate_path_safety", "condition": {"operator": "always"}},
+    {"source": "evaluate_path_safety", "target": "evaluate_intraoperative_risk", "condition": {"operator": "always"}},
+    {"source": "evaluate_intraoperative_risk", "target": "verify_skin_penetration", "condition": {"operator": "always"}},
+    {"source": "verify_skin_penetration", "target": "finalize_planning", "condition": {"operator": "always"}},
+    {"source": "finalize_planning", "target": "END", "condition": {"operator": "always"}}
+  ]
+}

@@ -1,0 +1,57 @@
+[
+  {
+    "document_id": "label-schema-v2",
+    "title": "Segmentation Label Schema",
+    "module": "data_validation",
+    "version": "v2",
+    "section": "Label IDs and geometry",
+    "text": "NIfTI labels must use the approved label IDs. CT and Mask shape, direction, origin and spacing must be consistent before inference or planning.",
+    "access_scopes": ["public"],
+    "updated_at": "2026-03-01",
+    "metadata": {"status": "active"}
+  },
+  {
+    "document_id": "planning-rules-v3",
+    "title": "Puncture Path Planning Rules",
+    "module": "path_planning",
+    "version": "v3",
+    "section": "Needle length, angle and safety envelope",
+    "text": "Candidate paths are filtered by needle length and insertion angle. The complete needle path is expanded by the configured safety radius and rejected when the safety envelope intersects a danger-organ Mask.",
+    "access_scopes": ["algorithm_team"],
+    "updated_at": "2026-04-16",
+    "metadata": {"status": "active"}
+  },
+  {
+    "document_id": "planning-rules-v2-deprecated",
+    "title": "Puncture Path Planning Rules",
+    "module": "path_planning",
+    "version": "v2",
+    "section": "Legacy constraints",
+    "text": "This version contains deprecated path planning constraints and must only be returned when version v2 is explicitly requested.",
+    "access_scopes": ["algorithm_team"],
+    "updated_at": "2025-11-01",
+    "metadata": {"status": "deprecated"}
+  },
+  {
+    "document_id": "safety-rules-v2",
+    "title": "Intraoperative Safety Evaluation",
+    "module": "safety_evaluation",
+    "version": "v2",
+    "section": "Skin penetration and warning stop boundaries",
+    "text": "Skin penetration is verified by 3D ray sampling from the planned entry point to the current needle tip. A zero tip label alone cannot determine penetration. Warning and stop regions are generated from danger-structure Masks.",
+    "access_scopes": ["algorithm_team", "clinical_team"],
+    "updated_at": "2026-05-08",
+    "metadata": {"status": "active"}
+  },
+  {
+    "document_id": "tensorrt-interface-v1",
+    "title": "TensorRT Segmentation Inference Interface",
+    "module": "segmentation",
+    "version": "v1",
+    "section": "Input output contract",
+    "text": "The C++ TensorRT adapter accepts a registered CT artifact and model version, and returns segmentation artifact references, latency metrics and structured errors.",
+    "access_scopes": ["algorithm_team"],
+    "updated_at": "2026-03-20",
+    "metadata": {"status": "active"}
+  }
+]

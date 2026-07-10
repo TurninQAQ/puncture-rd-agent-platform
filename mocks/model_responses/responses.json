@@ -1,0 +1,20 @@
+{
+  "intent_classification": {
+    "task_type": "PLANNING_SAFETY",
+    "case_id": "case-001",
+    "confidence": 0.98
+  },
+  "planning_tool_call": {
+    "name": "generate_candidate_paths",
+    "arguments": {
+      "case_id": "case-001",
+      "max_needle_length_mm": 120.0,
+      "max_insertion_angle_deg": 45.0
+    }
+  },
+  "final_report": {
+    "status": "COMPLETED",
+    "summary": "Mock report generated from deterministic tool results.",
+    "requires_manual_review": false
+  }
+}

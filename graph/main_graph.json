@@ -1,0 +1,185 @@
+{
+  "schema_version": "1.0",
+  "graph_id": "puncture_agent_main",
+  "description": "Top-level deterministic workflow for data/model validation and puncture planning/safety tasks.",
+  "start": "START",
+  "end": "END",
+  "max_steps": 80,
+  "nodes": [
+    {
+      "id": "parse_request",
+      "kind": "action",
+      "handler": "parse_request",
+      "writes": ["task_type", "case_id", "tool_plan"]
+    },
+    {
+      "id": "retrieve_project_knowledge",
+      "kind": "action",
+      "handler": "retrieve_project_knowledge",
+      "writes": ["retrieved_documents", "citations"]
+    },
+    {
+      "id": "resolve_case_context",
+      "kind": "action",
+      "handler": "resolve_case_context",
+      "writes": ["metadata.case_context_ready"]
+    },
+    {
+      "id": "task_router",
+      "kind": "router",
+      "handler": "task_router",
+      "writes": []
+    },
+    {
+      "id": "data_model_subgraph",
+      "kind": "subgraph",
+      "graph": "data_model_subgraph.json",
+      "writes": ["subgraph_result", "artifacts"]
+    },
+    {
+      "id": "planning_safety_subgraph",
+      "kind": "subgraph",
+      "graph": "planning_safety_subgraph.json",
+      "writes": ["subgraph_result", "candidate_paths", "safety_result", "risk_flags"]
+    },
+    {
+      "id": "result_verifier",
+      "kind": "action",
+      "handler": "result_verifier",
+      "writes": ["verification_status", "errors"]
+    },
+    {
+      "id": "error_recovery",
+      "kind": "action",
+      "handler": "error_recovery",
+      "writes": ["retry_count", "metadata"]
+    },
+    {
+      "id": "request_missing_data",
+      "kind": "action",
+      "handler": "request_missing_data",
+      "writes": ["status", "final_report"]
+    },
+    {
+      "id": "report_generator",
+      "kind": "action",
+      "handler": "report_generator",
+      "writes": ["status", "final_report"]
+    }
+  ],
+  "edges": [
+    {
+      "source": "START",
+      "target": "parse_request",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "parse_request",
+      "target": "retrieve_project_knowledge",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "retrieve_project_knowledge",
+      "target": "resolve_case_context",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "resolve_case_context",
+      "target": "task_router",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "task_router",
+      "target": "request_missing_data",
+      "condition": {"field": "metadata.case_context_ready", "operator": "eq", "value": false}
+    },
+    {
+      "source": "task_router",
+      "target": "data_model_subgraph",
+      "condition": {"field": "task_type", "operator": "eq", "value": "DATA_MODEL_VALIDATION"}
+    },
+    {
+      "source": "task_router",
+      "target": "planning_safety_subgraph",
+      "condition": {"field": "task_type", "operator": "eq", "value": "PLANNING_SAFETY"}
+    },
+    {
+      "source": "task_router",
+      "target": "request_missing_data",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "data_model_subgraph",
+      "target": "result_verifier",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "planning_safety_subgraph",
+      "target": "result_verifier",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "result_verifier",
+      "target": "report_generator",
+      "condition": {
+        "field": "verification_status",
+        "operator": "in",
+        "value": ["PASS", "NO_FEASIBLE_PATH", "MANUAL_REVIEW"]
+      }
+    },
+    {
+      "source": "result_verifier",
+      "target": "request_missing_data",
+      "condition": {"field": "verification_status", "operator": "eq", "value": "MISSING_INPUT"}
+    },
+    {
+      "source": "result_verifier",
+      "target": "error_recovery",
+      "condition": {
+        "field": "verification_status",
+        "operator": "in",
+        "value": ["NEED_RETRY", "NEED_REPLAN"]
+      }
+    },
+    {
+      "source": "result_verifier",
+      "target": "report_generator",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "error_recovery",
+      "target": "data_model_subgraph",
+      "condition": {
+        "all": [
+          {"field": "task_type", "operator": "eq", "value": "DATA_MODEL_VALIDATION"},
+          {"field": "retry_count", "operator": "lte_field", "value": "max_retries"}
+        ]
+      }
+    },
+    {
+      "source": "error_recovery",
+      "target": "planning_safety_subgraph",
+      "condition": {
+        "all": [
+          {"field": "task_type", "operator": "eq", "value": "PLANNING_SAFETY"},
+          {"field": "retry_count", "operator": "lte_field", "value": "max_retries"}
+        ]
+      }
+    },
+    {
+      "source": "error_recovery",
+      "target": "report_generator",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "request_missing_data",
+      "target": "END",
+      "condition": {"operator": "always"}
+    },
+    {
+      "source": "report_generator",
+      "target": "END",
+      "condition": {"operator": "always"}
+    }
+  ]
+}

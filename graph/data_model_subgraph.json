@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "graph_id": "data_model_validation",
+  "description": "Mockable data conversion, label validation, segmentation and skin-surface workflow.",
+  "start": "START",
+  "end": "END",
+  "max_steps": 40,
+  "nodes": [
+    {"id": "inspect_case_metadata", "kind": "action", "handler": "inspect_case_metadata"},
+    {"id": "validate_geometry", "kind": "action", "handler": "validate_geometry"},
+    {"id": "conversion_router", "kind": "router", "handler": "conversion_router"},
+    {"id": "convert_mcs_to_nifti", "kind": "action", "handler": "convert_mcs_to_nifti"},
+    {"id": "validate_label_schema", "kind": "action", "handler": "validate_label_schema"},
+    {"id": "segmentation_router", "kind": "router", "handler": "segmentation_router"},
+    {"id": "run_segmentation", "kind": "action", "handler": "run_segmentation"},
+    {"id": "validate_segmentation_result", "kind": "action", "handler": "validate_segmentation_result"},
+    {"id": "skin_processing_router", "kind": "router", "handler": "skin_processing_router"},
+    {"id": "extract_skin_surface", "kind": "action", "handler": "extract_skin_surface"},
+    {"id": "finalize_data_model", "kind": "action", "handler": "finalize_data_model"}
+  ],
+  "edges": [
+    {"source": "START", "target": "inspect_case_metadata", "condition": {"operator": "always"}},
+    {"source": "inspect_case_metadata", "target": "validate_geometry", "condition": {"operator": "always"}},
+    {"source": "validate_geometry", "target": "finalize_data_model", "condition": {"field": "metadata.geometry_valid", "operator": "eq", "value": false}},
+    {"source": "validate_geometry", "target": "conversion_router", "condition": {"operator": "always"}},
+    {"source": "conversion_router", "target": "convert_mcs_to_nifti", "condition": {"field": "metadata.requires_conversion", "operator": "eq", "value": true}},
+    {"source": "conversion_router", "target": "validate_label_schema", "condition": {"operator": "always"}},
+    {"source": "convert_mcs_to_nifti", "target": "validate_label_schema", "condition": {"operator": "always"}},
+    {"source": "validate_label_schema", "target": "finalize_data_model", "condition": {"field": "metadata.label_schema_valid", "operator": "eq", "value": false}},
+    {"source": "validate_label_schema", "target": "segmentation_router", "condition": {"operator": "always"}},
+    {"source": "segmentation_router", "target": "run_segmentation", "condition": {"field": "metadata.run_segmentation", "operator": "eq", "value": true}},
+    {"source": "segmentation_router", "target": "finalize_data_model", "condition": {"operator": "always"}},
+    {"source": "run_segmentation", "target": "validate_segmentation_result", "condition": {"operator": "always"}},
+    {"source": "validate_segmentation_result", "target": "finalize_data_model", "condition": {"field": "metadata.segmentation_valid", "operator": "eq", "value": false}},
+    {"source": "validate_segmentation_result", "target": "skin_processing_router", "condition": {"operator": "always"}},
+    {"source": "skin_processing_router", "target": "extract_skin_surface", "condition": {"field": "metadata.extract_skin_surface", "operator": "eq", "value": true}},
+    {"source": "skin_processing_router", "target": "finalize_data_model", "condition": {"operator": "always"}},
+    {"source": "extract_skin_surface", "target": "finalize_data_model", "condition": {"operator": "always"}},
+    {"source": "finalize_data_model", "target": "END", "condition": {"operator": "always"}}
+  ]
+}
