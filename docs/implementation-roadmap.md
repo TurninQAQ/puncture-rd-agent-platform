@@ -66,6 +66,9 @@ idempotency claim、`RUN_CREATED/RUN_STARTED`，以及 approval/success/failure/
 copy，Service/Repository 双层拒绝非法 outcome/snapshot 字段组合。100 路同 key 创建只执行一次，
 100 个并发事件连续编号，cancel/完成、审批缓冲、approve/resume 竞争和 rollback 均已覆盖。
 commit `189040b` 的三版本 CI、PostgreSQL restart、benchmark 与真实 process-kill job 全部通过。
+普通执行事件又新增不进入公共契约的 version-scoped `event_key`：同 key/同内容重放返回原
+sequence，不同内容固定冲突，取消后的 exact replay 仍会再次检查 fence 并停止旧 executor；
+canonical SHA-256 区分 `true`/`1` 等 JSON 类型。commit `15af386` 的完整远端矩阵已通过。
 FastAPI endpoint、SSE、原始 HTTP body 解析前限流、PostgreSQL Run Repository 和 OIDC 尚未完成。
 
 SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码、

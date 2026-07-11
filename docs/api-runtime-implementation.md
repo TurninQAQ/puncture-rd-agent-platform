@@ -44,6 +44,17 @@ The second production-facing boundary now provides:
 - atomic rollback when event construction, clock access, JSON normalization or
   compare-and-swap validation fails.
 
+The repository boundary also carries a private stream-event `event_key` that is
+not exposed through `RunEvent`, HTTP or SSE. The service namespaces explicit
+executor keys by execution version and provides an ordinal fallback for the
+deterministic Mock executors. An exact key/content replay returns the original
+sequence; changed content is a fixed conflict. The service rechecks the version
+fence after reconciliation so an old executor cannot continue after cancel.
+Canonical SHA-256 fingerprints preserve JSON type differences such as `true`
+versus `1`. Production graph executors must use checkpoint task IDs and tool
+call/idempotency IDs instead of relying on the ordinal fallback during mid-graph
+recovery.
+
 The execution version is deliberately internal and does not change the locked
 public `RunSnapshot` or event contracts.
 
@@ -53,18 +64,18 @@ Local Python 3.10 results on 2026-07-11:
 
 ```text
 python3 run_tests.py
-Ran 593 tests in 10.135s
+Ran 597 tests in 10.192s
 OK (skipped=29)
 
 PYTHONPATH=/tmp/lgpg:src:. python3 run_tests.py
-Ran 593 tests in 26.354s
+Ran 597 tests in 26.152s
 OK (skipped=12)
 
 PYTHONPATH=src:. python3 -m unittest -q \
   tests.api.test_run_repository \
   tests.api.test_run_service \
   tests.integration.test_mock_workflow
-Ran 32 tests in 0.258s
+Ran 36 tests in 0.346s
 OK
 ```
 
@@ -93,6 +104,12 @@ Remote evidence on 2026-07-11:
   100 concurrent ordered events, cancel/complete races, concurrent approve and
   resume, approval-event fencing, rollback, stale versions, durable JSON and
   forged lifecycle/outcome contract failures.
+- commit `15af386033d7881748861a1333556b68c675a602` completed
+  [GitHub Actions run 29150409932](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29150409932)
+  successfully across the complete Python/PostgreSQL matrix;
+- the added event-identity tests cover exact replay, changed-content conflict,
+  JSON type-sensitive fingerprints, invalid raw keys and cancel-after-replay
+  fencing without changing the public event contract.
 
 ## Still not implemented
 
@@ -104,6 +121,8 @@ completed boundaries:
 - raw HTTP request-size enforcement before parsing;
 - PostgreSQL Run/event/checkpoint/idempotency persistence and migrations (the
   current repository backend is intentionally in-memory only);
+- lifecycle/CAS COMMIT-unknown reconciliation and an execution reclaim/heartbeat
+  protocol for workers that die while a Run remains `RUNNING`;
 - process/SIGTERM restart recovery at the API Run layer;
 - project/case/artifact authorization and an OIDC/JWT verifier;
 - artifact metadata, health and low-cardinality metrics endpoints;
