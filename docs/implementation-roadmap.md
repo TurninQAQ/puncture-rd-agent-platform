@@ -40,17 +40,21 @@ case、ACL、AVAILABLE 状态、类型、完整几何、生产者版本和直接
 16 上分别执行 6 项禁止 skip 的真实数据库测试，覆盖 checkpoint 恢复、interrupt、竞争、
 backend termination/takeover 和 stream durability；独立 restart job 也已证明同一 PostgreSQL
 cluster 的 postmaster 重启后可由新 Python 进程按相同 checkpoint 哈希恢复，且已完成工具不
-重放。容器替换/宿主机故障/SIGKILL、工具返回后到图 checkpoint 前的进程崩溃 exactly-once
-证据和 API 接线仍待完成，详见
+重放。真实双进程门还已在 ledger 完成、MCP 响应返回但图 checkpoint 尚未提交时强制
+SIGKILL，并证明新进程恢复后不重复目标底层副作用。容器替换/宿主机故障、PostgreSQL
+SIGKILL/WAL crash recovery、工具内部副作用与 ledger commit 的原子性、跨主机共享账本和
+API 接线仍待完成，详见
 `docs/langgraph-runtime-implementation.md`。
 
 ## Phase 5: runtime and evaluation
 
 SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码、
 确定性双 Runtime 证据、PostgreSQL 16 三版本 CI 和 service restart/独立进程恢复也已完成。
+应用进程在 replay ledger 完成后、graph checkpoint 前遭遇 `SIGKILL` 的恢复门也已完成。
 GitHub 托管 Ubuntu 24.04/PostgreSQL 16 的 3×50 checkpoint 基准也已记录，并通过原始 50/150
-ms 观测阈值；它不是生产 SLA。下一步完成共享 PostgreSQL 账本、容器替换/故障恢复、受控
-专用存储主机 enforce 基准，并接入 FastAPI、SSE、OpenTelemetry 和生产回归 Harness。
+ms 观测阈值；它不是生产 SLA。下一步完成共享 PostgreSQL 账本及工具副作用原子性、容器
+替换/故障恢复、受控专用存储主机 enforce 基准，并接入 FastAPI、SSE、OpenTelemetry 和
+生产回归 Harness。
 
 ## Change policy
 

@@ -317,6 +317,22 @@ The tool backend must still make its own side effect and ledger completion
 atomic, or use an artifact/operation idempotency record, for the narrower crash
 window inside the tool service itself.
 
+The checked-in PostgreSQL process-kill gate exercises the graph-side window with
+two fresh Python processes. Process A completes the target tool's SQLite ledger
+entry and returns through the MCP bridge, then self-terminates with `SIGKILL`
+before the LangGraph node checkpoint. Process B observes that the PostgreSQL
+checkpoint lacks the target node result, resumes with the identical replay
+identity, receives `idempotentReplay=true`, and reaches the terminal checkpoint
+without invoking the target handler a second time. Commit
+`9f122782d7f9c6cdee842b84b453dfa99be73840` passed
+[GitHub Actions run 29147544527](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29147544527);
+artifact `postgres-tool-process-kill-9f122782d7f9c6cdee842b84b453dfa99be73840`
+is 2,451 bytes with digest
+`sha256:6022a7cf74b5de59a72332c9260826967360fcaaeb748cab3854a3181124a1b3`.
+This is evidence for the `COMPLETED`-to-checkpoint window on one host, not for
+atomicity between an external side effect and ledger completion, a shared
+multi-host ledger, or host power-loss recovery.
+
 Deadlines are enforced at two layers:
 
 1. `McpToolRuntime` bounds the registry call using the smaller of the tool

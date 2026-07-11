@@ -174,9 +174,10 @@ Registry service/database.
   external side effect exactly-once if a process dies after the tool returns but
   before the following graph checkpoint; the tool service needs a persistent
   idempotency ledger for that crash window. `SQLiteToolReplayLedger` now records
-  a terminal MCP response before returning it, and the checked-in bridge restart
-  test proves that losing subsequent AgentState mutations does not call the
-  handler twice on one shared host.
+  a terminal MCP response before returning it. Both the deterministic bridge
+  reconstruction tests and a checked-in two-process SIGKILL probe prove that
+  losing subsequent AgentState mutations does not call the handler twice on one
+  shared host after the ledger has reached `COMPLETED`.
 - Dynamic interrupt values cross the same JSON/raw-byte/size boundary before
   LangGraph can persist them. Invalid values become a durable terminal
   `STATE_BOUNDARY_ERROR` instead of leaving an unreadable interrupted thread.
@@ -256,6 +257,30 @@ Remote PostgreSQL checkpoint benchmark evidence on 2026-07-11:
   is 29,637 bytes with digest
   `sha256:0a1bd4a5539294ad12c6932238fa97205c4bd24796aa310b9cfea7362e73a44e`.
 
+Remote process-kill replay evidence on 2026-07-11:
+
+- commit `9f122782d7f9c6cdee842b84b453dfa99be73840` completed
+  [GitHub Actions run 29147544527](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29147544527)
+  successfully;
+- process A executed a real MCP planning side effect, durably completed the
+  SQLite replay ledger, returned through the bridge, wrote a crash marker and
+  then killed itself with `SIGKILL` before the LangGraph node returned or its
+  checkpoint could be committed;
+- process B used the same thread, case, principal, tool version, semantic
+  request and ordinal. Its pre-resume PostgreSQL checkpoint contained neither
+  the candidate-node result nor the target tool call, while the resumed call
+  reported `idempotentReplay=true` and did not repeat the underlying side effect;
+- all four planning side effects executed exactly once, and the final terminal
+  checkpoint was re-read and matched the expected state;
+- artifact `postgres-tool-process-kill-9f122782d7f9c6cdee842b84b453dfa99be73840`
+  is 2,451 bytes with digest
+  `sha256:6022a7cf74b5de59a72332c9260826967360fcaaeb748cab3854a3181124a1b3`.
+
+This probe covers the same-host SQLite-ledger window after ledger completion and
+before the graph checkpoint. It does not prove atomic coordination between an
+external side effect and ledger completion, multi-host shared-ledger behavior,
+or host power-loss recovery.
+
 - 542 tests pass in the dependency-free environment;
 - 550 tests pass with real LangGraph 1.2.9 available;
 - the graph suite with real dependencies available runs 133 tests: 126 pass and
@@ -284,6 +309,9 @@ Remote PostgreSQL checkpoint benchmark evidence on 2026-07-11:
   three supported Python versions;
 - the PostgreSQL service-restart job preserves the interrupted checkpoint and
   resumes it in a fresh Python process without replaying completed work;
+- the process-kill job terminates process A after the MCP ledger is complete but
+  before its graph checkpoint, then proves process B replays the stored response
+  without repeating the target side effect;
 - five offline PostgreSQL benchmark contract tests pin median P50/nearest-rank
   P95 statistics, the original 50/150 ms limits, phase filtering, the
   secret-free JSON schema and missing-DSN fail-closed behavior;
@@ -322,11 +350,9 @@ The following remain `NOT_RUN`, not implicitly complete:
   durable volume, host failure, SIGKILL/WAL crash recovery, or a PostgreSQL
   version upgrade. The checked-in restart gate performs a health-checked restart
   of the same service container;
-- forced process termination after a side-effecting tool returns but before the
-  graph checkpoint. Deterministic state-loss/restart tests now prove SQLite
-  replay count remains one, but an actual process-kill harness is still `NOT_RUN`;
 - a shared PostgreSQL/dedicated replay ledger for multi-host MCP servers and
-  atomic coordination between the tool's internal side effect and ledger commit;
+  atomic coordination between the tool's internal side effect and ledger commit.
+  A crash in that narrower internal window remains unverified;
 - a true multi-process/network-partition fault run. Real PostgreSQL same-thread
   contention and backend termination/takeover are verified in CI, but the two
   runtime contenders currently execute as threads in one Python process;
