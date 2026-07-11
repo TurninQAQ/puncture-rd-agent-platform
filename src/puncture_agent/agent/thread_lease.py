@@ -319,8 +319,7 @@ class SQLiteThreadExecutionLeaseManager:
         generation: int,
     ) -> None:
         try:
-            with self._transaction(write=False) as connection:
-                now_ms = self._now_ms()
+            with self._transaction(write=True) as connection:
                 row = connection.execute(
                     """
                     SELECT owner_token, generation, expires_at_ms
@@ -329,19 +328,22 @@ class SQLiteThreadExecutionLeaseManager:
                     """,
                     (scope_key,),
                 ).fetchone()
+                now_ms = self._now_ms()
+                if (
+                    row is None
+                    or row["owner_token"] != owner_token
+                    or int(row["generation"]) != generation
+                    or int(row["expires_at_ms"]) <= now_ms
+                ):
+                    raise ThreadLeaseLost(
+                        "the SQLite thread execution lease was lost"
+                    )
         except ThreadLeaseError:
             raise
         except sqlite3.Error as exc:
             raise ThreadLeaseUnavailable(
                 "SQLite thread lease ownership could not be checked"
             ) from exc
-        if (
-            row is None
-            or row["owner_token"] != owner_token
-            or int(row["generation"]) != generation
-            or int(row["expires_at_ms"]) <= now_ms
-        ):
-            raise ThreadLeaseLost("the SQLite thread execution lease was lost")
 
     def _renew(
         self,

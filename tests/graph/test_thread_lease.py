@@ -83,14 +83,20 @@ class _FakePostgresConnection:
 
 
 class _GatedSQLiteConnection:
-    def __init__(self, delegate: Any) -> None:
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        gated_statement: str = "BEGIN IMMEDIATE",
+    ) -> None:
         self._delegate = delegate
+        self._gated_statement = gated_statement
         self.begin_entered = Event()
         self.allow_begin = Event()
         self.gate_next_write = True
 
     def execute(self, statement: str, *args: Any, **kwargs: Any) -> Any:
-        if statement == "BEGIN IMMEDIATE" and self.gate_next_write:
+        if self._gated_statement in statement and self.gate_next_write:
             self.gate_next_write = False
             self.begin_entered.set()
             if not self.allow_begin.wait(timeout=2.0):
@@ -199,6 +205,44 @@ class SQLiteThreadExecutionLeaseTests(unittest.TestCase):
                     gated.allow_begin.set()
                     with self.assertRaises(ThreadLeaseLost):
                         renewal.result(timeout=2.0)
+
+                replacement = second_manager.acquire(
+                    "thread-blocked-renewal",
+                    operation="resume",
+                )
+                self.assertEqual(replacement.generation, 2)
+                with self.assertRaises(ThreadLeaseLost):
+                    blocked.release()
+                replacement.release()
+
+                asserted = first_manager.acquire(
+                    "thread-blocked-assertion",
+                    operation="run",
+                )
+                clock.advance(4.0)
+                gated = _GatedSQLiteConnection(
+                    first_manager._connection,
+                    gated_statement=(
+                        "SELECT owner_token, generation, expires_at_ms"
+                    ),
+                )
+                first_manager._connection = gated
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    assertion = pool.submit(asserted.assert_valid)
+                    self.assertTrue(gated.begin_entered.wait(timeout=2.0))
+                    clock.advance(2.0)
+                    gated.allow_begin.set()
+                    with self.assertRaises(ThreadLeaseLost):
+                        assertion.result(timeout=2.0)
+
+                asserted_replacement = second_manager.acquire(
+                    "thread-blocked-assertion",
+                    operation="stream",
+                )
+                self.assertEqual(asserted_replacement.generation, 2)
+                with self.assertRaises(ThreadLeaseLost):
+                    asserted.release()
+                asserted_replacement.release()
 
 
 class PostgresAdvisoryThreadExecutionLeaseTests(unittest.TestCase):
