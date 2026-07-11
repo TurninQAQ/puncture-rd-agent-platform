@@ -198,11 +198,11 @@ Local Python 3.10.12 results on 2026-07-11:
 
 ```text
 python3 run_tests.py
-Ran 562 tests in 9.727s
-OK (skipped=20)
+Ran 564 tests in 9.711s
+OK (skipped=22)
 
-PYTHONPATH=/tmp/lgpg:src:. python3 run_tests.py
-Ran 562 tests in 22.074s
+PYTHONPATH=/tmp/lgpg:src:. python3 -m unittest discover -s tests -p 'test_*.py' -q
+Ran 564 tests in 25.796s
 OK (skipped=12)
 ```
 
@@ -281,17 +281,39 @@ before the graph checkpoint. It does not prove atomic coordination between an
 external side effect and ledger completion, multi-host shared-ledger behavior,
 or host power-loss recovery.
 
+Remote real-LangGraph contract-matrix evidence on 2026-07-11:
+
+- commit `67c214bc0db0f33e5af92552da7a25376c91db1b` completed
+  [GitHub Actions run 29147890458](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29147890458)
+  successfully;
+- the tests construct `LangGraphRuntime` without a Fake API, so LangGraph 1.2.9
+  compiles and executes the checked-in `StateGraph` and child graphs;
+- the real graph covers planning and MCS success, missing case/artifact,
+  geometry and label fail-closed routing, no feasible path, one-time retry,
+  retry exhaustion, non-retryable failure and malformed production model output;
+- assertions pin exact tool sequences/statuses, retry counts, critical node
+  counts and forbidden downstream nodes, then re-read every terminal checkpoint;
+- a `Barrier(20)` and 20 workers force all sessions to overlap at the real
+  `parse_request` node. Ten planning and ten MCS workflows then verify their
+  exact four/six-tool sequences, per-call case identity and full checkpoint
+  equality with zero cross-session leakage;
+- Python 3.10, 3.11 and 3.12 standard-library jobs, PostgreSQL service restart,
+  checkpoint benchmark and process-kill jobs all passed. The release-tag job was
+  skipped as designed because the commit was not a version tag.
+
 - 542 tests pass in the dependency-free environment;
-- 550 tests pass with real LangGraph 1.2.9 available;
-- the graph suite with real dependencies available runs 133 tests: 126 pass and
+- 552 tests pass with real LangGraph 1.2.9 available;
+- the graph suite with real dependencies available runs 135 tests: 128 pass and
   six PostgreSQL tests plus the inverse missing-dependency guard are skipped;
-- eight tests execute the actual `StateGraph` (seven graph integration/smoke/
-  fault tests and one Eval test); the broader failure/concurrency matrix uses the
-  deterministic Fake API to isolate branch semantics;
+- ten tests execute the actual `StateGraph` (nine graph integration/smoke/fault
+  tests and one Eval test). The deterministic Fake API remains a fast reference
+  gate, while the complete key failure/concurrency matrix now runs on the real
+  graph as well;
 - the Eval suite runs 10 tests with 100% reference contract success, 100% report
   schema validity and zero forbidden-node violations;
-- 20 concurrent isolated sessions complete without cross-session state leakage
-  on the deterministic Fake API; the equivalent real-LangGraph matrix is `NOT_RUN`;
+- 20 concurrent isolated sessions synchronize inside the real `StateGraph`, run
+  ten planning and ten MCS workflows, and complete without cross-session state
+  or checkpoint leakage;
 - all ten legacy node request shapes decode as their frozen request dataclasses;
 - 15 durable replay tests prove one handler execution across bridge/runtime/
   ledger reconstruction, plus fail-closed authorization and uncertainty paths;
@@ -360,8 +382,6 @@ The following remain `NOT_RUN`, not implicitly complete:
   advisory-lock connection is lost while a stale handler's external side effect
   is still completing; the MCP replay ledger and manual reconciliation remain
   required because a session lock alone cannot fence arbitrary external systems;
-- the complete failure matrix and 20-session concurrency test on real LangGraph,
-  rather than only the focused real smoke/integration cases;
 - live multi-host execution against the deployment's shared Artifact Registry
   service, including Registry failover/load evidence. The authority protocol,
   in-memory/SQLite implementations and fail-closed bridge integration are locally

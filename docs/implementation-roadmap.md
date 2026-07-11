@@ -46,6 +46,11 @@ SIGKILL/WAL crash recovery、工具内部副作用与 ledger commit 的原子性
 API 接线仍待完成，详见
 `docs/langgraph-runtime-implementation.md`。
 
+Task 06 的关键成功/失败矩阵现已直接运行于 LangGraph 1.2.9 `StateGraph`：覆盖 MCS/规划
+成功、缺输入、geometry/label 失败、无可行路径、一次重试、重试耗尽、不可重试错误和
+malformed model。20 个 worker 通过同步屏障同时进入真实节点，并交替完成 10 个规划与
+10 个 MCS 会话；每个工具序列、case 请求和完整 checkpoint 均已核对，未发现跨会话泄漏。
+
 ## Phase 5: runtime and evaluation
 
 SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码、
