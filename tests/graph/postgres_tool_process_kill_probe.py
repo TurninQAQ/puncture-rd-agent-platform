@@ -428,7 +428,7 @@ def recover_worker() -> int:
             "pid": os.getpid(),
             "pre_resume_state_sha256": value_sha256(pre_resume.to_dict()),
             "schema_version": "1",
-            "status": resumed.status.value,
+            "status": resumed.status,
             "thread_id": thread_id,
             "tool_names": final_tools,
         },
