@@ -244,6 +244,19 @@ Remote evidence on 2026-07-11:
   composition test;
 - the same workflow kept PostgreSQL restart recovery, real process-kill replay
   protection and the hosted checkpoint benchmark green.
+- commit `99587564d50b71f82fa762d6c64fcf20308fc85a` completed
+  [GitHub Actions run 29157341457](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29157341457)
+  successfully;
+- each Python 3.10, 3.11 and 3.12 job passed the full suite plus the dedicated,
+  exact eight-test SSE replay/streaming gate with zero skips, while the existing
+  Pydantic, FastAPI, PostgreSQL Run repository and PostgreSQL composition gates
+  remained green;
+- the SSE tests cover canonical reconnect cursors, Accept specificity,
+  heartbeat/approval completion, 10,000-event bounded paging, token revocation,
+  capacity rejection, preflight failures, ASGI start/body-send cleanup and
+  low-cardinality privacy metrics;
+- PostgreSQL restart recovery, real process-kill replay protection and the
+  hosted checkpoint benchmark also remained successful.
 
 ## Still not implemented
 

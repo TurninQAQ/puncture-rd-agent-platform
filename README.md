@@ -52,6 +52,8 @@ python3 examples/local_mcp_demo.py
 
 [commit `b8da00f` 的 FastAPI Run Gateway](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29155728747) 新增全部 9 条 REST/OpenAPI 路径、JSON event cursor、解析前 Bearer/body admission、server-owned project binding、公司授权/Artifact/Executor 注入端口、固定错误、制品公共 metadata、health/低基数 metrics 和 PostgreSQL composition。Python 3.10/3.11/3.12 各自通过完整测试以及精确 7 项 Pydantic、13 项 FastAPI、8 项 PostgreSQL Repository、1 项 FastAPI/PostgreSQL no-skip 门，restart、process-kill 与 checkpoint benchmark 也全部成功。该节点不代表 SSE、OIDC 具体实现、后台 worker reclaim 或 API SIGTERM 恢复已经完成。
 
+[commit `9958756` 的有界 SSE 事件回放](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29157341457) 在同一事件路径增加 JSON/SSE 协商、严格 `Last-Event-ID`/query cursor、PostgreSQL high-water keyset page、Bearer 重验证、heartbeat、终态 tail、硬 deadline、断连清理和 per-process 全局/tenant 配额。Python 3.10/3.11/3.12 均通过完整测试及精确 8 项 SSE 零跳过门，10,000 事件有界回放、流中 token 撤销、response-start/body-send 失败和隐私指标均已覆盖；restart、process-kill 与 benchmark 继续全绿。该节点仍不代表 worker reclaim、API SIGTERM 恢复、集群级 SSE 配额或生产代理/数据库性能基线已经完成。
+
 ## Reading order
 
 1. `docs/architecture.md`

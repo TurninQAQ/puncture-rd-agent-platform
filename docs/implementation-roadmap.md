@@ -91,7 +91,9 @@ Task 07 的第五个生产边界节点现已实现：同一事件路径默认返
 PostgreSQL 以 high-water + keyset page 无锁读取。流在 200 前完成认证、授权、首屏读取和编码，
 启动后每轮重新验证 Bearer 并授权，按固定帧发送、空闲 heartbeat、终态 tail drain，并在超时、
 撤权、断连和 ASGI send failure 时释放 per-process 全局/tenant 配额。8 项独立 SSE 测试包含
-10,000 事件有界回放；生产代理慢消费者、集群级配额与 HTTP/PostgreSQL 性能仍需现场证据。
+10,000 事件有界回放；commit `9958756` 的三版本 CI、PostgreSQL restart、真实 process-kill
+和 checkpoint benchmark 已全部通过。生产代理慢消费者、集群级配额与 HTTP/PostgreSQL
+性能仍需现场证据。
 
 SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码、
 确定性双 Runtime 证据、PostgreSQL 16 三版本 CI 和 service restart/独立进程恢复也已完成。
