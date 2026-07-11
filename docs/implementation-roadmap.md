@@ -69,7 +69,16 @@ commit `189040b` 的三版本 CI、PostgreSQL restart、benchmark 与真实 proc
 普通执行事件又新增不进入公共契约的 version-scoped `event_key`：同 key/同内容重放返回原
 sequence，不同内容固定冲突，取消后的 exact replay 仍会再次检查 fence 并停止旧 executor；
 canonical SHA-256 区分 `true`/`1` 等 JSON 类型。commit `15af386` 的完整远端矩阵已通过。
-FastAPI endpoint、SSE、原始 HTTP body 解析前限流、PostgreSQL Run Repository 和 OIDC 尚未完成。
+
+Task 07 的第三个生产边界节点已完成：PostgreSQL Run/event Repository 使用显式 checksum
+migration、tenant/idempotency 唯一约束、行锁和单调 sequence/version；snapshot/event 动态
+JSON 同时保存 canonical text 与 JSONB，严格 UTC 毫秒时间边界避免数据库 round-trip 改变
+fingerprint。CAS mutation journal 与状态、lifecycle event 同事务提交，使 COMMIT 回执丢失后
+即使状态已经继续推进，原 mutation 仍可精确对账。commit `93391f4` 的 Python 3.10/3.11/3.12
+workflow 各自通过 8 项 PostgreSQL 16 no-skip 测试，包含 20 路幂等创建、100 个并发事件、
+tenant 隔离、rollback、backend termination，以及 create/append/CAS 在真实 commit 成功后丢失
+ACK 的恢复。FastAPI endpoint、SSE、原始 HTTP body 解析前限流、OIDC、worker reclaim/heartbeat
+和 API 进程恢复尚未完成。
 
 SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码、
 确定性双 Runtime 证据、PostgreSQL 16 三版本 CI 和 service restart/独立进程恢复也已完成。

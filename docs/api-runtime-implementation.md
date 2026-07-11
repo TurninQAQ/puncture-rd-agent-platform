@@ -55,6 +55,28 @@ versus `1`. Production graph executors must use checkpoint task IDs and tool
 call/idempotency IDs instead of relying on the ordinal fallback during mid-graph
 recovery.
 
+The third production-facing boundary now provides:
+
+- a lazy-psycopg `PostgresRunRepository` with explicit, advisory-lock-protected,
+  checksum-verified deployment migration; request paths never auto-migrate;
+- tenant-scoped idempotent create, row-locked monotonic event sequences and
+  version-fenced compare-and-swap transitions across repository instances;
+- canonical text sidecars beside JSONB for requests, snapshot dynamic fields
+  and event payloads. Reads re-parse the canonical text and recompute request,
+  snapshot and event fingerprints, preserving values such as `-0.0` and
+  exponent-form floats that JSONB may normalize;
+- one strict shared `YYYY-MM-DDTHH:MM:SS.mmmZ` boundary for memory and database
+  snapshots/events, with PostgreSQL millisecond-precision constraints;
+- a durable mutation journal written in the same transaction as snapshot and
+  lifecycle-event changes. Exact CAS replay therefore returns the original
+  target version even after a later approval/resume has advanced the current
+  Run;
+- explicit COMMIT-unknown reconciliation for create, keyed stream append and
+  lifecycle CAS. Tests wrap a real psycopg connection so the underlying
+  `commit()` succeeds before an acknowledgement-loss exception is raised;
+- sanitized configuration, availability and integrity errors without DSN or
+  backend exception leakage.
+
 The execution version is deliberately internal and does not change the locked
 public `RunSnapshot` or event contracts.
 
@@ -64,18 +86,23 @@ Local Python 3.10 results on 2026-07-11:
 
 ```text
 python3 run_tests.py
-Ran 597 tests in 10.192s
-OK (skipped=29)
+Ran 608 tests in 10.067s
+OK (skipped=37)
 
 PYTHONPATH=/tmp/lgpg:src:. python3 run_tests.py
-Ran 597 tests in 26.152s
-OK (skipped=12)
+Ran 608 tests in 26.214s
+OK (skipped=20)
 
 PYTHONPATH=src:. python3 -m unittest -q \
   tests.api.test_run_repository \
-  tests.api.test_run_service \
-  tests.integration.test_mock_workflow
-Ran 36 tests in 0.346s
+  tests.api.test_postgres_run_repository.PostgresRunRepositoryContractTests
+Ran 27 tests in 0.350s
+OK
+
+PUNCTURE_TEST_POSTGRES_DSN=<private-test-dsn> \
+PYTHONPATH=/tmp/lgpg:src:. python3 -m unittest \
+  tests.api.test_postgres_run_repository.PostgresRunRepositoryTests -v
+Ran 8 tests in 3.117s
 OK
 ```
 
@@ -110,6 +137,17 @@ Remote evidence on 2026-07-11:
 - the added event-identity tests cover exact replay, changed-content conflict,
   JSON type-sensitive fingerprints, invalid raw keys and cancel-after-replay
   fencing without changing the public event contract.
+- commit `93391f4743f4a0592671eba231fc3f2684d0d0f4` completed
+  [GitHub Actions run 29152000095](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29152000095)
+  successfully;
+- each Python 3.10, 3.11 and 3.12 matrix job executed exactly eight PostgreSQL
+  16 Run Repository tests with skips forbidden. The tests cover persistence and
+  migration checksum enforcement, 20-way idempotent create, tenant isolation,
+  100 concurrent ordered events, CAS competition/history, transaction rollback,
+  backend termination, and create/append/CAS acknowledgement loss after a real
+  successful commit;
+- the same workflow kept the independent PostgreSQL service-restart,
+  checkpoint benchmark and real process-kill recovery jobs green.
 
 ## Still not implemented
 
@@ -119,10 +157,8 @@ completed boundaries:
 - all nine FastAPI HTTP endpoints and generated OpenAPI evidence;
 - SSE event replay, `Last-Event-ID`, heartbeat, disconnect and backpressure;
 - raw HTTP request-size enforcement before parsing;
-- PostgreSQL Run/event/checkpoint/idempotency persistence and migrations (the
-  current repository backend is intentionally in-memory only);
-- lifecycle/CAS COMMIT-unknown reconciliation and an execution reclaim/heartbeat
-  protocol for workers that die while a Run remains `RUNNING`;
+- an execution reclaim/heartbeat protocol for workers that die while a Run
+  remains `RUNNING`;
 - process/SIGTERM restart recovery at the API Run layer;
 - project/case/artifact authorization and an OIDC/JWT verifier;
 - artifact metadata, health and low-cardinality metrics endpoints;
