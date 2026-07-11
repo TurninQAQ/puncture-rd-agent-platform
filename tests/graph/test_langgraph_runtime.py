@@ -35,6 +35,7 @@ from puncture_agent.agent.langgraph_runtime import (  # noqa: E402
 from puncture_agent.agent.langgraph_state import RawBytesStateError  # noqa: E402
 from puncture_agent.agent.production_nodes import build_production_handlers  # noqa: E402
 from puncture_agent.agent.nodes import DeterministicMockToolExecutor  # noqa: E402
+from puncture_agent.agent.runtime import NodeOutcome  # noqa: E402
 from puncture_agent.model_gateway.mock_qwen import MockQwenGateway  # noqa: E402
 from puncture_agent.rag.mock_service import MockRagService  # noqa: E402
 
@@ -637,6 +638,48 @@ class ProductionLangGraphRuntimeTests(unittest.TestCase):
             runtime.run(invalid)
         self.assertEqual(AgentStatus.CREATED, invalid.status)
         self.assertNotIn("trace_id", invalid.metadata)
+
+        handlers = dict(build_mock_handlers())
+        original_parse = handlers["parse_request"]
+
+        def hijack_thread(state, context):
+            outcome = original_parse(state, context)
+            return NodeOutcome(
+                updates={**dict(outcome.updates), "session_id": "hijacked-thread"},
+                output=outcome.output,
+                events=outcome.events,
+            )
+
+        handlers["parse_request"] = hijack_thread
+        identity_runtime = LangGraphRuntime(
+            PROJECT_ROOT / "graph" / "main_graph.json",
+            handlers,
+            langgraph_api=FakeLangGraphApi(),
+        )
+        identity_state = AgentState(
+            user_query="对 Case-709 做路径规划",
+            session_id="immutable-thread-identity",
+        )
+        with self.assertRaises(GraphExecutionError):
+            identity_runtime.run(identity_state)
+        self.assertEqual("immutable-thread-identity", identity_state.session_id)
+        stored = identity_runtime.checkpoint_state(
+            thread_id="immutable-thread-identity"
+        )
+        self.assertEqual("immutable-thread-identity", stored.session_id)
+        with self.assertRaises(LangGraphCheckpointError):
+            identity_runtime.checkpoint_state(thread_id="hijacked-thread")
+        corrupted = stored.to_dict()
+        corrupted["session_id"] = "hijacked-thread"
+        identity_runtime.checkpointer.put(
+            "immutable-thread-identity",
+            corrupted,
+        )
+        with self.assertRaisesRegex(
+            LangGraphCheckpointError,
+            "session identity",
+        ):
+            identity_runtime.resume(thread_id="immutable-thread-identity")
 
     def test_production_model_rag_and_tool_adapters_compose(self) -> None:
         handlers = build_production_handlers(

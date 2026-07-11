@@ -32,16 +32,17 @@ deterministic manifest backend，不声称重写或验证了公司 MCS、TensorR
 状态：已新增生产 `StateGraph` 编译器、两个 compiled subgraph、TypedDict 状态边界、
 同步 checkpoint/event 接口、动态 interrupt/resume、MCP/Model/RAG 适配器和并发隔离测试。
 隔离安装的 LangGraph 1.2.9 已验证真实图、子图恢复和 MCP trace；PostgreSQL saver、CI 服务
-配置与跨 runtime 恢复测试已落地。本机无 PostgreSQL 测试 DSN，真实数据库执行、工具返回后到
-图 checkpoint 前的进程崩溃 exactly-once 证据、跨 worker 同 thread 锁、可信输出 Artifact
-Registry 校验和 API 接线仍待完成，详见
+配置与跨 runtime 恢复测试已落地。跨 Runtime 的 `run/resume/stream` 已接 SQLite TTL/CAS
+测试替身和生产 PostgreSQL session advisory-lock manager，并覆盖竞争、续租、锁丢失和
+fail-closed 行为。本机无 PostgreSQL 测试 DSN，真实数据库运行证据、工具返回后到图 checkpoint
+前的进程崩溃 exactly-once 证据、可信输出 Artifact Registry 校验和 API 接线仍待完成，详见
 `docs/langgraph-runtime-implementation.md`。
 
 ## Phase 5: runtime and evaluation
 
-SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成。下一步完成共享
-PostgreSQL 账本与 checkpoint 运行证据、跨 worker 租约，并接入 FastAPI、SSE、
-OpenTelemetry 和生产回归 Harness。
+SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码与
+确定性双 Runtime 证据也已完成。下一步完成共享 PostgreSQL 账本、checkpoint/租约
+现场运行证据，并接入 FastAPI、SSE、OpenTelemetry 和生产回归 Harness。
 
 ## Change policy
 

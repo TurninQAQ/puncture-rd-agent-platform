@@ -6,6 +6,8 @@ from .langgraph_runtime import (
     LangGraphCheckpointError,
     LangGraphConcurrencyError,
     LangGraphDependencyError,
+    LangGraphLeaseLostError,
+    LangGraphLeaseUnavailableError,
     LangGraphRuntime,
     langgraph_available,
     open_postgres_checkpointer,
@@ -22,6 +24,17 @@ from .nodes import build_mock_handlers
 from .production_nodes import build_production_handlers
 from .runtime import GraphExecutionError, GraphRuntime
 from .state import AgentState, AgentStatus, TaskType, VerificationStatus
+from .thread_lease import (
+    PostgresAdvisoryThreadExecutionLeaseManager,
+    SQLiteThreadExecutionLeaseManager,
+    ThreadExecutionLease,
+    ThreadExecutionLeaseManager,
+    ThreadLeaseBusy,
+    ThreadLeaseError,
+    ThreadLeaseLost,
+    ThreadLeaseUnavailable,
+    thread_advisory_lock_key,
+)
 from .tool_bridge import (
     DEFAULT_TOOL_BRIDGE_POLICY,
     McpToolExecutor,
@@ -43,13 +56,23 @@ __all__ = [
     "LangGraphCheckpointError",
     "LangGraphConcurrencyError",
     "LangGraphDependencyError",
+    "LangGraphLeaseLostError",
+    "LangGraphLeaseUnavailableError",
     "LangGraphRuntime",
     "McpToolExecutor",
     "ProductionAgentState",
+    "PostgresAdvisoryThreadExecutionLeaseManager",
     "RawBytesStateError",
     "StateConversionError",
     "StateSizeLimitError",
+    "SQLiteThreadExecutionLeaseManager",
     "TaskType",
+    "ThreadExecutionLease",
+    "ThreadExecutionLeaseManager",
+    "ThreadLeaseBusy",
+    "ThreadLeaseError",
+    "ThreadLeaseLost",
+    "ThreadLeaseUnavailable",
     "ToolBridgeContractError",
     "ToolBridgeError",
     "ToolBridgePolicy",
@@ -64,5 +87,6 @@ __all__ = [
     "open_postgres_checkpointer",
     "state_from_mapping",
     "state_to_mapping",
+    "thread_advisory_lock_key",
     "validate_graph_spec",
 ]

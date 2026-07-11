@@ -38,6 +38,14 @@ from .runtime import (
     evaluate_condition,
 )
 from .state import AgentState, AgentStatus
+from .thread_lease import (
+    ThreadExecutionLease,
+    ThreadExecutionLeaseManager,
+    ThreadLeaseBusy,
+    ThreadLeaseLost,
+    ThreadLeaseOperation,
+    ThreadLeaseUnavailable,
+)
 
 
 _MISSING = object()
@@ -52,7 +60,31 @@ class LangGraphCheckpointError(GraphExecutionError):
 
 
 class LangGraphConcurrencyError(GraphExecutionError):
-    """Raised when the same thread is executed concurrently in one runtime."""
+    """Raised when the same thread is already executing in any configured worker."""
+
+
+class LangGraphLeaseUnavailableError(GraphExecutionError):
+    """Raised when exclusive thread ownership cannot be established safely."""
+
+
+class LangGraphLeaseLostError(GraphExecutionError):
+    """Raised when an execution loses its previously acquired thread lease."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        state: AgentState | None = None,
+        thread_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        try:
+            self.state = deepcopy(state) if state is not None else None
+        except Exception:
+            # Lease-loss signaling must not be downgraded to an ordinary node
+            # failure when a buggy handler inserted a non-copyable value.
+            self.state = None
+        self.thread_id = thread_id
 
 
 class _NodeHandlerFailure(GraphExecutionError):
@@ -170,6 +202,7 @@ class LangGraphRuntime:
         graph_root: str | Path | None = None,
         checkpointer: Any | None = None,
         tracer: TracerLike | None = None,
+        execution_lease_manager: ThreadExecutionLeaseManager | None = None,
         langgraph_api: _LangGraphApi | None = None,
     ) -> None:
         self.graph = load_graph_spec(graph) if not isinstance(graph, GraphSpec) else graph
@@ -181,11 +214,17 @@ class LangGraphRuntime:
             raise ValueError("graph_root is required for an in-memory GraphSpec")
         self.handlers = MappingProxyType(dict(handlers))
         self.tracer = tracer
+        if execution_lease_manager is not None and not callable(
+            getattr(execution_lease_manager, "acquire", None)
+        ):
+            raise TypeError("execution_lease_manager must expose acquire()")
+        self.execution_lease_manager = execution_lease_manager
         self._api = langgraph_api or _load_langgraph_api()
         self.checkpointer = (
             self._api.in_memory_saver() if checkpointer is None else checkpointer
         )
         self._active_threads: set[str] = set()
+        self._active_execution_leases: dict[str, ThreadExecutionLease] = {}
         self._uncertain_threads: set[str] = set()
         self._active_threads_lock = Lock()
         self._compiled_children: dict[str, Any] = {}
@@ -212,8 +251,17 @@ class LangGraphRuntime:
         normalized_thread = str(
             invocation_config["configurable"]["thread_id"]
         )
-        with self._thread_execution(normalized_thread):
-            return self._run_configured(state, invocation_config)
+        try:
+            with self._thread_execution(normalized_thread, operation="run"):
+                result = self._run_configured(state, invocation_config)
+        except LangGraphLeaseLostError as exc:
+            terminal = self._terminalize_execution_lease_loss(state, exc)
+            raise LangGraphLeaseLostError(
+                "graph execution stopped after losing exclusive thread ownership",
+                state=terminal,
+                thread_id=normalized_thread,
+            ) from exc
+        return result
 
     def _run_configured(
         self,
@@ -305,13 +353,28 @@ class LangGraphRuntime:
             config,
             recursion_limit=self.graph.max_steps,
         )
-        with self._thread_execution(normalized_thread):
-            return self._resume_configured(
-                normalized_thread=normalized_thread,
-                invocation_config=invocation_config,
-                resume_value=resume_value,
-                updates=updates,
-            )
+        resumed: AgentState | None = None
+        try:
+            with self._thread_execution(normalized_thread, operation="resume"):
+                resumed = self._resume_configured(
+                    normalized_thread=normalized_thread,
+                    invocation_config=invocation_config,
+                    resume_value=resume_value,
+                    updates=updates,
+                )
+        except LangGraphLeaseLostError as exc:
+            fallback = exc.state or resumed
+            if fallback is not None:
+                terminal = self._terminalize_execution_lease_loss(fallback, exc)
+                raise LangGraphLeaseLostError(
+                    "graph resume stopped after losing exclusive thread ownership",
+                    state=terminal,
+                    thread_id=normalized_thread,
+                ) from exc
+            with self._active_threads_lock:
+                self._uncertain_threads.add(normalized_thread)
+            raise
+        return resumed
 
     def _resume_configured(
         self,
@@ -452,6 +515,10 @@ class LangGraphRuntime:
             state = state_from_mapping(
                 self._require_mapping(values, "checkpoint values")
             )
+            if state.session_id != normalized_thread:
+                raise LangGraphCheckpointError(
+                    "checkpoint session identity does not match the requested thread"
+                )
             self._apply_interrupts(state, self._snapshot_interrupts(snapshot))
             return state
         except LangGraphCheckpointError:
@@ -477,8 +544,16 @@ class LangGraphRuntime:
         normalized_thread = str(
             invocation_config["configurable"]["thread_id"]
         )
-        with self._thread_execution(normalized_thread):
-            events = tuple(self._stream_configured(state, invocation_config))
+        try:
+            with self._thread_execution(normalized_thread, operation="stream"):
+                events = tuple(self._stream_configured(state, invocation_config))
+        except LangGraphLeaseLostError as exc:
+            terminal = self._terminalize_execution_lease_loss(state, exc)
+            raise LangGraphLeaseLostError(
+                "graph stream stopped after losing exclusive thread ownership",
+                state=terminal,
+                thread_id=normalized_thread,
+            ) from exc
         yield from events
 
     def _stream_configured(
@@ -701,6 +776,11 @@ class LangGraphRuntime:
 
         def execute(payload: Mapping[str, Any]) -> Mapping[str, Any]:
             working = _trusted_state_from_mapping(payload)
+            execution_thread_id = working.session_id
+            self._renew_execution_lease(
+                working,
+                thread_id=execution_thread_id,
+            )
 
             def failed_mapping(
                 code: str,
@@ -708,7 +788,17 @@ class LangGraphRuntime:
                 *,
                 error_type: str,
             ) -> Mapping[str, Any]:
-                failure_state = working
+                identity_was_changed = working.session_id != execution_thread_id
+                failure_state = (
+                    _trusted_state_from_mapping(payload)
+                    if identity_was_changed
+                    else working
+                )
+                if identity_was_changed:
+                    if enter_container:
+                        failure_state.visited_nodes.append(enter_container)
+                    failure_state.current_node = qualified
+                    failure_state.visited_nodes.append(qualified)
                 failure_state.status = AgentStatus.FAILED
                 failure_state.add_error(
                     code,
@@ -801,11 +891,24 @@ class LangGraphRuntime:
             try:
                 with node_context:
                     try:
+                        raw_outcome = handler(working, context)
+                        self._assert_execution_lease(
+                            working,
+                            thread_id=execution_thread_id,
+                        )
+                        if working.session_id != execution_thread_id:
+                            raise GraphExecutionError(
+                                "handler cannot change AgentState.session_id"
+                            )
                         outcome = _normalize_outcome(
-                            handler(working, context),
+                            raw_outcome,
                             handler_name=node.handler or qualified,
                         )
                         working.apply_updates(outcome.updates)
+                        if working.session_id != execution_thread_id:
+                            raise GraphExecutionError(
+                                "handler cannot update AgentState.session_id"
+                            )
                         working.node_outputs[qualified] = outcome.output
                         if exit_container:
                             working.node_outputs[exit_container] = {
@@ -831,8 +934,19 @@ class LangGraphRuntime:
                                         if key != "name"
                                     },
                                 )
-                        successful_mapping = state_to_mapping(working)
+                        candidate_mapping = state_to_mapping(working)
+                        self._assert_execution_lease(
+                            working,
+                            thread_id=execution_thread_id,
+                        )
+                        successful_mapping = candidate_mapping
+                    except LangGraphLeaseLostError:
+                        raise
                     except self._api.graph_bubble_up as exc:
+                        self._assert_execution_lease(
+                            working,
+                            thread_id=execution_thread_id,
+                        )
                         bubble_interrupts = self._interrupts_from_bubble(exc)
                         if bubble_interrupts:
                             # LangGraph persists dynamic interrupts after this
@@ -855,8 +969,20 @@ class LangGraphRuntime:
                                     "agent.node_id": qualified,
                                 },
                             )
+                        self._assert_execution_lease(
+                            working,
+                            thread_id=execution_thread_id,
+                        )
+                    except BaseException:
+                        self._assert_execution_lease(
+                            working,
+                            thread_id=execution_thread_id,
+                        )
+                        raise
                 if graph_bubble is not None:
                     raise graph_bubble
+            except LangGraphLeaseLostError:
+                raise
             except self._api.graph_bubble_up:
                 raise
             except GraphExecutionError as exc:
@@ -988,7 +1114,12 @@ class LangGraphRuntime:
         return result
 
     @contextmanager
-    def _thread_execution(self, thread_id: str) -> Iterator[None]:
+    def _thread_execution(
+        self,
+        thread_id: str,
+        *,
+        operation: ThreadLeaseOperation,
+    ) -> Iterator[None]:
         with self._active_threads_lock:
             if thread_id in self._uncertain_threads:
                 raise LangGraphCheckpointError(
@@ -999,11 +1130,148 @@ class LangGraphRuntime:
                     "the same LangGraph thread cannot execute concurrently"
                 )
             self._active_threads.add(thread_id)
+
+        lease: ThreadExecutionLease | None = None
+        execution_started = False
+        body_error: BaseException | None = None
         try:
-            yield
+            manager = self.execution_lease_manager
+            if manager is not None:
+                try:
+                    lease = manager.acquire(thread_id, operation=operation)
+                except ThreadLeaseBusy as exc:
+                    raise LangGraphConcurrencyError(
+                        "the same LangGraph thread is executing in another worker"
+                    ) from exc
+                except (ThreadLeaseUnavailable, ThreadLeaseLost) as exc:
+                    raise LangGraphLeaseUnavailableError(
+                        "exclusive LangGraph thread ownership is unavailable"
+                    ) from exc
+                except Exception as exc:
+                    raise LangGraphLeaseUnavailableError(
+                        "exclusive LangGraph thread ownership could not be acquired"
+                    ) from exc
+                if (
+                    getattr(lease, "thread_id", None) != thread_id
+                    or getattr(lease, "operation", None) != operation
+                ):
+                    raise LangGraphLeaseUnavailableError(
+                        "thread lease manager returned a mismatched execution claim"
+                    )
+                try:
+                    lease.renew()
+                except Exception as exc:
+                    raise LangGraphLeaseUnavailableError(
+                        "exclusive LangGraph thread ownership could not be verified"
+                    ) from exc
+                with self._active_threads_lock:
+                    self._active_execution_leases[thread_id] = lease
+
+            execution_started = True
+            try:
+                yield
+                if lease is not None:
+                    self._assert_execution_lease_id(thread_id)
+            except BaseException as exc:
+                body_error = exc
+                raise
         finally:
+            release_error: GraphExecutionError | None = None
+            if lease is not None:
+                with self._active_threads_lock:
+                    if self._active_execution_leases.get(thread_id) is lease:
+                        self._active_execution_leases.pop(thread_id, None)
+                try:
+                    lease.release()
+                except Exception as exc:
+                    if execution_started:
+                        release_error = LangGraphLeaseLostError(
+                            "exclusive LangGraph thread ownership was lost on release",
+                            thread_id=thread_id,
+                        )
+                    else:
+                        release_error = LangGraphLeaseUnavailableError(
+                            "exclusive LangGraph thread ownership could not be released"
+                        )
+                    release_error.__cause__ = exc
             with self._active_threads_lock:
                 self._active_threads.discard(thread_id)
+            if release_error is not None and not isinstance(
+                body_error, LangGraphLeaseLostError
+            ):
+                raise release_error
+
+    def _active_execution_lease(
+        self,
+        state: AgentState,
+        *,
+        thread_id: str,
+    ) -> ThreadExecutionLease | None:
+        if self.execution_lease_manager is None:
+            return None
+        with self._active_threads_lock:
+            lease = self._active_execution_leases.get(thread_id)
+        if lease is None:
+            raise LangGraphLeaseLostError(
+                "the active LangGraph thread lease is missing",
+                state=state,
+                thread_id=thread_id,
+            )
+        return lease
+
+    def _renew_execution_lease(
+        self,
+        state: AgentState,
+        *,
+        thread_id: str,
+    ) -> None:
+        lease = self._active_execution_lease(state, thread_id=thread_id)
+        if lease is None:
+            return
+        try:
+            lease.renew()
+        except Exception as exc:
+            raise LangGraphLeaseLostError(
+                "the LangGraph thread lease was lost before node execution",
+                state=state,
+                thread_id=thread_id,
+            ) from exc
+
+    def _assert_execution_lease(
+        self,
+        state: AgentState,
+        *,
+        thread_id: str,
+    ) -> None:
+        lease = self._active_execution_lease(state, thread_id=thread_id)
+        if lease is None:
+            return
+        try:
+            lease.assert_valid()
+        except Exception as exc:
+            raise LangGraphLeaseLostError(
+                "the LangGraph thread lease was lost during node execution",
+                state=state,
+                thread_id=thread_id,
+            ) from exc
+
+    def _assert_execution_lease_id(self, thread_id: str) -> None:
+        if self.execution_lease_manager is None:
+            return
+        with self._active_threads_lock:
+            lease = self._active_execution_leases.get(thread_id)
+        if lease is None:
+            raise LangGraphLeaseLostError(
+                "the active LangGraph thread lease is missing",
+                thread_id=thread_id,
+            )
+        try:
+            lease.assert_valid()
+        except Exception as exc:
+            raise LangGraphLeaseLostError(
+                "the LangGraph thread lease was lost before completion",
+                thread_id=thread_id,
+            ) from exc
 
     @classmethod
     def _validate_runtime_state(cls, state: AgentState) -> None:
@@ -1116,6 +1384,17 @@ class LangGraphRuntime:
     ) -> None:
         """Persist full state as one root-node update, then clear pending tasks."""
 
+        configurable = invocation_config.get("configurable", {})
+        thread_id = (
+            configurable.get("thread_id")
+            if isinstance(configurable, Mapping)
+            else None
+        )
+        if not isinstance(thread_id, str):
+            raise LangGraphCheckpointError(
+                "terminal checkpoint config has no valid thread identity"
+            )
+        self._assert_execution_lease_id(thread_id)
         update_state = getattr(self.compiled_graph, "update_state", None)
         if not callable(update_state):
             raise LangGraphCheckpointError(
@@ -1128,7 +1407,11 @@ class LangGraphRuntime:
                 dict(state),
                 as_node=root_node,
             )
+            self._assert_execution_lease_id(thread_id)
             update_state(updated_config, None, as_node=self._api.end)
+            self._assert_execution_lease_id(thread_id)
+        except LangGraphLeaseLostError:
+            raise
         except Exception as exc:
             raise LangGraphCheckpointError(
                 f"failed to persist terminal state for node {node_id}"
@@ -1226,6 +1509,35 @@ class LangGraphRuntime:
             # the same unavailable saver cannot record the uncertainty marker.
             pass
         return terminal
+
+    def _terminalize_execution_lease_loss(
+        self,
+        fallback: AgentState,
+        error: LangGraphLeaseLostError,
+    ) -> AgentState:
+        """Mark in-memory uncertainty without writing as the stale owner."""
+
+        terminal = deepcopy(error.state or fallback)
+        thread_id = error.thread_id or fallback.session_id
+        terminal.session_id = thread_id
+        terminal.status = AgentStatus.MANUAL_REVIEW
+        terminal.metadata.pop("_langgraph_subgraph_steps", None)
+        terminal.metadata["execution_state_uncertain"] = True
+        terminal.metadata["execution_lease_lost"] = True
+        if not any(
+            item.get("code") == "EXECUTION_LEASE_LOST"
+            for item in terminal.errors
+            if isinstance(item, Mapping)
+        ):
+            terminal.add_error(
+                "EXECUTION_LEASE_LOST",
+                "exclusive thread ownership was lost after graph execution began",
+                retryable=False,
+            )
+        with self._active_threads_lock:
+            self._uncertain_threads.add(thread_id)
+        _copy_state(fallback, terminal)
+        return fallback
 
     @staticmethod
     def _require_thread_id(value: str) -> str:
@@ -1391,7 +1703,10 @@ def open_postgres_checkpointer(
 __all__ = [
     "GraphStreamEvent",
     "LangGraphCheckpointError",
+    "LangGraphConcurrencyError",
     "LangGraphDependencyError",
+    "LangGraphLeaseLostError",
+    "LangGraphLeaseUnavailableError",
     "LangGraphRuntime",
     "langgraph_available",
     "open_postgres_checkpointer",

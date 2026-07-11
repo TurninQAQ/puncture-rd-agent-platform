@@ -15,6 +15,8 @@ from puncture_agent.agent import (  # noqa: E402
     AgentState,
     AgentStatus,
     LangGraphRuntime,
+    PostgresAdvisoryThreadExecutionLeaseManager,
+    ThreadLeaseBusy,
     build_mock_handlers,
     langgraph_available,
     open_postgres_checkpointer,
@@ -56,6 +58,9 @@ class LangGraphPostgresRestartTests(unittest.TestCase):
                 PROJECT_ROOT / "graph" / "main_graph.json",
                 handlers,
                 checkpointer=first_saver,
+                execution_lease_manager=(
+                    PostgresAdvisoryThreadExecutionLeaseManager(POSTGRES_DSN)
+                ),
             )
             completed = first_runtime.run(initial)
             self.assertEqual(AgentStatus.SUCCEEDED, completed.status)
@@ -66,6 +71,9 @@ class LangGraphPostgresRestartTests(unittest.TestCase):
                 PROJECT_ROOT / "graph" / "main_graph.json",
                 handlers,
                 checkpointer=second_saver,
+                execution_lease_manager=(
+                    PostgresAdvisoryThreadExecutionLeaseManager(POSTGRES_DSN)
+                ),
             )
             restored = second_runtime.checkpoint_state(thread_id=session_id)
             resumed = second_runtime.resume(thread_id=session_id)
@@ -109,6 +117,9 @@ class LangGraphPostgresRestartTests(unittest.TestCase):
                 PROJECT_ROOT / "graph" / "main_graph.json",
                 handlers_with_approval_gate(),
                 checkpointer=first_saver,
+                execution_lease_manager=(
+                    PostgresAdvisoryThreadExecutionLeaseManager(POSTGRES_DSN)
+                ),
             )
             interrupted = first_runtime.run(initial)
 
@@ -124,6 +135,9 @@ class LangGraphPostgresRestartTests(unittest.TestCase):
                 PROJECT_ROOT / "graph" / "main_graph.json",
                 handlers_with_approval_gate(),
                 checkpointer=second_saver,
+                execution_lease_manager=(
+                    PostgresAdvisoryThreadExecutionLeaseManager(POSTGRES_DSN)
+                ),
             )
             restored = second_runtime.checkpoint_state(thread_id=session_id)
             self.assertEqual(AgentStatus.AWAITING_INPUT, restored.status)
@@ -157,6 +171,22 @@ class LangGraphPostgresRestartTests(unittest.TestCase):
                 "planning_safety_subgraph.generate_candidate_paths"
             ),
         )
+
+    def test_dedicated_advisory_connections_reject_same_thread(self) -> None:
+        thread_id = f"postgres-lease-{uuid4().hex}"
+        first_manager = PostgresAdvisoryThreadExecutionLeaseManager(POSTGRES_DSN)
+        second_manager = PostgresAdvisoryThreadExecutionLeaseManager(POSTGRES_DSN)
+
+        first = first_manager.acquire(thread_id, operation="run")
+        try:
+            with self.assertRaises(ThreadLeaseBusy):
+                second_manager.acquire(thread_id, operation="resume")
+        finally:
+            first.release()
+
+        replacement = second_manager.acquire(thread_id, operation="stream")
+        replacement.assert_valid()
+        replacement.release()
 
 
 if __name__ == "__main__":

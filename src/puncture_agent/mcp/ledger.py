@@ -1,7 +1,7 @@
 """Durable replay ledger for idempotent MCP tool executions.
 
 The graph checkpoint and the external tool response cannot be committed in one
-transaction.  A tool server therefore records a successful public response
+transaction.  A tool server therefore records a replayable terminal public response
 before returning it to the graph.  If the graph process dies before its next
 checkpoint, a new tool-server/runtime instance can replay the recorded response
 without invoking the tool handler again.
@@ -90,8 +90,9 @@ class SQLiteToolReplayLedger:
 
     A short lease prevents simultaneous workers from running one idempotency
     scope.  If a process dies before completing the record, another worker may
-    reclaim it after the lease.  Successful responses are retained until an
-    explicit operational retention policy removes the database.
+    reclaim it after the lease.  Replayable terminal responses (success,
+    partial, and non-retryable failure) are retained until an explicit
+    operational retention policy removes the database.
     """
 
     def __init__(

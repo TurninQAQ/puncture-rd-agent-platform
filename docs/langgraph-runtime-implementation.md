@@ -18,6 +18,8 @@ Implemented and locally verified:
   framework-neutral event stream;
 - dynamic interrupt/resume, same-thread missing-input restart and cross-runtime
   continuation from a safe child-graph checkpoint;
+- cross-runtime `run`/`resume`/`stream` single-flight with a SQLite TTL/CAS test
+  double and a production PostgreSQL session advisory-lock manager;
 - bounded model structured-output parsing and compact ACL-aware RAG evidence;
 - fail-closed RAG module coverage for both task families;
 - all ten legacy Agent node request shapes mapped to the frozen MCP wire schemas;
@@ -90,6 +92,7 @@ Production startup must inject all external dependencies explicitly:
 from puncture_agent.agent import (
     LangGraphRuntime,
     McpToolExecutor,
+    PostgresAdvisoryThreadExecutionLeaseManager,
     build_production_handlers,
     open_postgres_checkpointer,
 )
@@ -104,19 +107,23 @@ handlers = build_production_handlers(
     rag_service=rag_client,
     access_scope_provider=authenticated_scope_provider,
 )
+lease_manager = PostgresAdvisoryThreadExecutionLeaseManager(postgres_dsn)
 
 with open_postgres_checkpointer(postgres_dsn, setup=False) as saver:
     runtime = LangGraphRuntime(
         "graph/main_graph.json",
         handlers,
         checkpointer=saver,
+        execution_lease_manager=lease_manager,
     )
     final_state = runtime.run(initial_state)
 ```
 
 `setup=True` performs the official saver migration and belongs in an explicit
 deployment migration/startup step, not on every request. Do not use the default
-in-memory saver for a production process that must survive restart.
+in-memory saver for a production process that must survive restart. The lease
+manager opens a separate autocommit connection per execution and must never
+reuse the saver connection.
 
 ## Failure routing and checkpoint boundaries
 
@@ -146,9 +153,16 @@ in-memory saver for a production process that must survive restart.
 - Dynamic interrupt values cross the same JSON/raw-byte/size boundary before
   LangGraph can persist them. Invalid values become a durable terminal
   `STATE_BOUNDARY_ERROR` instead of leaving an unreadable interrupted thread.
-- Same-thread single-flight is enforced inside one `LangGraphRuntime` instance.
-  Multiple workers sharing one saver still require a PostgreSQL advisory/lease
-  lock or an equivalent run-level idempotency coordinator.
+- The local active-thread guard remains a fast path, while the injected lease
+  manager serializes the same thread across runtime/worker instances. A busy
+  lease leaves the rejected state and checkpoint untouched. Backend
+  unavailability fails closed before a handler runs.
+- Ownership is renewed/verified before each node, checked immediately after a
+  handler returns or raises, and checked before explicit terminal checkpoint
+  writes and before an API result/event becomes visible. Lease loss stops the
+  stale worker, marks the in-memory state `MANUAL_REVIEW` with
+  `EXECUTION_LEASE_LOST`, and deliberately does not write that marker through
+  the checkpoint saver after ownership is lost.
 
 ## Verification evidence
 
@@ -156,18 +170,18 @@ Local Python 3.10.12 results on 2026-07-11:
 
 ```text
 python3 run_tests.py
-Ran 513 tests in 9.533s
-OK (skipped=16)
+Ran 528 tests in 10.253s
+OK (skipped=17)
 
 PYTHONPATH=/tmp/lginstall3:src:. python3 run_tests.py
-Ran 513 tests in 22.837s
-OK (skipped=8)
+Ran 528 tests in 24.388s
+OK (skipped=9)
 ```
 
-- 497 tests pass in the dependency-free environment;
-- 505 tests pass with real LangGraph 1.2.9 available;
-- the graph suite with real dependencies available runs 87 tests: 84 pass and
-  only two PostgreSQL tests plus the inverse missing-dependency guard are skipped;
+- 511 tests pass in the dependency-free environment;
+- 519 tests pass with real LangGraph 1.2.9 available;
+- the graph suite with real dependencies available runs 102 tests: 98 pass and
+  three PostgreSQL tests plus the inverse missing-dependency guard are skipped;
 - eight tests execute the actual `StateGraph` (seven graph integration/smoke/
   fault tests and one Eval test); the broader failure/concurrency matrix uses the
   deterministic Fake API to isolate branch semantics;
@@ -178,6 +192,9 @@ OK (skipped=8)
 - all ten legacy node request shapes decode as their frozen request dataclasses;
 - 15 durable replay tests prove one handler execution across bridge/runtime/
   ledger reconstruction, plus fail-closed authorization and uncertainty paths;
+- 14 execution-lease tests prove backend contention/expiry/loss behavior and
+  cross-runtime `run/run`, `resume/resume`, and `stream/run` exclusion while
+  allowing different thread IDs to enter handlers concurrently;
 - real LangGraph child nodes and four local MCP planning calls share one trace ID;
 - a real dynamic interrupt resumes across a new runtime from the child checkpoint
   without replaying the already completed candidate-generation node;
@@ -220,8 +237,13 @@ The following remain `NOT_RUN`, not implicitly complete:
   replay count remains one, but an actual process-kill harness is still `NOT_RUN`;
 - a shared PostgreSQL/dedicated replay ledger for multi-host MCP servers and
   atomic coordination between the tool's internal side effect and ledger commit;
-- distributed single-flight for two workers/runtimes executing the same thread;
-  the current guard is process/runtime-instance local;
+- actual PostgreSQL execution of the gated same-thread advisory-lock test and a
+  true multi-process/network-partition fault run; deterministic dual-runtime
+  coverage is complete, but this host has no PostgreSQL test DSN;
+- durable fencing or an incident record for the narrow case where the dedicated
+  advisory-lock connection is lost while a stale handler's external side effect
+  is still completing; the MCP replay ledger and manual reconciliation remain
+  required because a session lock alone cannot fence arbitrary external systems;
 - blocking real-saver proof that no API node event is acknowledged before a sync
   checkpoint finishes; deterministic stream-buffer tests cover the adapter logic;
 - the complete failure matrix and 20-session concurrency test on real LangGraph,
