@@ -277,6 +277,44 @@ class PostgresRunRepository:
     def schema(self) -> str:
         return self._schema_name
 
+    def check_health(self) -> None:
+        """Verify connectivity and the exact deployed migration checksum."""
+
+        statements = self._migration_statements()
+        checksum = sha256("\n".join(statements).encode("utf-8")).hexdigest()
+        connection: Any | None = None
+        try:
+            connection = self._connect()
+            row = self._fetchone(
+                connection,
+                f"SELECT name, checksum_sha256 FROM {self._migrations} "
+                "WHERE version = %s",
+                (1,),
+            )
+            if row != ("initial-run-event-store", checksum):
+                raise RunRepositoryConfigurationError()
+            self._execute_discard(
+                connection,
+                f"SELECT 1 FROM {self._runs} LIMIT 0",
+            )
+            self._execute_discard(
+                connection,
+                f"SELECT 1 FROM {self._events} LIMIT 0",
+            )
+            self._execute_discard(
+                connection,
+                f"SELECT 1 FROM {self._mutations} LIMIT 0",
+            )
+            connection.commit()
+        except RunRepositoryError:
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            raise self._map_exception(exc, setup=True) from exc
+        finally:
+            self._close(connection)
+
     def migrate(self) -> None:
         statements = self._migration_statements()
         checksum = sha256("\n".join(statements).encode("utf-8")).hexdigest()

@@ -250,6 +250,8 @@ def _transition_fingerprint(
 
 @runtime_checkable
 class RunRepository(Protocol):
+    def check_health(self) -> None: ...
+
     def create_or_get_started(
         self,
         snapshot: RunSnapshot,
@@ -302,6 +304,11 @@ class InMemoryRunRepository:
         self._records: dict[str, _StoredRun] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
         self._lock = RLock()
+
+    def check_health(self) -> None:
+        """The in-process reference repository is ready while reachable."""
+
+        return None
 
     def create_or_get_started(
         self,

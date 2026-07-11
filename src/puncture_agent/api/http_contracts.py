@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from contracts.artifacts import ArtifactPublicView
+from contracts.enums import ArtifactStatus, ArtifactType
 from puncture_agent.runtime.models import (
     ApprovalDecision,
     EventType,
@@ -68,6 +70,10 @@ _ARTIFACT_ID = Annotated[
         max_length=255,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     ),
+]
+_PUBLIC_METADATA_TEXT = Annotated[
+    StrictStr,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
 ]
 _TEST_CONTROL_KEYS = {
     "approval_id",
@@ -305,6 +311,10 @@ class RunSnapshotResponse(_FrozenApiModel):
     @classmethod
     def from_runtime(cls, snapshot: RunSnapshot) -> "RunSnapshotResponse":
         request = snapshot.request
+        public_metadata = redact_public_value(request.metadata)
+        for key in tuple(public_metadata):
+            if normalize_public_key(key) in _AUTHORITY_METADATA_KEYS:
+                public_metadata[key] = REDACTED
         error = (
             redact_public_value(snapshot.error)
             if snapshot.error is not None
@@ -322,7 +332,7 @@ class RunSnapshotResponse(_FrozenApiModel):
                 tenant_id=request.tenant_id,
                 principal_id=request.principal_id,
                 artifact_ids=request.artifact_ids,
-                metadata=redact_public_value(request.metadata),
+                metadata=public_metadata,
             ),
             status=snapshot.status,
             trace_id=snapshot.trace_id,
@@ -350,15 +360,62 @@ class RunEventResponse(_FrozenApiModel):
 
     @classmethod
     def from_runtime(cls, event: RunEvent) -> "RunEventResponse":
+        node_name = (
+            redact_public_value(event.node_name)
+            if event.node_name is not None
+            else None
+        )
         return cls(
             run_id=event.run_id,
             sequence=event.sequence,
             event_type=event.event_type,
-            node_name=event.node_name,
+            node_name=node_name,
             timestamp=event.timestamp,
             payload=redact_public_value(event.payload),
             trace_id=event.trace_id,
         )
+
+
+class ArtifactMetadataResponse(_FrozenApiModel):
+    artifact_id: _ARTIFACT_ID
+    case_id: _CASE_ID
+    artifact_type: ArtifactType
+    status: ArtifactStatus
+    producer_name: _PUBLIC_METADATA_TEXT
+    producer_version: _PUBLIC_METADATA_TEXT
+    geometry_fingerprint: _PUBLIC_METADATA_TEXT | None
+
+    @field_validator(
+        "producer_name",
+        "producer_version",
+        "geometry_fingerprint",
+    )
+    @classmethod
+    def _metadata_text_is_public(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_public_json_input(value, max_depth=1, max_nodes=1)
+        return value
+
+    @classmethod
+    def from_contract(
+        cls,
+        artifact: ArtifactPublicView,
+    ) -> "ArtifactMetadataResponse":
+        if not isinstance(artifact, ArtifactPublicView):
+            raise TypeError("artifact metadata must be an ArtifactPublicView")
+        return cls(
+            artifact_id=artifact.artifact_id,
+            case_id=artifact.case_id,
+            artifact_type=artifact.artifact_type,
+            status=artifact.status,
+            producer_name=artifact.producer_name,
+            producer_version=artifact.producer_version,
+            geometry_fingerprint=artifact.geometry_fingerprint,
+        )
+
+
+class HealthResponse(_FrozenApiModel):
+    status: Literal["UP", "DOWN", "DEGRADED"]
 
 
 def map_exception_to_http_error(exc: BaseException) -> HttpErrorMapping:
@@ -424,7 +481,9 @@ __all__ = [
     "ApiErrorResponse",
     "ApiRequestValidationError",
     "ApprovalBody",
+    "ArtifactMetadataResponse",
     "AuthenticatedPrincipal",
+    "HealthResponse",
     "HttpErrorMapping",
     "PublicApiErrorCode",
     "RunCreateBody",

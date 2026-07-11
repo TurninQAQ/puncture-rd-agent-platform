@@ -307,7 +307,7 @@ class PydanticHttpContractTests(unittest.TestCase):
             run_id="run-004",
             sequence=1,
             event_type=EventType.RUN_FAILED,
-            node_name=None,
+            node_name="file:///private/Authorization-Bearer-secret",
             timestamp="2026-07-11T00:00:01.000Z",
             payload=event_payload,
             trace_id="trace-004",
@@ -325,6 +325,7 @@ class PydanticHttpContractTests(unittest.TestCase):
         self.assertEqual(REDACTED, public_snapshot.error["message"])
         self.assertEqual(REDACTED, public_event.payload["patient_name"])
         self.assertEqual([1, 2], public_event.payload["safe"])
+        self.assertEqual(REDACTED, public_event.node_name)
         snapshot.final_report["ok"] = True
         event_payload["safe"].append(3)
         self.assertFalse(public_snapshot.final_report["ok"])

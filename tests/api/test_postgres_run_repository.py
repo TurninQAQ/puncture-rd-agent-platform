@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from hashlib import sha256
 import math
 import os
 import sys
@@ -199,6 +200,70 @@ class PostgresRunRepositoryContractTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual(False, calls[0][1]["autocommit"])
         self.assertEqual(5, calls[0][1]["connect_timeout"])
+
+    def test_healthcheck_commits_success_and_rolls_back_invalid_migration(self) -> None:
+        class Cursor:
+            def __init__(self, row=None) -> None:
+                self.row = row
+                self.closed = False
+
+            def fetchone(self):
+                return self.row
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Connection:
+            def __init__(self) -> None:
+                self.closed = False
+                self.autocommit = False
+                self.health_row = None
+                self.commits = 0
+                self.rollbacks = 0
+                self.closes = 0
+
+            def execute(self, statement, parameters=()):
+                del parameters
+                if "SELECT name, checksum_sha256" in statement:
+                    return Cursor(self.health_row)
+                return Cursor()
+
+            def commit(self) -> None:
+                self.commits += 1
+
+            def rollback(self) -> None:
+                self.rollbacks += 1
+
+            def close(self) -> None:
+                self.closes += 1
+                self.closed = True
+
+        healthy_connection = Connection()
+        healthy = PostgresRunRepository(
+            "postgresql://database.example.test/agent",
+            connection_factory=lambda *args, **kwargs: healthy_connection,
+        )
+        checksum = sha256(
+            "\n".join(healthy._migration_statements()).encode("utf-8")
+        ).hexdigest()
+        healthy_connection.health_row = ("initial-run-event-store", checksum)
+
+        healthy.check_health()
+
+        self.assertEqual(1, healthy_connection.commits)
+        self.assertEqual(0, healthy_connection.rollbacks)
+        self.assertEqual(1, healthy_connection.closes)
+
+        invalid_connection = Connection()
+        invalid = PostgresRunRepository(
+            "postgresql://database.example.test/agent",
+            connection_factory=lambda *args, **kwargs: invalid_connection,
+        )
+        with self.assertRaises(RunRepositoryConfigurationError):
+            invalid.check_health()
+        self.assertEqual(0, invalid_connection.commits)
+        self.assertEqual(1, invalid_connection.rollbacks)
+        self.assertEqual(1, invalid_connection.closes)
 
 
 @unittest.skipUnless(

@@ -80,6 +80,34 @@ The third production-facing boundary now provides:
 The execution version is deliberately internal and does not change the locked
 public `RunSnapshot` or event contracts.
 
+The fourth production-facing boundary now provides:
+
+- an isolated FastAPI application factory with all nine fixed REST/OpenAPI
+  paths, stable operation IDs, fixed structured errors, and no endpoint-local
+  Agent or medical-algorithm logic;
+- Bearer verification before body buffering/JSON parsing, plus explicit
+  `PrincipalAuthenticator`, tenant/project/case `ResourceAuthorizer`, and atomic
+  `ArtifactAccessGateway` ports. There is no permissive default principal;
+- a server-owned project binding persisted in Run request metadata, redacted in
+  public snapshots, and compared with current authorization on every Run read
+  or state-changing operation;
+- pure-ASGI raw body admission that rejects ambiguous/forged lengths,
+  compression, wrong JSON media types, chunked overflow and single oversized
+  chunks before copying them into the bounded parser buffer;
+- a seven-field artifact metadata response with requested-ID consistency,
+  public-value validation and no URI/checksum/private metadata;
+- low-cardinality Prometheus HTTP metrics, non-cacheable operational responses,
+  repository readiness that verifies migration checksum plus all core tables,
+  and `UP`/`DEGRADED`/`DOWN` health semantics;
+- `PostgresApiSettings` and `create_postgres_app`, which compose an injected
+  executor with `InMemoryRunService` and `PostgresRunRepository`. Migration is
+  an explicit lifespan option and never occurs in a request path.
+
+The class name `InMemoryRunService` is historical; the service accepts the
+durable PostgreSQL repository. Company algorithms, identity verification data,
+case/project indexes and artifact storage implementations remain injected
+interfaces, as required.
+
 ## Verification
 
 Local Python 3.10 results on 2026-07-11:
@@ -104,11 +132,30 @@ PYTHONPATH=/tmp/lgpg:src:. python3 -m unittest \
   tests.api.test_postgres_run_repository.PostgresRunRepositoryTests -v
 Ran 8 tests in 3.117s
 OK
+
+python3 run_tests.py (dependency-free final regression)
+Ran 623 tests in 10.116s
+OK (skipped=48)
+
+PUNCTURE_TEST_POSTGRES_DSN=<private-test-dsn> \
+PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. python3 run_tests.py
+Ran 623 tests in 34.129s
+OK (skipped=6)
+
+PUNCTURE_TEST_POSTGRES_DSN=<private-test-dsn> \
+PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. python3 -m unittest \
+  tests.api.test_fastapi_app.FastApiPostgresIntegrationTests \
+  tests.api.test_postgres_run_repository.PostgresRunRepositoryTests -v
+Ran 9 tests
+OK
 ```
 
-The dependency-free run executes the two framework-neutral privacy tests and
-skips seven Pydantic tests explicitly. The implementation-dependency run and CI
-execute all nine. The Pydantic suite pins JSON-schema required fields, task
+The dependency-free run executes the pure-ASGI body-admission tests, the two
+framework-neutral privacy tests and repository contract tests while explicitly
+skipping implementation-backed transport/database cases. The dependency run
+executes all seven Pydantic tests and all thirteen FastAPI transport/body tests;
+the PostgreSQL environment adds the one HTTP composition test and eight Run
+repository tests. The Pydantic suite pins JSON-schema required fields, task
 enum, artifact count, extra-field rejection and JSON round-trip behavior.
 
 Remote evidence on 2026-07-11:
@@ -154,12 +201,10 @@ Remote evidence on 2026-07-11:
 The following remain `NOT_RUN`/not implemented and must not be inferred from the
 completed boundaries:
 
-- all nine FastAPI HTTP endpoints and generated OpenAPI evidence;
 - SSE event replay, `Last-Event-ID`, heartbeat, disconnect and backpressure;
-- raw HTTP request-size enforcement before parsing;
 - an execution reclaim/heartbeat protocol for workers that die while a Run
   remains `RUNNING`;
 - process/SIGTERM restart recovery at the API Run layer;
-- project/case/artifact authorization and an OIDC/JWT verifier;
-- artifact metadata, health and low-cardinality metrics endpoints;
+- a concrete OIDC/JWT verifier, company case/project authorizer, company
+  artifact gateway and company algorithm executor (their ports are complete);
 - HTTP concurrency, 10,000-event replay and production performance baselines.
