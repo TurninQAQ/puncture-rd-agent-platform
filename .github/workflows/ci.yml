@@ -60,6 +60,7 @@ jobs:
       - name: Test
         run: python run_tests.py
       - name: PostgreSQL/LangGraph integration (skips forbidden)
+        if: ${{ always() }}
         env:
           PUNCTURE_TEST_POSTGRES_DSN: postgresql://puncture_test:puncture_test@127.0.0.1:5432/puncture_agent_test?sslmode=disable
         run: >-
