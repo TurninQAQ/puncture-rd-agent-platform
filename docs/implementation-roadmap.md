@@ -57,8 +57,16 @@ Task 07 的第一个生产边界节点已完成：Pydantic v2 request/response/e
 body 伪造的 tenant/principal/role/scope，可信权限只能由认证上下文注入；原始影像字段、
 敏感 metadata、任意 URI、Bearer/JWT/token 和非 JSON/非有限值在进入 Runtime 前拒绝。
 所有 snapshot/event/error 公共视图执行深度脱敏，未知内部错误只返回固定 500/503 消息。
-Pydantic 2.13.4 已显式固定，commit `3c4c6fc` 的三版本 CI 独立 no-skip gate 已通过。FastAPI endpoint、
-SSE、原始 HTTP body 解析前限流、PostgreSQL Run Repository 和 OIDC 尚未完成。
+Pydantic 2.13.4 已显式固定，commit `3c4c6fc` 的三版本 CI 独立 no-skip gate 已通过。
+
+Task 07 的第二个生产边界节点也已完成：新增框架无关 `RunRepository` 协议和线程安全内存参考
+实现，以内部单调 version fence 保护 executor 所有事件和终态提交；Run 创建、tenant-scoped
+idempotency claim、`RUN_CREATED/RUN_STARTED`，以及 approval/success/failure/cancel 状态事件均
+原子提交。普通流只接受 NODE/TOOL 事件，所有写入口执行 1 MiB 有界 JSON 规范化和 detached
+copy，Service/Repository 双层拒绝非法 outcome/snapshot 字段组合。100 路同 key 创建只执行一次，
+100 个并发事件连续编号，cancel/完成、审批缓冲、approve/resume 竞争和 rollback 均已覆盖。
+commit `189040b` 的三版本 CI、PostgreSQL restart、benchmark 与真实 process-kill job 全部通过。
+FastAPI endpoint、SSE、原始 HTTP body 解析前限流、PostgreSQL Run Repository 和 OIDC 尚未完成。
 
 SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码、
 确定性双 Runtime 证据、PostgreSQL 16 三版本 CI 和 service restart/独立进程恢复也已完成。
