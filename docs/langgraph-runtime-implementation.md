@@ -234,6 +234,28 @@ Remote PostgreSQL service-restart evidence on 2026-07-11:
   is 5.69 KB with workflow digest
   `sha256:6d471b09986ac48b7c3ce15da86212e9f5406599d07681314e3006ecc5069e83`.
 
+Remote PostgreSQL checkpoint benchmark evidence on 2026-07-11:
+
+- commit `66f193d1c5d62c2c248c90be5e6ea33c2724c09a` completed
+  [GitHub Actions run 29146879180](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29146879180)
+  successfully on Ubuntu 24.04, Python 3.10 and PostgreSQL 16;
+- after five warm-ups, three rounds of 50 sessions measured median P50 and
+  nearest-rank P95;
+- successful synchronous `PostgresSaver.put()` calls measured P50 `3.131 ms`
+  and P95 `3.606 ms`; `put_writes` remains a separate diagnostic;
+- public `LangGraphRuntime.resume()` through terminal state measured P50
+  `23.429 ms` and P95 `25.829 ms`. Saver connection setup, migration and graph
+  compilation are outside this interval, while production advisory-lease
+  acquisition remains inside it;
+- all 150 terminal checkpoints were re-read, session/case identity and full
+  state were verified, and completed fake planning tools did not replay;
+- the fixed save/resume P95 observations passed the original `50/150 ms`
+  engineering limits. The job intentionally used `record` rather than
+  `enforce` mode because a shared GitHub runner is not a production SLA host;
+- artifact `postgres-checkpoint-benchmark-66f193d1c5d62c2c248c90be5e6ea33c2724c09a`
+  is 29,637 bytes with digest
+  `sha256:0a1bd4a5539294ad12c6932238fa97205c4bd24796aa310b9cfea7362e73a44e`.
+
 - 542 tests pass in the dependency-free environment;
 - 550 tests pass with real LangGraph 1.2.9 available;
 - the graph suite with real dependencies available runs 133 tests: 126 pass and
@@ -331,7 +353,9 @@ The following remain `NOT_RUN`, not implicitly complete:
   buffers all node states until the graph stream drains, with a worst-case memory
   shape of roughly `max_steps * 1 MiB`;
 - live model/RAG/MCP network clients, OAuth/OIDC, OpenTelemetry and API wiring;
-- PostgreSQL checkpoint save/resume P50/P95 evidence.
+- enforced checkpoint save/resume evidence on the intended dedicated
+  PostgreSQL/storage host. The GitHub-hosted record baseline passes the original
+  limits but is not a production performance or SLA claim.
 
 Checkpointing does not make an external side effect exactly-once by itself.
 Stable bridge idempotency keys and a persistent tool-side idempotency ledger are

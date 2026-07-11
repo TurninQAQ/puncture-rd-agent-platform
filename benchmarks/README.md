@@ -59,3 +59,19 @@ Use `--enforce-thresholds` or `PUNCTURE_ENFORCE_PERFORMANCE_GATES=1` only on a
 controlled benchmark host. GitHub-hosted runner artifacts are engineering
 baselines, not production SLA evidence. Never pass the DSN as a command-line
 argument or include it in the environment/storage labels.
+
+Recorded GitHub-hosted baseline on 2026-07-11:
+
+- commit `66f193d1c5d62c2c248c90be5e6ea33c2724c09a`;
+- [workflow run 29146879180](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29146879180), Ubuntu 24.04, Python 3.10 and PostgreSQL 16;
+- 5 warm-ups, 3 rounds x 50 measured sessions;
+- checkpoint `put()` P50/P95: `3.131 / 3.606 ms`;
+- public `resume()` P50/P95: `23.429 / 25.829 ms`;
+- fixed `50 / 150 ms` thresholds observed as passed in `record` mode;
+- artifact `postgres-checkpoint-benchmark-66f193d1c5d62c2c248c90be5e6ea33c2724c09a`,
+  29,637 bytes, digest
+  `sha256:0a1bd4a5539294ad12c6932238fa97205c4bd24796aa310b9cfea7362e73a44e`.
+
+This is a shared GitHub-runner engineering observation. Run with enforcement on
+the intended dedicated PostgreSQL/storage host before treating the limits as a
+release or production performance gate.
