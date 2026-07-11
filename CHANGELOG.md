@@ -5,6 +5,28 @@ Semantic Versioning while it is below 1.0.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-11
+
+### Added
+
+- Local, dependency-free enterprise Hybrid RAG demo with heading-aware ingestion, deterministic BM25/dense recall, RRF, reranking, parent context and stable citations.
+- ACL/module/version/lifecycle enforcement in both recall branches, parent lookup and final output, including explicit no-evidence behavior.
+- Versioned in-memory index generations, checksum-guarded updates, bounded embedding batches and embedding/parser/chunker manifest compatibility.
+- Offline Golden Set and ablation metrics for Recall@5/10, MRR, NDCG@10, correct-version rate, ACL leaks, no-answer accuracy and latency percentiles.
+- Secure optional adapters for OpenSearch, OpenAI-compatible Qwen embeddings and vLLM reranking, plus a versioned OpenSearch deployment profile.
+- Deterministic industrial/EDA local demo and detailed local/deployment test runbooks.
+
+### Security
+
+- Added fail-closed backend-filter verification, citation escaping, strict public RAG type validation, bounded total retrieval deadlines, hashed query traces and non-fatal trace export.
+- Added strict provider URL/auth/TLS/JSON handling, disabled ambient proxies/redirects, bounded response bodies and secret-redacted configuration.
+
+### Verification
+
+- Local Python 3.10 suite: 346 tests run, 339 passed and 7 explicitly gated integration tests skipped.
+- Local RAG demo, compileall, shell syntax, JSON validation and whitespace checks pass.
+- Live OpenSearch, Qwen embedding/reranker services, GPU inference and production-corpus quality/latency evaluation remain `NOT_RUN`.
+
 ## [0.3.0] - 2026-07-10
 
 ### Added

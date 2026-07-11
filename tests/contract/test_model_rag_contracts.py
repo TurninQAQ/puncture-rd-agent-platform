@@ -24,7 +24,12 @@ from puncture_agent.model_gateway import (  # noqa: E402
     validate_json_schema_subset,
     VllmGatewayConfig,
 )
-from puncture_agent.rag import RetrievalRequest, RetrievalResponse, RetrievedChunk  # noqa: E402
+from puncture_agent.rag import (  # noqa: E402
+    EnterpriseRagConfig,
+    RetrievalRequest,
+    RetrievalResponse,
+    RetrievedChunk,
+)
 
 
 class ModelContractTests(unittest.TestCase):
@@ -269,6 +274,28 @@ class RagContractTests(unittest.TestCase):
     def test_retrieval_request_validates_top_k(self) -> None:
         with self.assertRaisesRegex(ValueError, "top_k"):
             RetrievalRequest(request_id="rag-1", query="rules", top_k=0)
+        for invalid in (True, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "top_k"):
+                RetrievalRequest(request_id="rag-type", query="rules", top_k=invalid)
+
+    def test_retrieval_request_rejects_bare_string_sequences(self) -> None:
+        with self.assertRaisesRegex(ValueError, "modules"):
+            RetrievalRequest(request_id="rag-modules", query="rules", modules="eda")
+        with self.assertRaisesRegex(ValueError, "access_scopes"):
+            RetrievalRequest(request_id="rag-scopes", query="rules", access_scopes="secret")
+
+    def test_enterprise_rag_config_rejects_nonfinite_and_mistyped_controls(self) -> None:
+        base = {
+            "endpoint": "memory://",
+            "index_name": "rag-index",
+            "embedding_model": "embedding",
+            "reranker_model": "reranker",
+        }
+        with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+            EnterpriseRagConfig(**base, timeout_seconds=float("nan"))
+        for field_name, invalid in (("dense_top_k", True), ("lexical_top_k", 1.5)):
+            with self.subTest(field_name=field_name), self.assertRaisesRegex(ValueError, "top-k"):
+                EnterpriseRagConfig(**base, **{field_name: invalid})
 
     def test_response_requires_contiguous_ranks(self) -> None:
         chunk = RetrievedChunk(
@@ -294,19 +321,20 @@ class RagContractTests(unittest.TestCase):
             )
 
     def test_chunk_score_must_be_normalized(self) -> None:
-        with self.assertRaisesRegex(ValueError, "normalized"):
-            RetrievedChunk(
-                chunk_id="doc#1",
-                document_id="doc",
-                title="Title",
-                module="planning",
-                version="v1",
-                section="Section",
-                text="Text",
-                score=2.5,
-                rank=1,
-                citation="[Title | v1 | Section]",
-            )
+        for invalid in (2.5, float("nan"), True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "normalized"):
+                RetrievedChunk(
+                    chunk_id="doc#1",
+                    document_id="doc",
+                    title="Title",
+                    module="planning",
+                    version="v1",
+                    section="Section",
+                    text="Text",
+                    score=invalid,
+                    rank=1,
+                    citation="[Title | v1 | Section]",
+                )
 
 
 if __name__ == "__main__":

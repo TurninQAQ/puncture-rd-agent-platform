@@ -98,17 +98,18 @@ class MockRagServiceTests(unittest.TestCase):
         self.assertEqual(context.exception.code, "RAG_TIMEOUT")
         self.assertTrue(context.exception.retryable)
 
-    def test_production_client_remains_an_explicit_stub(self) -> None:
-        client = EnterpriseRagClient(
-            EnterpriseRagConfig(
-                endpoint="http://127.0.0.1:9200",
-                index_name="project-knowledge",
-                embedding_model="embedding-model",
-                reranker_model="reranker-model",
+    def test_production_client_fails_fast_without_explicit_providers(self) -> None:
+        with self.assertRaises(RagServiceError) as context:
+            EnterpriseRagClient(
+                EnterpriseRagConfig(
+                    endpoint="http://127.0.0.1:9200",
+                    index_name="project-knowledge",
+                    embedding_model="embedding-model",
+                    reranker_model="reranker-model",
+                )
             )
-        )
-        with self.assertRaises(NotImplementedError):
-            client.health()
+        self.assertEqual(context.exception.code, "RAG_INVALID_REQUEST")
+        self.assertFalse(context.exception.retryable)
 
 
 if __name__ == "__main__":

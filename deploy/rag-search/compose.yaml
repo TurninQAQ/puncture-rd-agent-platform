@@ -1,0 +1,115 @@
+name: puncture-rag-search
+
+services:
+  opensearch:
+    profiles: ["serve"]
+    image: ${OPENSEARCH_IMAGE:-opensearchproject/opensearch:3.7.0}
+    restart: unless-stopped
+    entrypoint: ["/opt/rag-search/entrypoint.sh"]
+    command: ["opensearch"]
+    ports:
+      - "${OPENSEARCH_PUBLISH_ADDRESS:-127.0.0.1}:${OPENSEARCH_HOST_PORT:-9200}:9200"
+    environment:
+      cluster.name: ${OPENSEARCH_CLUSTER_NAME:-puncture-rag-search}
+      node.name: ${OPENSEARCH_NODE_NAME:-puncture-rag-search-1}
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: ${OPENSEARCH_JAVA_OPTS:--Xms1g -Xmx1g}
+      OPENSEARCH_CLUSTER_NAME: ${OPENSEARCH_CLUSTER_NAME:-puncture-rag-search}
+      OPENSEARCH_NODE_NAME: ${OPENSEARCH_NODE_NAME:-puncture-rag-search-1}
+      OPENSEARCH_ADMIN_PASSWORD_FILE: /run/secrets/opensearch_admin_password
+      OPENSEARCH_HEALTH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_HEALTH_PASSWORD_FILE: /run/secrets/opensearch_admin_password
+      OPENSEARCH_HEALTH_INSECURE: ${OPENSEARCH_INSECURE:-true}
+      DISABLE_SECURITY_PLUGIN: "false"
+      DISABLE_INSTALL_DEMO_CONFIG: "false"
+    volumes:
+      - rag-search-data:/usr/share/opensearch/data
+      - rag-search-snapshots:/mnt/snapshots
+      - ./entrypoint.sh:/opt/rag-search/entrypoint.sh:ro
+      - ./scripts/container_healthcheck.sh:/opt/rag-search/container_healthcheck.sh:ro
+      - ${OPENSEARCH_ADMIN_PASSWORD_FILE_HOST:-/dev/null}:/run/secrets/opensearch_admin_password:ro
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/opt/rag-search/container_healthcheck.sh"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+
+  bootstrap-index:
+    profiles: ["bootstrap"]
+    image: ${RAG_SEARCH_PYTHON_IMAGE:-python:3.12-slim}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment: &verification_environment
+      OPENSEARCH_ENDPOINT: ${OPENSEARCH_ENDPOINT:-https://opensearch:9200}
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD_FILE: /run/secrets/opensearch_admin_password
+      OPENSEARCH_CA_FILE: /run/secrets/opensearch_ca.pem
+      OPENSEARCH_INSECURE: ${OPENSEARCH_INSECURE:-true}
+      RAG_INDEX_TEMPLATE_NAME: ${RAG_INDEX_TEMPLATE_NAME:-puncture-rag-template-v1}
+      RAG_INDEX_NAME: ${RAG_INDEX_NAME:-puncture-rag-v000001}
+      RAG_READ_ALIAS: ${RAG_READ_ALIAS:-puncture-rag-read}
+      RAG_WRITE_ALIAS: ${RAG_WRITE_ALIAS:-puncture-rag-write}
+      RAG_SCHEMA_VERSION: ${RAG_SCHEMA_VERSION:-1}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+      RAG_EMBEDDING_REVISION: ${RAG_EMBEDDING_REVISION:-SET_IMMUTABLE_QWEN3_EMBEDDING_REVISION}
+      RAG_EMBEDDING_DIMENSION: ${RAG_EMBEDDING_DIMENSION:-1024}
+      RAG_QUERY_INSTRUCTION: ${RAG_QUERY_INSTRUCTION:-Retrieve relevant internal engineering passages that answer the query.}
+      RAG_DOCUMENT_INSTRUCTION: ${RAG_DOCUMENT_INSTRUCTION:-}
+      RAG_VECTORS_NORMALIZED: ${RAG_VECTORS_NORMALIZED:-true}
+      RAG_TOKENIZER_REVISION: ${RAG_TOKENIZER_REVISION:-SET_IMMUTABLE_QWEN3_TOKENIZER_REVISION}
+      RAG_MAX_INPUT_TOKENS: ${RAG_MAX_INPUT_TOKENS:-8192}
+      RAG_PARSER_VERSION: ${RAG_PARSER_VERSION:-1}
+      RAG_CHUNKER_VERSION: ${RAG_CHUNKER_VERSION:-1}
+      RAG_REQUEST_TIMEOUT_SECONDS: ${RAG_REQUEST_TIMEOUT_SECONDS:-15}
+    volumes:
+      - ./config:/opt/rag-search/config:ro
+      - ./scripts:/opt/rag-search/scripts:ro
+      - ${OPENSEARCH_ADMIN_PASSWORD_FILE_HOST:-/dev/null}:/run/secrets/opensearch_admin_password:ro
+      - ${OPENSEARCH_CA_FILE_HOST:-/dev/null}:/run/secrets/opensearch_ca.pem:ro
+    command: ["python3", "/opt/rag-search/scripts/bootstrap_index.py"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+  smoke-test:
+    profiles: ["verify"]
+    image: ${RAG_SEARCH_PYTHON_IMAGE:-python:3.12-slim}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      <<: *verification_environment
+      RAG_HEALTH_WAIT_SECONDS: ${RAG_HEALTH_WAIT_SECONDS:-180}
+    volumes:
+      - ./scripts:/opt/rag-search/scripts:ro
+      - ${OPENSEARCH_ADMIN_PASSWORD_FILE_HOST:-/dev/null}:/run/secrets/opensearch_admin_password:ro
+      - ${OPENSEARCH_CA_FILE_HOST:-/dev/null}:/run/secrets/opensearch_ca.pem:ro
+    command: ["python3", "/opt/rag-search/scripts/smoke_test.py"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  rag-search-data:
+  rag-search-snapshots:
+
+networks:
+  default:
+    name: puncture-rag-search-internal
+    internal: true

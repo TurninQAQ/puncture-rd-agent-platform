@@ -7,7 +7,8 @@ puncture R&D Agent. It supplies evidence for label validation, model interfaces,
 path-planning constraints, safety rules, and historical troubleshooting. It does
 not calculate image geometry or medical risk itself.
 
-The production target is a hybrid retrieval chain:
+The implemented local pipeline and optional production-adapter target use this
+hybrid retrieval chain:
 
 ```text
 query normalization / rewrite
@@ -31,6 +32,10 @@ The current `MockRagService` is only a deterministic lexical development double.
 It proves request/response behavior, filters, empty-evidence handling, and failure
 routing; it does not claim BM25, embedding, RRF, or reranker quality.
 
+`EnterpriseRagClient.offline(...)` is the dependency-free executable demo. The
+production facade requires explicit injected search, embedding and reranker
+providers; it never silently falls back to the deterministic implementation.
+
 ## 2. Files and ownership
 
 Public contracts:
@@ -47,6 +52,11 @@ Tests:
 
 - `tests/contract/test_model_rag_contracts.py`
 - `tests/rag/test_mock_rag.py`
+- `tests/rag/test_ingestion.py`
+- `tests/rag/test_enterprise_rag.py`
+- `tests/rag/test_evaluation.py`
+- `tests/rag/test_local_demo.py`
+- provider/OpenSearch tests under `tests/rag/`
 
 Production task:
 
@@ -368,9 +378,10 @@ Existing tests verify:
 - citation/rank shape and `top_k` enforcement;
 - empty evidence instead of fabricated content;
 - normalized retryable timeout failure;
-- visible production stub before task 02 completion.
+- explicit provider injection and deterministic offline mode;
+- fail-closed hybrid retrieval, ingestion, evaluation and provider protocols.
 
-### 11.2 Ingestion unit tests to add
+### 11.2 Implemented ingestion unit tests
 
 Use small synthetic documents. Do not require company files. Cover:
 
@@ -385,7 +396,7 @@ Use small synthetic documents. Do not require company files. Cover:
 9. embedding dimension mismatch fails before index activation;
 10. partial indexing reports failed records and does not swap the live alias.
 
-### 11.3 Retrieval unit tests to add
+### 11.3 Implemented retrieval unit tests
 
 Use fake lexical, vector, and reranker backends. Cover:
 

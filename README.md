@@ -12,8 +12,9 @@
 - 可单独交给其他模型实现的任务卡与验收文档。
 - 已实现的 Module 0：SQLite 持久化 Artifact Registry、原子本地对象存储、幂等发布与访问审计。
 - 已实现的 Module 1：Qwen/vLLM OpenAI 兼容网关、严格工具/结构化输出校验、安全流式传输与私有化部署模板。
+- 已实现的 Module 2：本地可运行的企业 Hybrid RAG、文档摄取、BM25 + dense + RRF + rerank、ACL/版本过滤、Citation、离线 Eval，以及 OpenSearch/Qwen Embedding/Reranker 可选适配器。
 
-当前仍未实现：真实 MCS 解析、TensorRT 推理、医学图像算法、路径规划、安全评估、Elasticsearch/OpenSearch RAG 或真实 LangGraph。Qwen/vLLM 的代码与部署资产已经完成离线验收，但本仓库不声称已经在目标 GPU 上完成模型下载、启动和性能基准；现场步骤见 `docs/qwen-deployment-runbook.md`。
+当前仍未实现：真实 MCS 解析、TensorRT 推理、医学图像算法、路径规划、安全评估或真实 LangGraph。Qwen/vLLM、OpenSearch、Qwen Embedding/Reranker 的代码与部署资产已经完成离线验收，但本仓库不声称已经在目标 GPU/集群上完成模型下载、服务启动或性能基准；现场步骤见对应 runbook。
 
 ## Core rule
 
@@ -26,9 +27,10 @@
 ```bash
 python3 run_tests.py
 PYTHONPATH="$PWD/src:$PWD" python3 -m puncture_agent.api.demo
+python3 examples/local_rag_demo.py
 ```
 
-当前基线：本机执行 248 项测试，241 项通过、7 项门控跳过（2 项真实 `httpx` 传输集成测试由 CI 安装依赖后执行，5 项私有 vLLM 测试需显式端点）；Mock Demo 会串联 Model Gateway、RAG、Agent Graph、工具调用、确定性 Verifier 和 Run Event。
+当前本地 Python 3.10 基线：执行 346 项测试，339 项通过、7 项门控跳过（2 项模型网关真实 `httpx` 集成测试和 5 项私有 vLLM 测试）；`local_rag_demo.py` 无需网络或第三方依赖即可运行企业 RAG 摄取、混合检索、ACL-negative 和 Citation 流程。
 
 ## Reading order
 
@@ -39,9 +41,11 @@ PYTHONPATH="$PWD/src:$PWD" python3 -m puncture_agent.api.demo
 5. `docs/qwen-deployment-runbook.md`
 6. `docs/testing-qwen-vllm.md`
 7. `docs/module-delegation-playbook.md`
-8. `docs/versioning.md`
-9. `contracts/README.md`
-10. 对应的 `specs/*.md`、`tasks/task-*.md` 和 Contract Tests
+8. `docs/testing-rag.md`
+9. `docs/rag-deployment-runbook.md`
+10. `docs/versioning.md`
+11. `contracts/README.md`
+12. 对应的 `specs/*.md`、`tasks/task-*.md` 和 Contract Tests
 
 ## Module implementation order
 

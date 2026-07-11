@@ -1,0 +1,196 @@
+{
+  "index_patterns": [
+    "puncture-rag-v*"
+  ],
+  "priority": 500,
+  "version": 1,
+  "_meta": {
+    "contract": "puncture-rag-index",
+    "schema_version": "1",
+    "embedding_model": "SET_DURING_BOOTSTRAP",
+    "embedding_revision": "SET_DURING_BOOTSTRAP",
+    "embedding_dimension": 1024,
+    "query_instruction": "",
+    "document_instruction": "",
+    "vectors_normalized": true,
+    "tokenizer_revision": "SET_DURING_BOOTSTRAP",
+    "max_input_tokens": 8192,
+    "parser_version": "1",
+    "chunker_version": "1"
+  },
+  "template": {
+    "settings": {
+      "index.knn": true,
+      "index.knn.derived_source.enabled": true,
+      "number_of_shards": 1,
+      "number_of_replicas": 1,
+      "refresh_interval": "5s",
+      "codec": "best_compression",
+      "analysis": {
+        "analyzer": {
+          "code_preserving": {
+            "type": "custom",
+            "tokenizer": "whitespace",
+            "filter": [
+              "lowercase"
+            ]
+          }
+        }
+      }
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "_meta": {
+        "contract": "puncture-rag-chunk-v1",
+        "schema_version": "1",
+        "embedding_model": "SET_DURING_BOOTSTRAP",
+        "embedding_revision": "SET_DURING_BOOTSTRAP",
+        "embedding_dimension": 1024,
+        "query_instruction": "",
+        "document_instruction": "",
+        "vectors_normalized": true,
+        "tokenizer_revision": "SET_DURING_BOOTSTRAP",
+        "max_input_tokens": 8192,
+        "parser_version": "1",
+        "chunker_version": "1"
+      },
+      "properties": {
+        "doc_kind": {
+          "type": "keyword"
+        },
+        "document_id": {
+          "type": "keyword"
+        },
+        "chunk_id": {
+          "type": "keyword"
+        },
+        "parent_id": {
+          "type": "keyword"
+        },
+        "canonical_document_id": {
+          "type": "keyword"
+        },
+        "supersedes_document_id": {
+          "type": "keyword"
+        },
+        "title": {
+          "type": "text",
+          "fields": {
+            "code": {
+              "type": "text",
+              "analyzer": "code_preserving"
+            },
+            "raw": {
+              "type": "keyword",
+              "ignore_above": 1024
+            }
+          }
+        },
+        "source_uri": {
+          "type": "keyword",
+          "index": false,
+          "doc_values": false
+        },
+        "source_type": {
+          "type": "keyword"
+        },
+        "owner": {
+          "type": "keyword"
+        },
+        "module": {
+          "type": "keyword"
+        },
+        "version": {
+          "type": "keyword"
+        },
+        "status": {
+          "type": "keyword"
+        },
+        "access_scopes": {
+          "type": "keyword"
+        },
+        "section": {
+          "type": "text",
+          "fields": {
+            "raw": {
+              "type": "keyword",
+              "ignore_above": 2048
+            }
+          }
+        },
+        "section_path": {
+          "type": "keyword",
+          "ignore_above": 2048
+        },
+        "text": {
+          "type": "text",
+          "fields": {
+            "code": {
+              "type": "text",
+              "analyzer": "code_preserving"
+            }
+          }
+        },
+        "token_count": {
+          "type": "integer"
+        },
+        "chunk_index": {
+          "type": "integer"
+        },
+        "embedding": {
+          "type": "knn_vector",
+          "dimension": 1024,
+          "method": {
+            "name": "hnsw",
+            "space_type": "cosinesimil",
+            "engine": "lucene",
+            "parameters": {
+              "ef_construction": 100,
+              "m": 16
+            }
+          }
+        },
+        "embedding_model": {
+          "type": "keyword"
+        },
+        "embedding_revision": {
+          "type": "keyword"
+        },
+        "embedding_dimension": {
+          "type": "integer"
+        },
+        "checksum_sha256": {
+          "type": "keyword"
+        },
+        "parser_version": {
+          "type": "keyword"
+        },
+        "chunker_version": {
+          "type": "keyword"
+        },
+        "ingestion_run_id": {
+          "type": "keyword"
+        },
+        "created_at": {
+          "type": "date",
+          "format": "strict_date_time"
+        },
+        "updated_at": {
+          "type": "date",
+          "format": "strict_date_time"
+        },
+        "indexed_at": {
+          "type": "date",
+          "format": "strict_date_time"
+        },
+        "metadata": {
+          "type": "flat_object"
+        },
+        "metadata_terms": {
+          "type": "keyword",
+          "ignore_above": 2048
+        }
+      }
+    }
+  }
+}

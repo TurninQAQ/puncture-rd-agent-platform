@@ -1,0 +1,8 @@
+.env
+secrets/
+snapshot-data/
+test-results/
+*.pem
+*.key
+*.p12
+*.jks
