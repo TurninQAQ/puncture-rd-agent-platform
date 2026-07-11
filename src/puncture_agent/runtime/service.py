@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, cast, runtime_checkable
 from uuid import uuid4
 
 from .errors import (
@@ -29,6 +29,10 @@ from .repository import (
     InMemoryRunRepository,
     RunEventDraft,
     RunEventPage,
+    RunExecutionClaim,
+    RunExecutionIntent,
+    RunExecutionIntentKind,
+    RunExecutionRepository,
     RunRepository,
     VersionedRun,
 )
@@ -67,6 +71,7 @@ class _ExecutorContractViolation(RuntimeError):
     pass
 
 
+@runtime_checkable
 class RunExecutor(Protocol):
     def execute(
         self,
@@ -78,12 +83,58 @@ class RunExecutor(Protocol):
     ) -> ExecutionOutcome: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RunExecutionContext:
+    """Fenced execution identity exposed to a recovery-safe executor."""
+
+    run_id: str
+    trace_id: str
+    version: int
+    generation: int
+    recovering: bool
+    assert_active: Callable[[], None]
+    stop_requested: Callable[[], bool]
+
+    def __post_init__(self) -> None:
+        for field_name in ("run_id", "trace_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        for field_name in ("version", "generation"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+        if not isinstance(self.recovering, bool):
+            raise TypeError("recovering must be a boolean")
+        if not callable(self.assert_active) or not callable(self.stop_requested):
+            raise TypeError("execution context callbacks must be callable")
+
+
+@runtime_checkable
+class RecoverableRunExecutor(Protocol):
+    """Executor that can safely replay one fenced durable execution claim."""
+
+    recovery_safe: bool
+
+    def execute_claimed(
+        self,
+        request: RunRequest,
+        emit: Emit,
+        *,
+        context: RunExecutionContext,
+        checkpoint: Mapping[str, Any] | None = None,
+        approval: ApprovalDecision | None = None,
+    ) -> ExecutionOutcome: ...
+
+
 class ScenarioExecutor:
     """Predictable executor controlled by request metadata.
 
     `requires_approval`, `force_failure`, and `dependency_timeout` are mock-only
     controls and must never become production request parameters.
     """
+
+    recovery_safe = True
 
     def __init__(self) -> None:
         self.execution_count = 0
@@ -157,18 +208,63 @@ class ScenarioExecutor:
         emit(EventType.NODE_COMPLETED, "report_generator", {"verified": True})
         return ExecutionOutcome(status=RunStatus.SUCCEEDED, final_report=report)
 
+    def execute_claimed(
+        self,
+        request: RunRequest,
+        emit: Emit,
+        *,
+        context: RunExecutionContext,
+        checkpoint: Mapping[str, Any] | None = None,
+        approval: ApprovalDecision | None = None,
+    ) -> ExecutionOutcome:
+        context.assert_active()
+        outcome = self.execute(
+            request,
+            emit,
+            checkpoint=checkpoint,
+            approval=approval,
+        )
+        context.assert_active()
+        return outcome
+
 
 class InMemoryRunService:
     def __init__(
         self,
-        executor: RunExecutor | None = None,
+        executor: RunExecutor | RecoverableRunExecutor | None = None,
         *,
         repository: RunRepository | None = None,
+        deferred_execution: bool = False,
+        execution_notifier: Callable[[], None] | None = None,
     ) -> None:
+        if not isinstance(deferred_execution, bool):
+            raise TypeError("deferred_execution must be a boolean")
+        if execution_notifier is not None and not callable(execution_notifier):
+            raise TypeError("execution_notifier must be callable")
         self.executor = executor if executor is not None else ScenarioExecutor()
         self.repository = (
             repository if repository is not None else InMemoryRunRepository()
         )
+        self.deferred_execution = deferred_execution
+        self.execution_notifier = execution_notifier
+        if deferred_execution:
+            if execution_notifier is None:
+                raise ValueError(
+                    "deferred execution requires an execution_notifier"
+                )
+            if not isinstance(self.repository, RunExecutionRepository):
+                raise ValueError(
+                    "deferred execution requires a RunExecutionRepository"
+                )
+            if (
+                not isinstance(self.executor, RecoverableRunExecutor)
+                or self.executor.recovery_safe is not True
+            ):
+                raise ValueError(
+                    "deferred execution requires a recovery-safe executor"
+                )
+        elif not isinstance(self.executor, RunExecutor):
+            raise ValueError("inline execution requires a RunExecutor")
 
     def create_run(self, request: RunRequest) -> RunSnapshot:
         now = _utc_now()
@@ -205,6 +301,15 @@ class InMemoryRunService:
         except RunRepositoryError as exc:
             raise self._service_error(exc) from exc
         if not created.created:
+            if (
+                self.deferred_execution
+                and created.run.snapshot.status is RunStatus.RUNNING
+            ):
+                self._notify_execution()
+            return created.run.snapshot
+
+        if self.deferred_execution:
+            self._notify_execution()
             return created.run.snapshot
 
         self._execute(created.run)
@@ -308,6 +413,18 @@ class InMemoryRunService:
             approval_id=None,
             error=None,
         )
+        if self.deferred_execution:
+            resumed = self._compare_and_swap_and_enqueue(
+                current,
+                replacement,
+                intent=RunExecutionIntent(
+                    RunExecutionIntentKind.APPROVAL,
+                    approval=decision,
+                ),
+                events=(),
+            )
+            self._notify_execution()
+            return resumed.snapshot
         resumed = self._compare_and_swap(
             current,
             replacement,
@@ -356,14 +473,55 @@ class InMemoryRunService:
             approval_id=None,
             error=None,
         )
+        if self.deferred_execution:
+            resumed = self._compare_and_swap_and_enqueue(
+                current,
+                replacement,
+                intent=RunExecutionIntent(RunExecutionIntentKind.RESUME),
+                events=(),
+            )
+            self._notify_execution()
+            return resumed.snapshot
         resumed = self._compare_and_swap(current, replacement, events=())
         self._execute(resumed)
         return self.get_run(run_id, tenant_id=tenant_id)
+
+    def execute_claimed(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        stop_requested: Callable[[], bool] = lambda: False,
+    ) -> None:
+        """Execute one durable job while its repository claim remains active."""
+
+        if not self.deferred_execution:
+            raise RunServiceError(
+                "EXECUTION_MODE_CONFLICT",
+                "claimed execution requires deferred execution mode",
+            )
+        if not isinstance(claim, RunExecutionClaim):
+            raise TypeError("claim must be a RunExecutionClaim")
+        if not callable(stop_requested):
+            raise TypeError("stop_requested must be callable")
+        approval = (
+            claim.intent.approval
+            if claim.intent.kind is RunExecutionIntentKind.APPROVAL
+            else None
+        )
+        self._execute(
+            claim.run,
+            approval=approval,
+            claim=claim,
+            stop_requested=stop_requested,
+        )
 
     def _execute(
         self,
         run: VersionedRun,
         approval: ApprovalDecision | None = None,
+        *,
+        claim: RunExecutionClaim | None = None,
+        stop_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         snapshot = run.snapshot
         tenant_id = snapshot.request.tenant_id
@@ -371,6 +529,39 @@ class InMemoryRunService:
         request = deepcopy(snapshot.request)
         pending_transition_events: list[RunEventDraft] = []
         stream_event_ordinal = 0
+        execution_repository: RunExecutionRepository | None = None
+        context: RunExecutionContext | None = None
+
+        if claim is not None:
+            if not isinstance(self.repository, RunExecutionRepository):
+                raise RunServiceError(
+                    "EXECUTION_REPOSITORY_UNAVAILABLE",
+                    "run repository does not support claimed execution",
+                )
+            execution_repository = cast(RunExecutionRepository, self.repository)
+
+            def assert_execution_active() -> None:
+                if stop_requested():
+                    raise ExecutionSuperseded("execution stop was requested")
+                execution_repository.assert_execution_claim(claim)
+
+            context = RunExecutionContext(
+                run_id=snapshot.run_id,
+                trace_id=snapshot.trace_id,
+                version=run.version,
+                generation=claim.generation,
+                recovering=claim.generation > 1,
+                assert_active=assert_execution_active,
+                stop_requested=stop_requested,
+            )
+        else:
+
+            def assert_execution_active() -> None:
+                self.repository.assert_running(
+                    snapshot.run_id,
+                    tenant_id=tenant_id,
+                    expected_version=run.version,
+                )
 
         def emit(
             event_type: EventType,
@@ -443,38 +634,49 @@ class InMemoryRunService:
                     "executor event crossed the JSON boundary"
                 ) from exc
             if event_type is EventType.APPROVAL_REQUESTED:
-                self.repository.assert_running(
-                    snapshot.run_id,
-                    tenant_id=tenant_id,
-                    expected_version=run.version,
-                )
+                assert_execution_active()
                 pending_transition_events.append(draft)
                 return
             try:
-                self.repository.append_if_running(
-                    snapshot.run_id,
-                    tenant_id=tenant_id,
-                    expected_version=run.version,
-                    event=draft,
-                )
+                if execution_repository is not None and claim is not None:
+                    assert_execution_active()
+                    execution_repository.append_if_claimed(claim, event=draft)
+                else:
+                    self.repository.append_if_running(
+                        snapshot.run_id,
+                        tenant_id=tenant_id,
+                        expected_version=run.version,
+                        event=draft,
+                    )
             except RunRepositoryEventConflict as exc:
                 raise _ExecutorContractViolation(
                     "executor reused event_key with different content"
                 ) from exc
-            self.repository.assert_running(
-                snapshot.run_id,
-                tenant_id=tenant_id,
-                expected_version=run.version,
-            )
+            assert_execution_active()
 
         try:
-            outcome = self.executor.execute(
-                request,
-                emit,
-                checkpoint=checkpoint,
-                approval=approval,
-            )
+            if context is not None:
+                assert_execution_active()
+                recoverable_executor = cast(RecoverableRunExecutor, self.executor)
+                outcome = recoverable_executor.execute_claimed(
+                    request,
+                    emit,
+                    context=context,
+                    checkpoint=checkpoint,
+                    approval=approval,
+                )
+                assert_execution_active()
+            else:
+                inline_executor = cast(RunExecutor, self.executor)
+                outcome = inline_executor.execute(
+                    request,
+                    emit,
+                    checkpoint=checkpoint,
+                    approval=approval,
+                )
         except ExecutionSuperseded:
+            if claim is not None:
+                raise
             return
         except _ExecutorContractViolation:
             outcome = self._failed_outcome(
@@ -561,13 +763,25 @@ class InMemoryRunService:
             error=(deepcopy(dict(outcome.error)) if outcome.error is not None else None),
         )
         try:
-            self.repository.compare_and_swap(
-                snapshot.run_id,
-                tenant_id=tenant_id,
-                expected_version=run.version,
-                snapshot=replacement,
-                events=tuple(transition_events),
-            )
+            if execution_repository is not None and claim is not None:
+                assert_execution_active()
+                execution_repository.compare_and_swap_if_claimed(
+                    claim,
+                    snapshot=replacement,
+                    events=tuple(transition_events),
+                )
+            else:
+                self.repository.compare_and_swap(
+                    snapshot.run_id,
+                    tenant_id=tenant_id,
+                    expected_version=run.version,
+                    snapshot=replacement,
+                    events=tuple(transition_events),
+                )
+        except ExecutionSuperseded:
+            if claim is not None:
+                raise
+            return
         except RunRepositoryVersionConflict:
             return
         except RunRepositoryError as exc:
@@ -596,6 +810,43 @@ class InMemoryRunService:
             )
         except RunRepositoryError as exc:
             raise self._service_error(exc) from exc
+
+    def _compare_and_swap_and_enqueue(
+        self,
+        current: VersionedRun,
+        replacement: RunSnapshot,
+        *,
+        intent: RunExecutionIntent,
+        events: tuple[RunEventDraft, ...],
+    ) -> VersionedRun:
+        if not isinstance(self.repository, RunExecutionRepository):
+            raise RunServiceError(
+                "EXECUTION_REPOSITORY_UNAVAILABLE",
+                "run repository does not support durable execution jobs",
+            )
+        try:
+            return self.repository.compare_and_swap_and_enqueue(
+                current.snapshot.run_id,
+                tenant_id=current.snapshot.request.tenant_id,
+                expected_version=current.version,
+                snapshot=replacement,
+                intent=intent,
+                events=events,
+            )
+        except RunRepositoryError as exc:
+            raise self._service_error(exc) from exc
+
+    def _notify_execution(self) -> None:
+        notifier = self.execution_notifier
+        if notifier is None:
+            return
+        try:
+            notifier()
+        except Exception:
+            # The durable job is authoritative. Notification only reduces poll
+            # latency and must never turn a committed transition into an API
+            # failure or encourage a non-idempotent caller retry.
+            return
 
     @staticmethod
     def _failed_outcome(
@@ -713,7 +964,9 @@ class InMemoryRunService:
 __all__ = [
     "Emit",
     "InMemoryRunService",
+    "RecoverableRunExecutor",
     "RunExecutor",
+    "RunExecutionContext",
     "RunServiceError",
     "ScenarioExecutor",
 ]

@@ -466,6 +466,42 @@ class FastApiTransportTests(unittest.TestCase):
         self.assertEqual(40, configured.sse_max_connections)
         self.assertEqual(4, configured.sse_max_connections_per_tenant)
         self.assertEqual(64, configured.to_sse_config().page_size)
+        worker_configured = PostgresApiSettings.from_env(
+            {
+                "PUNCTURE_API_POSTGRES_DSN": "postgresql://db/agent",
+                "PUNCTURE_API_WORKER_ENABLED": "true",
+                "PUNCTURE_API_WORKER_ID": "api-worker-a",
+                "PUNCTURE_API_WORKER_CONCURRENCY": "3",
+                "PUNCTURE_API_WORKER_POLL_INTERVAL_SECONDS": "0.25",
+                "PUNCTURE_API_WORKER_HEARTBEAT_INTERVAL_SECONDS": "4",
+                "PUNCTURE_API_WORKER_LEASE_SECONDS": "16",
+                "PUNCTURE_API_WORKER_SHUTDOWN_GRACE_SECONDS": "12",
+            }
+        )
+        worker_config = worker_configured.to_worker_config()
+        self.assertTrue(worker_configured.worker_enabled)
+        self.assertEqual("api-worker-a", worker_config.worker_id)
+        self.assertEqual(3, worker_config.concurrency)
+        self.assertEqual(0.25, worker_config.poll_interval_seconds)
+        self.assertEqual(4.0, worker_config.heartbeat_interval_seconds)
+        self.assertEqual(16.0, worker_config.lease_seconds)
+        self.assertEqual(12.0, worker_config.shutdown_grace_seconds)
+        self.assertFalse(
+            PostgresApiSettings.from_env(
+                {
+                    "PUNCTURE_API_POSTGRES_DSN": "postgresql://db/agent",
+                    "PUNCTURE_API_WORKER_ENABLED": "false",
+                }
+            ).worker_enabled
+        )
+        with self.assertRaisesRegex(ValueError, "three heartbeat"):
+            PostgresApiSettings.from_env(
+                {
+                    "PUNCTURE_API_POSTGRES_DSN": "postgresql://db/agent",
+                    "PUNCTURE_API_WORKER_HEARTBEAT_INTERVAL_SECONDS": "10",
+                    "PUNCTURE_API_WORKER_LEASE_SECONDS": "20",
+                }
+            )
         with self.assertRaisesRegex(ValueError, "heartbeat"):
             PostgresApiSettings.from_env(
                 {
@@ -482,6 +518,40 @@ class FastApiTransportTests(unittest.TestCase):
                     "PUNCTURE_API_SSE_MAX_CONNECTIONS_PER_TENANT": "3",
                 }
             )
+
+    def test_lifespan_hooks_reverse_shutdown_and_include_extra_metrics(self) -> None:
+        calls: list[str] = []
+
+        class ExtraMetrics:
+            def render(self) -> str:
+                return "puncture_test_extra_metric 1\n"
+
+        app = create_app(
+            self.service,
+            authenticator=self.authenticator,
+            authorizer=self.authorizer,
+            artifact_gateway=self.artifacts,
+            additional_metrics=(ExtraMetrics(),),
+            startup_hooks=(
+                lambda: calls.append("start-a"),
+                lambda: calls.append("start-b"),
+            ),
+            shutdown_hooks=(
+                lambda: calls.append("stop-a"),
+                lambda: calls.append("stop-b"),
+            ),
+        )
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            self.assertEqual(["start-a", "start-b"], calls)
+            self.assertIn(
+                "puncture_test_extra_metric 1",
+                client.get("/metrics").text,
+            )
+        self.assertEqual(
+            ["start-a", "start-b", "stop-b", "stop-a"],
+            calls,
+        )
 
     def test_create_get_event_replay_artifact_metadata_and_metrics(self) -> None:
         created = self.client.post(
@@ -1611,6 +1681,7 @@ class FastApiPostgresIntegrationTests(unittest.TestCase):
             PostgresApiSettings,
             create_postgres_app,
         )
+        from puncture_agent.runtime.worker import WorkerState
 
         schema = f"fastapi_{uuid4().hex[:20]}"
         authenticator = _Authenticator()
@@ -1659,14 +1730,44 @@ class FastApiPostgresIntegrationTests(unittest.TestCase):
 
                 self.assertEqual(200, first.status_code, first.text)
                 self.assertEqual(first.json()["run_id"], second.json()["run_id"])
+                self.assertEqual("RUNNING", first.json()["status"])
+                run_id = first.json()["run_id"]
+                deadline = time.monotonic() + 3.0
+                terminal = None
+                while time.monotonic() < deadline:
+                    terminal = client.get(
+                        f"/api/v1/runs/{run_id}",
+                        headers=FastApiTransportTests._headers(),
+                    )
+                    if terminal.json().get("status") == "SUCCEEDED":
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(terminal)
+                assert terminal is not None
+                self.assertEqual("SUCCEEDED", terminal.json()["status"])
                 self.assertEqual(1, executor.execution_count)
                 self.assertEqual({"status": "UP"}, health.json())
+                self.assertEqual(WorkerState.RUNNING, app.state.run_worker.status.state)
+                worker_deadline = time.monotonic() + 1.0
+                while (
+                    app.state.run_worker.status.active_executions
+                    and time.monotonic() < worker_deadline
+                ):
+                    time.sleep(0.005)
+                self.assertEqual(0, app.state.run_worker.status.active_executions)
+                worker_metrics = client.get("/metrics").text
+                self.assertIn("puncture_worker_claims_started_total 1", worker_metrics)
+                self.assertIn(
+                    'puncture_worker_execution_outcomes_total{outcome="completed"} 1',
+                    worker_metrics,
+                )
                 with psycopg.connect(POSTGRES_DSN, autocommit=True) as connection:
                     connection.execute(f'DROP TABLE "{schema}".run_events')
                 self.assertEqual(
                     {"status": "DOWN"},
                     client.get("/health").json(),
                 )
+            self.assertEqual(WorkerState.STOPPED, app.state.run_worker.status.state)
         finally:
             with psycopg.connect(POSTGRES_DSN, autocommit=True) as connection:
                 connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

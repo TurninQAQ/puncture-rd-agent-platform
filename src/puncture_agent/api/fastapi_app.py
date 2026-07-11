@@ -191,6 +191,10 @@ class HealthProbe(Protocol):
     def status(self) -> Literal["UP", "DEGRADED"]: ...
 
 
+class MetricsRenderer(Protocol):
+    def render(self) -> str: ...
+
+
 class AlwaysUpHealthProbe:
     def status(self) -> Literal["UP"]:
         return "UP"
@@ -500,9 +504,11 @@ def create_app(
     metrics: HttpMetrics | None = None,
     sse_config: SseConfig | None = None,
     sse_metrics: SseMetrics | None = None,
+    additional_metrics: Sequence[MetricsRenderer] = (),
     max_request_body_bytes: int = 1024 * 1024,
     allow_test_controls: bool = False,
     startup_hooks: Sequence[Callable[[], None]] = (),
+    shutdown_hooks: Sequence[Callable[[], None]] = (),
 ) -> FastAPI:
     """Create one isolated application with fail-closed injected authority."""
 
@@ -518,9 +524,18 @@ def create_app(
         raise TypeError("sse_metrics must be an SseMetrics")
     if not isinstance(allow_test_controls, bool):
         raise TypeError("allow_test_controls must be a boolean")
-    hooks = tuple(startup_hooks)
-    if any(not callable(hook) for hook in hooks):
+    start_hooks = tuple(startup_hooks)
+    stop_hooks = tuple(shutdown_hooks)
+    if any(not callable(hook) for hook in start_hooks):
         raise TypeError("startup_hooks must contain callables")
+    if any(not callable(hook) for hook in stop_hooks):
+        raise TypeError("shutdown_hooks must contain callables")
+    metric_renderers = tuple(additional_metrics)
+    if any(
+        not callable(getattr(renderer, "render", None))
+        for renderer in metric_renderers
+    ):
+        raise TypeError("additional_metrics must contain renderers")
     dependencies = _Dependencies(
         run_service=run_service,
         authenticator=authenticator,
@@ -551,9 +566,13 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        for hook in hooks:
-            await run_in_threadpool(hook)
-        yield
+        try:
+            for hook in start_hooks:
+                await run_in_threadpool(hook)
+            yield
+        finally:
+            for hook in reversed(stop_hooks):
+                await run_in_threadpool(hook)
 
     app = FastAPI(
         title="Puncture R&D Agent API",
@@ -566,6 +585,7 @@ def create_app(
     app.state.puncture_metrics = metric_store
     app.state.puncture_sse_metrics = event_stream_metrics
     app.state.puncture_sse_limiter = event_stream_limiter
+    app.state.puncture_additional_metrics = metric_renderers
     app.add_middleware(
         RawBodyAdmissionMiddleware,
         max_body_bytes=max_request_body_bytes,
@@ -1002,8 +1022,13 @@ def create_app(
         tags=["operations"],
     )
     def get_metrics() -> PlainTextResponse:
+        rendered_metrics = (
+            metric_store.render()
+            + event_stream_metrics.render()
+            + "".join(renderer.render() for renderer in metric_renderers)
+        )
         return PlainTextResponse(
-            metric_store.render() + event_stream_metrics.render(),
+            rendered_metrics,
             media_type="text/plain; version=0.0.4",
             headers={"Cache-Control": "no-store"},
         )
@@ -1017,6 +1042,7 @@ __all__ = [
     "ArtifactAccessGateway",
     "AuthorizedCase",
     "HealthProbe",
+    "MetricsRenderer",
     "PrincipalAuthenticator",
     "ResourceAuthorizer",
     "RunService",

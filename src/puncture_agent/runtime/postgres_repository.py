@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from dataclasses import dataclass
 from hashlib import sha256
 import json
 import math
@@ -23,22 +24,36 @@ from .errors import (
     RunRepositoryVersionConflict,
 )
 from .json_boundary import RuntimeJsonBoundaryError, copy_json_mapping
-from .models import EventType, RunEvent, RunRequest, RunSnapshot, RunStatus
+from .models import (
+    ApprovalDecision,
+    EventType,
+    RunEvent,
+    RunRequest,
+    RunSnapshot,
+    RunStatus,
+)
 from .repository import (
     CreateRunResult,
     InMemoryRunRepository,
     RunEventDraft,
     RunEventPage,
+    RunExecutionClaim,
+    RunExecutionIntent,
+    RunExecutionIntentKind,
     VersionedRun,
     _RUNNING_STREAM_EVENTS,
     _canonical_json,
     _canonical_utc_millisecond,
     _event_fingerprint,
+    _execution_intent_document,
+    _execution_intent_fingerprint,
     _request_document,
     _request_fingerprint,
     _snapshot_fingerprint,
     _transition_fingerprint,
     _validate_event_page_request,
+    _validate_execution_identifier,
+    _validate_execution_lease_seconds,
 )
 
 
@@ -74,6 +89,26 @@ _REQUEST_FIELDS = frozenset(
         "metadata",
     }
 )
+_EXECUTION_INTENT_FIELDS = frozenset({"kind", "approval"})
+_APPROVAL_FIELDS = frozenset(
+    {"approval_id", "approved", "principal_id", "comment"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodedExecutionJob:
+    tenant_id: str
+    run_id: str
+    execution_version: int
+    intent: RunExecutionIntent
+    generation: int
+    owner_token: str | None
+    worker_id: str | None
+    claimed_at: str | None
+    heartbeat_at: str | None
+    lease_expires_at: str | None
+    released_at: str | None
+    completed_at: str | None
 
 
 def _quote_identifier(value: str) -> str:
@@ -198,6 +233,55 @@ def _request_from_canonical(
         raise RunRepositoryIntegrityError() from exc
 
 
+def _execution_intent_from_canonical(
+    canonical: str,
+    *,
+    fingerprint: str,
+) -> RunExecutionIntent:
+    if not isinstance(canonical, str) or not isinstance(fingerprint, str):
+        raise RunRepositoryIntegrityError()
+    if sha256(canonical.encode("utf-8")).hexdigest() != fingerprint:
+        raise RunRepositoryIntegrityError()
+    try:
+        document = _strict_json_loads(canonical)
+        if (
+            not isinstance(document, dict)
+            or set(document) != _EXECUTION_INTENT_FIELDS
+            or _canonical_json(document) != canonical
+        ):
+            raise ValueError("execution intent document is invalid")
+        kind = RunExecutionIntentKind(document["kind"])
+        approval_document = document["approval"]
+        approval: ApprovalDecision | None = None
+        if approval_document is not None:
+            if (
+                not isinstance(approval_document, dict)
+                or set(approval_document) != _APPROVAL_FIELDS
+                or not isinstance(approval_document["approval_id"], str)
+                or type(approval_document["approved"]) is not bool
+                or not isinstance(approval_document["principal_id"], str)
+                or not isinstance(approval_document["comment"], str)
+            ):
+                raise ValueError("approval execution intent is invalid")
+            approval = ApprovalDecision(
+                approval_id=approval_document["approval_id"],
+                approved=approval_document["approved"],
+                principal_id=approval_document["principal_id"],
+                comment=approval_document["comment"],
+            )
+        intent = RunExecutionIntent(kind=kind, approval=approval)
+        if _execution_intent_fingerprint(intent) != fingerprint:
+            raise ValueError("execution intent fingerprint changed after decoding")
+        return intent
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        RuntimeJsonBoundaryError,
+    ) as exc:
+        raise RunRepositoryIntegrityError() from exc
+
+
 class PostgresRunRepository:
     """One-transaction-per-operation PostgreSQL implementation.
 
@@ -237,6 +321,7 @@ class PostgresRunRepository:
         self._runs = f'{self._schema}."runs"'
         self._events = f'{self._schema}."run_events"'
         self._mutations = f'{self._schema}."run_mutations"'
+        self._execution_jobs = f'{self._schema}."run_execution_jobs"'
         self._migrations = f'{self._schema}."schema_migrations"'
         self._run_select = f"""
             SELECT
@@ -274,27 +359,50 @@ class PostgresRunRepository:
                 execution_version,
                 event_fingerprint
         """
+        self._execution_job_select = """
+            SELECT
+                tenant_id,
+                run_id,
+                execution_version,
+                intent_fingerprint,
+                intent_canonical,
+                generation,
+                owner_token,
+                worker_id,
+                to_char(claimed_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                to_char(heartbeat_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                to_char(lease_expires_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                to_char(released_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                to_char(completed_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+        """
 
     @property
     def schema(self) -> str:
         return self._schema_name
 
     def check_health(self) -> None:
-        """Verify connectivity and the exact deployed migration checksum."""
+        """Verify connectivity and every deployed migration checksum."""
 
-        statements = self._migration_statements()
-        checksum = sha256("\n".join(statements).encode("utf-8")).hexdigest()
         connection: Any | None = None
         try:
             connection = self._connect()
-            row = self._fetchone(
-                connection,
-                f"SELECT name, checksum_sha256 FROM {self._migrations} "
-                "WHERE version = %s",
-                (1,),
-            )
-            if row != ("initial-run-event-store", checksum):
-                raise RunRepositoryConfigurationError()
+            for version, name, statements in self._migration_versions():
+                checksum = sha256(
+                    "\n".join(statements).encode("utf-8")
+                ).hexdigest()
+                row = self._fetchone(
+                    connection,
+                    f"SELECT name, checksum_sha256 FROM {self._migrations} "
+                    "WHERE version = %s",
+                    (version,),
+                )
+                if row != (name, checksum):
+                    raise RunRepositoryConfigurationError()
             self._execute_discard(
                 connection,
                 f"SELECT 1 FROM {self._runs} LIMIT 0",
@@ -307,6 +415,10 @@ class PostgresRunRepository:
                 connection,
                 f"SELECT 1 FROM {self._mutations} LIMIT 0",
             )
+            self._execute_discard(
+                connection,
+                f"SELECT 1 FROM {self._execution_jobs} LIMIT 0",
+            )
             connection.commit()
         except RunRepositoryError:
             self._rollback(connection)
@@ -318,8 +430,6 @@ class PostgresRunRepository:
             self._close(connection)
 
     def migrate(self) -> None:
-        statements = self._migration_statements()
-        checksum = sha256("\n".join(statements).encode("utf-8")).hexdigest()
         connection: Any | None = None
         try:
             connection = self._connect()
@@ -354,16 +464,20 @@ class PostgresRunRepository:
                 )
                 """,
             )
-            row = self._fetchone(
-                connection,
-                f"SELECT name, checksum_sha256 FROM {self._migrations} "
-                "WHERE version = %s",
-                (1,),
-            )
-            if row is not None:
-                if row != ("initial-run-event-store", checksum):
-                    raise RunRepositoryConfigurationError()
-            else:
+            for version, name, statements in self._migration_versions():
+                checksum = sha256(
+                    "\n".join(statements).encode("utf-8")
+                ).hexdigest()
+                row = self._fetchone(
+                    connection,
+                    f"SELECT name, checksum_sha256 FROM {self._migrations} "
+                    "WHERE version = %s",
+                    (version,),
+                )
+                if row is not None:
+                    if row != (name, checksum):
+                        raise RunRepositoryConfigurationError()
+                    continue
                 for statement in statements:
                     self._execute_discard(connection, statement)
                 self._execute_discard(
@@ -373,7 +487,7 @@ class PostgresRunRepository:
                         (version, name, checksum_sha256)
                     VALUES (%s, %s, %s)
                     """,
-                    (1, "initial-run-event-store", checksum),
+                    (version, name, checksum),
                 )
             connection.commit()
         except RunRepositoryError:
@@ -499,6 +613,14 @@ class PostgresRunRepository:
                     or existing_row[4] != request_canonical
                 ):
                     raise RunRepositoryIdempotencyConflict()
+                if not self._execution_job_intent_matches(
+                    connection,
+                    run_id=existing.snapshot.run_id,
+                    tenant_id=existing.snapshot.request.tenant_id,
+                    execution_version=1,
+                    intent=RunExecutionIntent(RunExecutionIntentKind.CREATE),
+                ):
+                    raise RunRepositoryIntegrityError()
                 connection.commit()
                 return CreateRunResult(existing, created=False)
 
@@ -513,6 +635,13 @@ class PostgresRunRepository:
                     execution_version=1,
                     trace_id=normalized.trace_id,
                 )
+            self._insert_execution_job(
+                connection,
+                run_id=normalized.run_id,
+                tenant_id=normalized.request.tenant_id,
+                execution_version=1,
+                intent=RunExecutionIntent(RunExecutionIntentKind.CREATE),
+            )
             commit_attempted = True
             connection.commit()
             return CreateRunResult(VersionedRun(normalized, 1), created=True)
@@ -846,6 +975,68 @@ class PostgresRunRepository:
         snapshot: RunSnapshot,
         events: tuple[RunEventDraft, ...] = (),
     ) -> VersionedRun:
+        return self._compare_and_swap(
+            run_id,
+            tenant_id=tenant_id,
+            expected_version=expected_version,
+            snapshot=snapshot,
+            events=events,
+            intent=None,
+            execution_claim=None,
+        )
+
+    def compare_and_swap_and_enqueue(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        expected_version: int,
+        snapshot: RunSnapshot,
+        intent: RunExecutionIntent,
+        events: tuple[RunEventDraft, ...] = (),
+    ) -> VersionedRun:
+        if not isinstance(intent, RunExecutionIntent):
+            raise TypeError("execution intent is invalid")
+        return self._compare_and_swap(
+            run_id,
+            tenant_id=tenant_id,
+            expected_version=expected_version,
+            snapshot=snapshot,
+            events=events,
+            intent=intent,
+            execution_claim=None,
+        )
+
+    def compare_and_swap_if_claimed(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        snapshot: RunSnapshot,
+        events: tuple[RunEventDraft, ...] = (),
+    ) -> VersionedRun:
+        if not isinstance(claim, RunExecutionClaim):
+            raise TypeError("execution claim is invalid")
+        return self._compare_and_swap(
+            claim.run.snapshot.run_id,
+            tenant_id=claim.run.snapshot.request.tenant_id,
+            expected_version=claim.run.version,
+            snapshot=snapshot,
+            events=events,
+            intent=None,
+            execution_claim=claim,
+        )
+
+    def _compare_and_swap(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        expected_version: int,
+        snapshot: RunSnapshot,
+        events: tuple[RunEventDraft, ...],
+        intent: RunExecutionIntent | None,
+        execution_claim: RunExecutionClaim | None,
+    ) -> VersionedRun:
         InMemoryRunRepository._validate_version(expected_version)
         normalized = InMemoryRunRepository._copy_snapshot(snapshot)
         normalized_events = tuple(
@@ -882,17 +1073,36 @@ class PostgresRunRepository:
                 raise RunRepositoryNotFound()
             current, last_sequence, _ = self._decode_run(current_row)
             if current.version != expected_version:
-                if self._cas_replay_matches(
+                replay_matches = self._cas_replay_matches(
                     connection,
                     run_id=run_id,
                     tenant_id=tenant_id,
                     target_fingerprint=target_fingerprint,
                     transition_fingerprint=transition_fingerprint,
                     expected_version=expected_version,
-                ):
+                )
+                if replay_matches and intent is not None:
+                    replay_matches = self._execution_job_intent_matches(
+                        connection,
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        execution_version=expected_version + 1,
+                        intent=intent,
+                    )
+                if replay_matches and execution_claim is not None:
+                    replay_matches = self._execution_claim_identity_matches(
+                        connection,
+                        execution_claim,
+                    )
+                if replay_matches:
                     connection.commit()
                     return VersionedRun(normalized, expected_version + 1)
                 raise RunRepositoryVersionConflict()
+            if execution_claim is not None:
+                self._require_active_execution_claim(
+                    connection,
+                    execution_claim,
+                )
             InMemoryRunRepository._validate_replacement(
                 current.snapshot,
                 normalized,
@@ -901,6 +1111,19 @@ class PostgresRunRepository:
                 normalized,
                 normalized_events,
             )
+            if intent is not None and normalized.status is not RunStatus.RUNNING:
+                raise RunRepositoryTransitionError(
+                    "execution intent requires a RUNNING target"
+                )
+            if intent is not None:
+                expected_intent = {
+                    RunStatus.WAITING_APPROVAL: RunExecutionIntentKind.APPROVAL,
+                    RunStatus.FAILED: RunExecutionIntentKind.RESUME,
+                }.get(current.snapshot.status)
+                if intent.kind is not expected_intent:
+                    raise RunRepositoryTransitionError(
+                        "execution intent does not match the lifecycle transition"
+                    )
             next_version = expected_version + 1
             next_sequence = last_sequence + len(normalized_events)
             self._execute_discard(
@@ -958,10 +1181,25 @@ class PostgresRunRepository:
                 target_fingerprint=target_fingerprint,
                 transition_fingerprint=transition_fingerprint,
             )
+            if current.snapshot.status is RunStatus.RUNNING:
+                self._complete_execution_job(
+                    connection,
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    execution_version=expected_version,
+                )
+            if intent is not None:
+                self._insert_execution_job(
+                    connection,
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    execution_version=next_version,
+                    intent=intent,
+                )
             commit_attempted = True
             connection.commit()
             return VersionedRun(normalized, next_version)
-        except RunRepositoryError:
+        except (ExecutionSuperseded, RunRepositoryError):
             self._rollback(connection)
             raise
         except Exception as exc:
@@ -974,6 +1212,447 @@ class PostgresRunRepository:
                     target=normalized,
                     target_fingerprint=target_fingerprint,
                     transition_fingerprint=transition_fingerprint,
+                    intent=intent,
+                    execution_claim=execution_claim,
+                )
+            raise self._map_exception(exc) from exc
+        finally:
+            self._close(connection)
+
+    def claim_next_execution(
+        self,
+        *,
+        worker_id: str,
+        owner_token: str,
+        lease_seconds: float,
+    ) -> RunExecutionClaim | None:
+        _validate_execution_identifier("worker_id", worker_id)
+        _validate_execution_identifier("owner_token", owner_token)
+        lease = _validate_execution_lease_seconds(lease_seconds)
+        connection: Any | None = None
+        commit_attempted = False
+        try:
+            connection = self._connect()
+            owner_lock_key = int.from_bytes(
+                sha256(
+                    f"puncture-execution-owner:{owner_token}".encode("utf-8")
+                ).digest()[:8],
+                byteorder="big",
+                signed=True,
+            )
+            self._execute_discard(
+                connection,
+                "SELECT pg_advisory_xact_lock(%s::bigint)",
+                (owner_lock_key,),
+            )
+            existing_identity = self._fetchone(
+                connection,
+                f"""
+                SELECT
+                    j.tenant_id,
+                    j.run_id,
+                    j.execution_version,
+                    j.worker_id,
+                    r.version,
+                    r.status
+                FROM {self._execution_jobs} AS j
+                JOIN {self._runs} AS r
+                  ON r.tenant_id = j.tenant_id AND r.run_id = j.run_id
+                WHERE j.owner_token = %s
+                FOR UPDATE OF j
+                """,
+                (owner_token,),
+            )
+            if existing_identity is not None:
+                (
+                    tenant_id,
+                    run_id,
+                    execution_version,
+                    stored_worker_id,
+                    current_version,
+                    current_status,
+                ) = existing_identity
+                if (
+                    stored_worker_id != worker_id
+                    or current_version != execution_version
+                    or current_status != RunStatus.RUNNING.value
+                ):
+                    raise RunRepositoryTransitionError(
+                        "execution owner token is already in use"
+                    )
+                claim = self._load_execution_claim(
+                    connection,
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    execution_version=execution_version,
+                )
+                if not self._execution_claim_is_active(connection, claim):
+                    raise RunRepositoryTransitionError(
+                        "execution owner token is already in use"
+                    )
+                connection.commit()
+                return claim
+
+            candidate = self._fetchone(
+                connection,
+                f"""
+                SELECT j.tenant_id, j.run_id, j.execution_version
+                FROM {self._execution_jobs} AS j
+                JOIN {self._runs} AS r
+                  ON r.tenant_id = j.tenant_id AND r.run_id = j.run_id
+                WHERE r.status = %s
+                  AND r.version = j.execution_version
+                  AND j.completed_at IS NULL
+                  AND (
+                      j.owner_token IS NULL
+                      OR j.released_at IS NOT NULL
+                      OR j.lease_expires_at <=
+                          date_trunc('milliseconds', clock_timestamp())
+                  )
+                ORDER BY r.updated_at ASC, r.run_id ASC
+                FOR UPDATE OF j SKIP LOCKED
+                LIMIT 1
+                """,
+                (RunStatus.RUNNING.value,),
+            )
+            if candidate is None:
+                connection.commit()
+                return None
+            tenant_id, run_id, execution_version = candidate
+            updated = self._fetchone(
+                connection,
+                f"""
+                WITH db_clock AS (
+                    SELECT date_trunc(
+                        'milliseconds', clock_timestamp()
+                    ) AS now
+                )
+                UPDATE {self._execution_jobs} AS j
+                SET generation = j.generation + 1,
+                    owner_token = %s,
+                    worker_id = %s,
+                    claimed_at = db_clock.now,
+                    heartbeat_at = db_clock.now,
+                    lease_expires_at = date_trunc(
+                        'milliseconds',
+                        db_clock.now + (%s * interval '1 second')
+                    ),
+                    released_at = NULL
+                FROM db_clock
+                WHERE j.tenant_id = %s
+                  AND j.run_id = %s
+                  AND j.execution_version = %s
+                RETURNING j.generation
+                """,
+                (
+                    owner_token,
+                    worker_id,
+                    lease,
+                    tenant_id,
+                    run_id,
+                    execution_version,
+                ),
+            )
+            if updated is None:
+                raise RunRepositoryIntegrityError()
+            claim = self._load_execution_claim(
+                connection,
+                run_id=run_id,
+                tenant_id=tenant_id,
+                execution_version=execution_version,
+            )
+            commit_attempted = True
+            connection.commit()
+            return claim
+        except RunRepositoryError:
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            if commit_attempted:
+                return self._reconcile_execution_claim(
+                    worker_id=worker_id,
+                    owner_token=owner_token,
+                )
+            raise self._map_exception(exc) from exc
+        finally:
+            self._close(connection)
+
+    def heartbeat_execution_claim(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        lease_seconds: float,
+    ) -> RunExecutionClaim:
+        if not isinstance(claim, RunExecutionClaim):
+            raise TypeError("execution claim is invalid")
+        lease = _validate_execution_lease_seconds(lease_seconds)
+        connection: Any | None = None
+        commit_attempted = False
+        try:
+            connection = self._connect()
+            updated = self._fetchone(
+                connection,
+                f"""
+                WITH db_clock AS (
+                    SELECT date_trunc(
+                        'milliseconds', clock_timestamp()
+                    ) AS now
+                )
+                UPDATE {self._execution_jobs} AS j
+                SET heartbeat_at = db_clock.now,
+                    lease_expires_at = date_trunc(
+                        'milliseconds',
+                        db_clock.now + (%s * interval '1 second')
+                    )
+                FROM db_clock
+                WHERE j.tenant_id = %s
+                  AND j.run_id = %s
+                  AND j.execution_version = %s
+                  AND j.generation = %s
+                  AND j.owner_token = %s
+                  AND j.worker_id = %s
+                  AND j.intent_fingerprint = %s
+                  AND j.released_at IS NULL
+                  AND j.completed_at IS NULL
+                  AND j.lease_expires_at > db_clock.now
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {self._runs} AS r
+                      WHERE r.tenant_id = j.tenant_id
+                        AND r.run_id = j.run_id
+                        AND r.version = j.execution_version
+                        AND r.status = %s
+                  )
+                RETURNING j.generation
+                """,
+                (
+                    lease,
+                    claim.run.snapshot.request.tenant_id,
+                    claim.run.snapshot.run_id,
+                    claim.run.version,
+                    claim.generation,
+                    claim.owner_token,
+                    claim.worker_id,
+                    _execution_intent_fingerprint(claim.intent),
+                    RunStatus.RUNNING.value,
+                ),
+            )
+            if updated is None:
+                self._raise_missing_or_superseded_claim(connection, claim)
+            refreshed = self._load_execution_claim(
+                connection,
+                run_id=claim.run.snapshot.run_id,
+                tenant_id=claim.run.snapshot.request.tenant_id,
+                execution_version=claim.run.version,
+            )
+            commit_attempted = True
+            connection.commit()
+            return refreshed
+        except (ExecutionSuperseded, RunRepositoryError):
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            if commit_attempted:
+                return self._reconcile_execution_claim(
+                    worker_id=claim.worker_id,
+                    owner_token=claim.owner_token,
+                )
+            raise self._map_exception(exc) from exc
+        finally:
+            self._close(connection)
+
+    def release_execution_claim(self, claim: RunExecutionClaim) -> None:
+        if not isinstance(claim, RunExecutionClaim):
+            raise TypeError("execution claim is invalid")
+        connection: Any | None = None
+        commit_attempted = False
+        try:
+            connection = self._connect()
+            run_exists = self._fetchone(
+                connection,
+                f"""
+                SELECT 1
+                FROM {self._runs}
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                (
+                    claim.run.snapshot.request.tenant_id,
+                    claim.run.snapshot.run_id,
+                ),
+            )
+            if run_exists is None:
+                raise RunRepositoryNotFound()
+            self._execute_discard(
+                connection,
+                f"""
+                WITH db_clock AS (
+                    SELECT date_trunc(
+                        'milliseconds', clock_timestamp()
+                    ) AS now
+                )
+                UPDATE {self._execution_jobs} AS j
+                SET released_at = COALESCE(j.released_at, db_clock.now),
+                    lease_expires_at = LEAST(
+                        j.lease_expires_at, db_clock.now
+                    )
+                FROM db_clock
+                WHERE j.tenant_id = %s
+                  AND j.run_id = %s
+                  AND j.execution_version = %s
+                  AND j.generation = %s
+                  AND j.owner_token = %s
+                  AND j.worker_id = %s
+                  AND j.intent_fingerprint = %s
+                """,
+                (
+                    claim.run.snapshot.request.tenant_id,
+                    claim.run.snapshot.run_id,
+                    claim.run.version,
+                    claim.generation,
+                    claim.owner_token,
+                    claim.worker_id,
+                    _execution_intent_fingerprint(claim.intent),
+                ),
+            )
+            commit_attempted = True
+            connection.commit()
+        except RunRepositoryError:
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            if commit_attempted and self._execution_claim_was_released(claim):
+                return
+            raise self._map_exception(exc) from exc
+        finally:
+            self._close(connection)
+
+    def abandon_execution_claim(self, claim: RunExecutionClaim) -> None:
+        if not isinstance(claim, RunExecutionClaim):
+            raise TypeError("execution claim is invalid")
+        # Deliberately preserve the lease. Shutdown grace expiry must stop
+        # heartbeats and let PostgreSQL's TTL fence the old execution before a
+        # replacement worker can claim it.
+        return None
+
+    def assert_execution_claim(self, claim: RunExecutionClaim) -> None:
+        if not isinstance(claim, RunExecutionClaim):
+            raise TypeError("execution claim is invalid")
+        connection: Any | None = None
+        try:
+            connection = self._connect()
+            self._require_active_execution_claim(connection, claim)
+            connection.commit()
+        except (ExecutionSuperseded, RunRepositoryError):
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            raise self._map_exception(exc) from exc
+        finally:
+            self._close(connection)
+
+    def append_if_claimed(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        event: RunEventDraft,
+    ) -> RunEvent:
+        if not isinstance(claim, RunExecutionClaim):
+            raise TypeError("execution claim is invalid")
+        normalized = InMemoryRunRepository._copy_event(event)
+        expected_version = claim.run.version
+        if normalized.event_type not in _RUNNING_STREAM_EVENTS:
+            raise RunRepositoryTransitionError(
+                "state events must be committed atomically with a state transition"
+            )
+        if normalized.event_key is None:
+            raise RunRepositoryTransitionError(
+                "running stream events require a stable event_key"
+            )
+        fingerprint = _event_fingerprint(normalized, expected_version)
+        run_id = claim.run.snapshot.run_id
+        tenant_id = claim.run.snapshot.request.tenant_id
+        connection: Any | None = None
+        commit_attempted = False
+        try:
+            connection = self._connect()
+            run_row = self._fetchone(
+                connection,
+                f"""
+                SELECT version, status, trace_id, last_event_sequence
+                FROM {self._runs}
+                WHERE run_id = %s AND tenant_id = %s
+                FOR UPDATE
+                """,
+                (run_id, tenant_id),
+            )
+            if run_row is None:
+                raise RunRepositoryNotFound()
+            existing_row = self._fetchone(
+                connection,
+                self._event_select
+                + f"""
+                  FROM {self._events}
+                  WHERE run_id = %s AND tenant_id = %s AND event_key = %s
+                """,
+                (run_id, tenant_id, normalized.event_key),
+            )
+            if existing_row is not None:
+                existing, event_key, execution_version, stored_fingerprint = (
+                    self._decode_event(existing_row)
+                )
+                if existing.trace_id != run_row[2]:
+                    raise RunRepositoryIntegrityError()
+                if (
+                    event_key != normalized.event_key
+                    or execution_version != expected_version
+                    or stored_fingerprint != fingerprint
+                ):
+                    raise RunRepositoryEventConflict()
+                if not self._execution_claim_identity_matches(connection, claim):
+                    raise ExecutionSuperseded("execution claim was superseded")
+                connection.commit()
+                return existing
+            self._require_active_execution_claim(connection, claim)
+            version, status, trace_id, last_sequence = run_row
+            if version != expected_version or status != RunStatus.RUNNING.value:
+                raise ExecutionSuperseded("execution claim is no longer active")
+            new_sequence = int(last_sequence) + 1
+            self._execute_discard(
+                connection,
+                f"""
+                UPDATE {self._runs}
+                SET last_event_sequence = %s
+                WHERE run_id = %s AND tenant_id = %s
+                """,
+                (new_sequence, run_id, tenant_id),
+            )
+            appended = self._insert_event(
+                connection,
+                run_id=run_id,
+                tenant_id=tenant_id,
+                sequence=new_sequence,
+                event=normalized,
+                event_key=normalized.event_key,
+                execution_version=expected_version,
+                trace_id=trace_id,
+            )
+            commit_attempted = True
+            connection.commit()
+            return appended
+        except (ExecutionSuperseded, RunRepositoryError):
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            if commit_attempted:
+                return self._reconcile_claimed_append(
+                    claim=claim,
+                    event_key=normalized.event_key,
+                    fingerprint=fingerprint,
                 )
             raise self._map_exception(exc) from exc
         finally:
@@ -1162,6 +1841,218 @@ class PostgresRunRepository:
                 "ix_runtime_runs_recovery"
             ON {self._runs} (status, updated_at, run_id)
             WHERE status IN ('RUNNING', 'WAITING_APPROVAL', 'FAILED')
+            """,
+        )
+
+    def _migration_versions(
+        self,
+    ) -> tuple[tuple[int, str, tuple[str, ...]], ...]:
+        return (
+            (1, "initial-run-event-store", self._migration_statements()),
+            (2, "durable-run-execution-jobs", self._execution_job_statements()),
+        )
+
+    def _execution_job_statements(self) -> tuple[str, ...]:
+        intent_values = ", ".join(
+            f"'{intent_kind.value}'" for intent_kind in RunExecutionIntentKind
+        )
+        create_intent = RunExecutionIntent(RunExecutionIntentKind.CREATE)
+        resume_intent = RunExecutionIntent(RunExecutionIntentKind.RESUME)
+        create_canonical = _canonical_json(
+            _execution_intent_document(create_intent)
+        )
+        resume_canonical = _canonical_json(
+            _execution_intent_document(resume_intent)
+        )
+        create_fingerprint = _execution_intent_fingerprint(create_intent)
+        resume_fingerprint = _execution_intent_fingerprint(resume_intent)
+        return (
+            f"""
+            CREATE TABLE {self._execution_jobs} (
+                tenant_id text COLLATE "C" NOT NULL,
+                run_id text COLLATE "C" NOT NULL,
+                execution_version bigint NOT NULL,
+                intent_kind text NOT NULL,
+                intent_fingerprint text NOT NULL,
+                intent_canonical text NOT NULL,
+                intent_json jsonb NOT NULL,
+                generation bigint NOT NULL DEFAULT 0,
+                owner_token text COLLATE "C",
+                worker_id text COLLATE "C",
+                claimed_at timestamptz,
+                heartbeat_at timestamptz,
+                lease_expires_at timestamptz,
+                released_at timestamptz,
+                completed_at timestamptz,
+                created_at timestamptz NOT NULL DEFAULT
+                    date_trunc('milliseconds', clock_timestamp()),
+                CONSTRAINT pk_runtime_run_execution_jobs PRIMARY KEY (
+                    tenant_id, run_id, execution_version
+                ),
+                CONSTRAINT uq_runtime_run_execution_jobs_owner
+                    UNIQUE (owner_token),
+                CONSTRAINT fk_runtime_run_execution_jobs_run
+                    FOREIGN KEY (tenant_id, run_id)
+                    REFERENCES {self._runs} (tenant_id, run_id)
+                    ON DELETE RESTRICT,
+                CONSTRAINT ck_runtime_run_execution_jobs_version
+                    CHECK (execution_version >= 1),
+                CONSTRAINT ck_runtime_run_execution_jobs_kind
+                    CHECK (intent_kind IN ({intent_values})),
+                CONSTRAINT ck_runtime_run_execution_jobs_intent_fingerprint
+                    CHECK (intent_fingerprint ~ '^[0-9a-f]{{64}}$'),
+                CONSTRAINT ck_runtime_run_execution_jobs_intent_object
+                    CHECK (jsonb_typeof(intent_json) = 'object'),
+                CONSTRAINT ck_runtime_run_execution_jobs_intent_canonical
+                    CHECK (intent_json = intent_canonical::jsonb),
+                CONSTRAINT ck_runtime_run_execution_jobs_intent_kind
+                    CHECK (intent_json ->> 'kind' = intent_kind),
+                CONSTRAINT ck_runtime_run_execution_jobs_generation
+                    CHECK (generation >= 0),
+                CONSTRAINT ck_runtime_run_execution_jobs_claim_shape CHECK (
+                    (
+                        generation = 0
+                        AND owner_token IS NULL
+                        AND worker_id IS NULL
+                        AND claimed_at IS NULL
+                        AND heartbeat_at IS NULL
+                        AND lease_expires_at IS NULL
+                        AND (
+                            (
+                                released_at IS NULL
+                                AND completed_at IS NULL
+                            ) OR (
+                                released_at IS NOT NULL
+                                AND completed_at IS NOT NULL
+                            )
+                        )
+                    ) OR (
+                        generation >= 1
+                        AND owner_token IS NOT NULL
+                        AND worker_id IS NOT NULL
+                        AND claimed_at IS NOT NULL
+                        AND heartbeat_at IS NOT NULL
+                        AND lease_expires_at IS NOT NULL
+                    )
+                ),
+                CONSTRAINT ck_runtime_run_execution_jobs_owner_token CHECK (
+                    owner_token IS NULL OR (
+                        btrim(owner_token) <> ''
+                        AND owner_token = btrim(owner_token)
+                        AND octet_length(owner_token) <= 128
+                    )
+                ),
+                CONSTRAINT ck_runtime_run_execution_jobs_worker_id CHECK (
+                    worker_id IS NULL OR (
+                        btrim(worker_id) <> ''
+                        AND worker_id = btrim(worker_id)
+                        AND octet_length(worker_id) <= 128
+                    )
+                ),
+                CONSTRAINT ck_runtime_run_execution_jobs_time_precision CHECK (
+                    created_at = date_trunc('milliseconds', created_at)
+                    AND (
+                        claimed_at IS NULL OR claimed_at =
+                            date_trunc('milliseconds', claimed_at)
+                    )
+                    AND (
+                        heartbeat_at IS NULL OR heartbeat_at =
+                            date_trunc('milliseconds', heartbeat_at)
+                    )
+                    AND (
+                        lease_expires_at IS NULL OR lease_expires_at =
+                            date_trunc('milliseconds', lease_expires_at)
+                    )
+                    AND (
+                        released_at IS NULL OR released_at =
+                            date_trunc('milliseconds', released_at)
+                    )
+                    AND (
+                        completed_at IS NULL OR completed_at =
+                            date_trunc('milliseconds', completed_at)
+                    )
+                ),
+                CONSTRAINT ck_runtime_run_execution_jobs_time_order CHECK (
+                    claimed_at IS NULL OR (
+                        heartbeat_at >= claimed_at
+                        AND lease_expires_at >= heartbeat_at
+                        AND (released_at IS NULL OR released_at >= claimed_at)
+                        AND (completed_at IS NULL OR completed_at >= claimed_at)
+                    )
+                ),
+                CONSTRAINT ck_runtime_run_execution_jobs_completion CHECK (
+                    completed_at IS NULL OR released_at IS NOT NULL
+                )
+            )
+            """,
+            f"""
+            WITH db_clock AS (
+                SELECT date_trunc('milliseconds', clock_timestamp()) AS now
+            )
+            INSERT INTO {self._execution_jobs} (
+                tenant_id,
+                run_id,
+                execution_version,
+                intent_kind,
+                intent_fingerprint,
+                intent_canonical,
+                intent_json,
+                released_at,
+                completed_at
+            )
+            SELECT
+                tenant_id,
+                run_id,
+                1,
+                'CREATE',
+                '{create_fingerprint}',
+                '{create_canonical}',
+                '{create_canonical}'::jsonb,
+                CASE
+                    WHEN status = 'RUNNING' AND version = 1 THEN NULL
+                    ELSE db_clock.now
+                END,
+                CASE
+                    WHEN status = 'RUNNING' AND version = 1 THEN NULL
+                    ELSE db_clock.now
+                END
+            FROM {self._runs}
+            CROSS JOIN db_clock
+            ON CONFLICT DO NOTHING
+            """,
+            f"""
+            INSERT INTO {self._execution_jobs} (
+                tenant_id,
+                run_id,
+                execution_version,
+                intent_kind,
+                intent_fingerprint,
+                intent_canonical,
+                intent_json
+            )
+            SELECT
+                tenant_id,
+                run_id,
+                version,
+                'RESUME',
+                '{resume_fingerprint}',
+                '{resume_canonical}',
+                '{resume_canonical}'::jsonb
+            FROM {self._runs}
+            WHERE status = 'RUNNING' AND version > 1
+            ON CONFLICT DO NOTHING
+            """,
+            f"""
+            CREATE INDEX "ix_runtime_run_execution_jobs_claim"
+            ON {self._execution_jobs} (
+                completed_at,
+                released_at,
+                lease_expires_at,
+                tenant_id,
+                run_id,
+                execution_version
+            )
+            WHERE completed_at IS NULL
             """,
         )
 
@@ -1471,6 +2362,356 @@ class PostgresRunRepository:
             ),
         )
 
+    def _insert_execution_job(
+        self,
+        connection: Any,
+        *,
+        run_id: str,
+        tenant_id: str,
+        execution_version: int,
+        intent: RunExecutionIntent,
+    ) -> None:
+        canonical = _canonical_json(_execution_intent_document(intent))
+        self._execute_discard(
+            connection,
+            f"""
+            INSERT INTO {self._execution_jobs} (
+                tenant_id,
+                run_id,
+                execution_version,
+                intent_kind,
+                intent_fingerprint,
+                intent_canonical,
+                intent_json
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                tenant_id,
+                run_id,
+                execution_version,
+                intent.kind.value,
+                _execution_intent_fingerprint(intent),
+                canonical,
+                canonical,
+            ),
+        )
+
+    def _complete_execution_job(
+        self,
+        connection: Any,
+        *,
+        run_id: str,
+        tenant_id: str,
+        execution_version: int,
+    ) -> None:
+        row = self._fetchone(
+            connection,
+            f"""
+            WITH db_clock AS (
+                SELECT date_trunc('milliseconds', clock_timestamp()) AS now
+            )
+            UPDATE {self._execution_jobs} AS j
+            SET released_at = COALESCE(j.released_at, db_clock.now),
+                completed_at = COALESCE(j.completed_at, db_clock.now)
+            FROM db_clock
+            WHERE j.tenant_id = %s
+              AND j.run_id = %s
+              AND j.execution_version = %s
+            RETURNING j.execution_version
+            """,
+            (tenant_id, run_id, execution_version),
+        )
+        if row != (execution_version,):
+            raise RunRepositoryIntegrityError()
+
+    def _execution_job_intent_matches(
+        self,
+        connection: Any,
+        *,
+        run_id: str,
+        tenant_id: str,
+        execution_version: int,
+        intent: RunExecutionIntent,
+    ) -> bool:
+        row = self._fetchone(
+            connection,
+            f"""
+            SELECT intent_fingerprint, intent_canonical
+            FROM {self._execution_jobs}
+            WHERE tenant_id = %s
+              AND run_id = %s
+              AND execution_version = %s
+            """,
+            (tenant_id, run_id, execution_version),
+        )
+        expected_fingerprint = _execution_intent_fingerprint(intent)
+        expected_canonical = _canonical_json(_execution_intent_document(intent))
+        return row == (expected_fingerprint, expected_canonical)
+
+    def _decode_execution_job(
+        self,
+        row: tuple[Any, ...],
+    ) -> _DecodedExecutionJob:
+        if len(row) != 13:
+            raise RunRepositoryIntegrityError()
+        (
+            tenant_id,
+            run_id,
+            execution_version,
+            intent_fingerprint,
+            intent_canonical,
+            generation,
+            owner_token,
+            worker_id,
+            claimed_at,
+            heartbeat_at,
+            lease_expires_at,
+            released_at,
+            completed_at,
+        ) = row
+        try:
+            if (
+                not isinstance(tenant_id, str)
+                or not isinstance(run_id, str)
+                or isinstance(execution_version, bool)
+                or not isinstance(execution_version, int)
+                or execution_version < 1
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+            ):
+                raise ValueError("execution job identity is invalid")
+            intent = _execution_intent_from_canonical(
+                intent_canonical,
+                fingerprint=intent_fingerprint,
+            )
+            claim_values = (
+                owner_token,
+                worker_id,
+                claimed_at,
+                heartbeat_at,
+                lease_expires_at,
+            )
+            if generation == 0:
+                if any(value is not None for value in claim_values):
+                    raise ValueError("unclaimed execution job has claim fields")
+            else:
+                if any(value is None for value in claim_values):
+                    raise ValueError("claimed execution job is incomplete")
+                _validate_execution_identifier("owner_token", owner_token)
+                _validate_execution_identifier("worker_id", worker_id)
+            for field_name, value in (
+                ("claimed_at", claimed_at),
+                ("heartbeat_at", heartbeat_at),
+                ("lease_expires_at", lease_expires_at),
+                ("released_at", released_at),
+                ("completed_at", completed_at),
+            ):
+                if value is not None:
+                    _canonical_utc_millisecond(value, field_name=field_name)
+            return _DecodedExecutionJob(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                execution_version=execution_version,
+                intent=intent,
+                generation=generation,
+                owner_token=owner_token,
+                worker_id=worker_id,
+                claimed_at=claimed_at,
+                heartbeat_at=heartbeat_at,
+                lease_expires_at=lease_expires_at,
+                released_at=released_at,
+                completed_at=completed_at,
+            )
+        except (TypeError, ValueError, RuntimeJsonBoundaryError) as exc:
+            raise RunRepositoryIntegrityError() from exc
+
+    def _load_execution_claim(
+        self,
+        connection: Any,
+        *,
+        run_id: str,
+        tenant_id: str,
+        execution_version: int,
+    ) -> RunExecutionClaim:
+        run_row = self._fetchone(
+            connection,
+            self._run_select + " WHERE run_id = %s AND tenant_id = %s",
+            (run_id, tenant_id),
+        )
+        if run_row is None:
+            raise RunRepositoryNotFound()
+        run, _, _ = self._decode_run(run_row)
+        job_row = self._fetchone(
+            connection,
+            self._execution_job_select
+            + f"""
+              FROM {self._execution_jobs}
+              WHERE tenant_id = %s
+                AND run_id = %s
+                AND execution_version = %s
+            """,
+            (tenant_id, run_id, execution_version),
+        )
+        if job_row is None:
+            raise RunRepositoryIntegrityError()
+        job = self._decode_execution_job(job_row)
+        if (
+            run.version != execution_version
+            or run.snapshot.status is not RunStatus.RUNNING
+            or job.generation < 1
+            or job.owner_token is None
+            or job.worker_id is None
+            or job.claimed_at is None
+            or job.heartbeat_at is None
+            or job.lease_expires_at is None
+        ):
+            raise ExecutionSuperseded("execution claim is no longer active")
+        return RunExecutionClaim(
+            run=run,
+            intent=job.intent,
+            generation=job.generation,
+            owner_token=job.owner_token,
+            worker_id=job.worker_id,
+            claimed_at=job.claimed_at,
+            heartbeat_at=job.heartbeat_at,
+            lease_expires_at=job.lease_expires_at,
+        )
+
+    def _execution_claim_identity_matches(
+        self,
+        connection: Any,
+        claim: RunExecutionClaim,
+    ) -> bool:
+        row = self._fetchone(
+            connection,
+            self._execution_job_select
+            + f"""
+              FROM {self._execution_jobs}
+              WHERE tenant_id = %s
+                AND run_id = %s
+                AND execution_version = %s
+            """,
+            (
+                claim.run.snapshot.request.tenant_id,
+                claim.run.snapshot.run_id,
+                claim.run.version,
+            ),
+        )
+        if row is None:
+            return False
+        job = self._decode_execution_job(row)
+        return bool(
+            job.generation == claim.generation
+            and job.owner_token == claim.owner_token
+            and job.worker_id == claim.worker_id
+            and _execution_intent_fingerprint(job.intent)
+            == _execution_intent_fingerprint(claim.intent)
+        )
+
+    def _execution_claim_is_active(
+        self,
+        connection: Any,
+        claim: RunExecutionClaim,
+    ) -> bool:
+        row = self._fetchone(
+            connection,
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {self._execution_jobs} AS j
+                JOIN {self._runs} AS r
+                  ON r.tenant_id = j.tenant_id AND r.run_id = j.run_id
+                WHERE j.tenant_id = %s
+                  AND j.run_id = %s
+                  AND j.execution_version = %s
+                  AND j.generation = %s
+                  AND j.owner_token = %s
+                  AND j.worker_id = %s
+                  AND j.intent_fingerprint = %s
+                  AND j.released_at IS NULL
+                  AND j.completed_at IS NULL
+                  AND j.lease_expires_at >
+                      date_trunc('milliseconds', clock_timestamp())
+                  AND r.version = j.execution_version
+                  AND r.status = %s
+            )
+            """,
+            (
+                claim.run.snapshot.request.tenant_id,
+                claim.run.snapshot.run_id,
+                claim.run.version,
+                claim.generation,
+                claim.owner_token,
+                claim.worker_id,
+                _execution_intent_fingerprint(claim.intent),
+                RunStatus.RUNNING.value,
+            ),
+        )
+        return row == (True,)
+
+    def _require_active_execution_claim(
+        self,
+        connection: Any,
+        claim: RunExecutionClaim,
+    ) -> None:
+        row = self._fetchone(
+            connection,
+            f"""
+            SELECT j.generation
+            FROM {self._execution_jobs} AS j
+            JOIN {self._runs} AS r
+              ON r.tenant_id = j.tenant_id AND r.run_id = j.run_id
+            WHERE j.tenant_id = %s
+              AND j.run_id = %s
+              AND j.execution_version = %s
+              AND j.generation = %s
+              AND j.owner_token = %s
+              AND j.worker_id = %s
+              AND j.intent_fingerprint = %s
+              AND j.released_at IS NULL
+              AND j.completed_at IS NULL
+              AND j.lease_expires_at >
+                  date_trunc('milliseconds', clock_timestamp())
+              AND r.version = j.execution_version
+              AND r.status = %s
+            FOR UPDATE OF j
+            """,
+            (
+                claim.run.snapshot.request.tenant_id,
+                claim.run.snapshot.run_id,
+                claim.run.version,
+                claim.generation,
+                claim.owner_token,
+                claim.worker_id,
+                _execution_intent_fingerprint(claim.intent),
+                RunStatus.RUNNING.value,
+            ),
+        )
+        if row is None:
+            self._raise_missing_or_superseded_claim(connection, claim)
+
+    def _raise_missing_or_superseded_claim(
+        self,
+        connection: Any,
+        claim: RunExecutionClaim,
+    ) -> None:
+        row = self._fetchone(
+            connection,
+            f"""
+            SELECT 1
+            FROM {self._runs}
+            WHERE tenant_id = %s AND run_id = %s
+            """,
+            (
+                claim.run.snapshot.request.tenant_id,
+                claim.run.snapshot.run_id,
+            ),
+        )
+        if row is None:
+            raise RunRepositoryNotFound()
+        raise ExecutionSuperseded("execution claim is no longer active")
+
     def _cas_replay_matches(
         self,
         connection: Any,
@@ -1528,6 +2769,14 @@ class PostgresRunRepository:
             )
             event_types = [self._decode_event(event)[0].event_type for event in events]
             if event_types[:2] != [EventType.RUN_CREATED, EventType.RUN_STARTED]:
+                raise RunRepositoryIntegrityError()
+            if not self._execution_job_intent_matches(
+                connection,
+                run_id=run.snapshot.run_id,
+                tenant_id=run.snapshot.request.tenant_id,
+                execution_version=1,
+                intent=RunExecutionIntent(RunExecutionIntentKind.CREATE),
+            ):
                 raise RunRepositoryIntegrityError()
             connection.commit()
             return CreateRunResult(
@@ -1592,6 +2841,128 @@ class PostgresRunRepository:
         finally:
             self._close(connection)
 
+    def _reconcile_execution_claim(
+        self,
+        *,
+        worker_id: str,
+        owner_token: str,
+    ) -> RunExecutionClaim:
+        connection: Any | None = None
+        try:
+            connection = self._connect()
+            row = self._fetchone(
+                connection,
+                f"""
+                SELECT tenant_id, run_id, execution_version, worker_id
+                FROM {self._execution_jobs}
+                WHERE owner_token = %s
+                """,
+                (owner_token,),
+            )
+            if row is None or row[3] != worker_id:
+                raise RunRepositoryUnavailable()
+            claim = self._load_execution_claim(
+                connection,
+                run_id=row[1],
+                tenant_id=row[0],
+                execution_version=row[2],
+            )
+            if not self._execution_claim_is_active(connection, claim):
+                raise RunRepositoryUnavailable()
+            connection.commit()
+            return claim
+        except ExecutionSuperseded as exc:
+            self._rollback(connection)
+            raise RunRepositoryUnavailable() from exc
+        except RunRepositoryError:
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            raise self._map_exception(exc) from exc
+        finally:
+            self._close(connection)
+
+    def _execution_claim_was_released(self, claim: RunExecutionClaim) -> bool:
+        connection: Any | None = None
+        try:
+            connection = self._connect()
+            row = self._fetchone(
+                connection,
+                f"""
+                SELECT released_at IS NOT NULL
+                FROM {self._execution_jobs}
+                WHERE tenant_id = %s
+                  AND run_id = %s
+                  AND execution_version = %s
+                  AND generation = %s
+                  AND owner_token = %s
+                  AND worker_id = %s
+                  AND intent_fingerprint = %s
+                """,
+                (
+                    claim.run.snapshot.request.tenant_id,
+                    claim.run.snapshot.run_id,
+                    claim.run.version,
+                    claim.generation,
+                    claim.owner_token,
+                    claim.worker_id,
+                    _execution_intent_fingerprint(claim.intent),
+                ),
+            )
+            connection.commit()
+            return row == (True,)
+        except Exception:
+            self._rollback(connection)
+            return False
+        finally:
+            self._close(connection)
+
+    def _reconcile_claimed_append(
+        self,
+        *,
+        claim: RunExecutionClaim,
+        event_key: str,
+        fingerprint: str,
+    ) -> RunEvent:
+        connection: Any | None = None
+        try:
+            connection = self._connect()
+            row = self._fetchone(
+                connection,
+                self._event_select
+                + f" FROM {self._events} "
+                "WHERE tenant_id = %s AND run_id = %s AND event_key = %s",
+                (
+                    claim.run.snapshot.request.tenant_id,
+                    claim.run.snapshot.run_id,
+                    event_key,
+                ),
+            )
+            if row is None:
+                raise RunRepositoryUnavailable()
+            event, stored_key, stored_version, stored_fingerprint = (
+                self._decode_event(row)
+            )
+            if (
+                stored_key != event_key
+                or stored_version != claim.run.version
+                or stored_fingerprint != fingerprint
+            ):
+                raise RunRepositoryEventConflict()
+            if not self._execution_claim_identity_matches(connection, claim):
+                raise ExecutionSuperseded("execution claim was superseded")
+            connection.commit()
+            return event
+        except (ExecutionSuperseded, RunRepositoryError):
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            raise self._map_exception(exc) from exc
+        finally:
+            self._close(connection)
+
     def _reconcile_cas(
         self,
         *,
@@ -1601,18 +2972,34 @@ class PostgresRunRepository:
         target: RunSnapshot,
         target_fingerprint: str,
         transition_fingerprint: str,
+        intent: RunExecutionIntent | None,
+        execution_claim: RunExecutionClaim | None,
     ) -> VersionedRun:
         connection: Any | None = None
         try:
             connection = self._connect()
-            if not self._cas_replay_matches(
+            replay_matches = self._cas_replay_matches(
                 connection,
                 run_id=run_id,
                 tenant_id=tenant_id,
                 target_fingerprint=target_fingerprint,
                 transition_fingerprint=transition_fingerprint,
                 expected_version=expected_version,
-            ):
+            )
+            if replay_matches and intent is not None:
+                replay_matches = self._execution_job_intent_matches(
+                    connection,
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    execution_version=expected_version + 1,
+                    intent=intent,
+                )
+            if replay_matches and execution_claim is not None:
+                replay_matches = self._execution_claim_identity_matches(
+                    connection,
+                    execution_claim,
+                )
+            if not replay_matches:
                 raise RunRepositoryUnavailable()
             connection.commit()
             return VersionedRun(target, expected_version + 1)

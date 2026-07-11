@@ -6,12 +6,18 @@ from dataclasses import dataclass, field
 import math
 import os
 from typing import Mapping
+from uuid import uuid4
 
 from fastapi import FastAPI
 
 from puncture_agent.runtime import InMemoryRunService
 from puncture_agent.runtime.postgres_repository import PostgresRunRepository
-from puncture_agent.runtime.service import RunExecutor
+from puncture_agent.runtime.service import RecoverableRunExecutor, RunExecutor
+from puncture_agent.runtime.worker import (
+    RunWorker,
+    WorkerConfig,
+    WorkerState,
+)
 
 from .fastapi_app import (
     ArtifactAccessGateway,
@@ -64,6 +70,13 @@ class PostgresApiSettings:
     sse_max_connection_seconds: float = 600.0
     sse_max_connections: int = 200
     sse_max_connections_per_tenant: int = 20
+    worker_enabled: bool = True
+    worker_id: str | None = None
+    worker_concurrency: int = 1
+    worker_poll_interval_seconds: float = 0.5
+    worker_heartbeat_interval_seconds: float = 5.0
+    worker_lease_seconds: float = 30.0
+    worker_shutdown_grace_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if (
@@ -82,7 +95,10 @@ class PostgresApiSettings:
             )
         if not isinstance(self.migrate_on_startup, bool):
             raise TypeError("migrate_on_startup must be a boolean")
+        if not isinstance(self.worker_enabled, bool):
+            raise TypeError("worker_enabled must be a boolean")
         self.to_sse_config()
+        self.to_worker_config(worker_id=self.worker_id or "worker-validation")
 
     def to_sse_config(self) -> SseConfig:
         return SseConfig(
@@ -92,6 +108,21 @@ class PostgresApiSettings:
             max_connection_seconds=self.sse_max_connection_seconds,
             max_connections=self.sse_max_connections,
             max_connections_per_tenant=self.sse_max_connections_per_tenant,
+        )
+
+    def to_worker_config(self, *, worker_id: str | None = None) -> WorkerConfig:
+        resolved_worker_id = (
+            worker_id if worker_id is not None else self.worker_id
+        )
+        if resolved_worker_id is None:
+            raise ValueError("worker_id is required when building WorkerConfig")
+        return WorkerConfig(
+            worker_id=resolved_worker_id,
+            concurrency=self.worker_concurrency,
+            poll_interval_seconds=self.worker_poll_interval_seconds,
+            heartbeat_interval_seconds=self.worker_heartbeat_interval_seconds,
+            lease_seconds=self.worker_lease_seconds,
+            shutdown_grace_seconds=self.worker_shutdown_grace_seconds,
         )
 
     @classmethod
@@ -154,6 +185,37 @@ class PostgresApiSettings:
                     "20",
                 ),
             ),
+            worker_enabled=_parse_bool(
+                "PUNCTURE_API_WORKER_ENABLED",
+                source.get("PUNCTURE_API_WORKER_ENABLED", "true"),
+            ),
+            worker_id=source.get("PUNCTURE_API_WORKER_ID") or None,
+            worker_concurrency=_parse_positive_int(
+                "PUNCTURE_API_WORKER_CONCURRENCY",
+                source.get("PUNCTURE_API_WORKER_CONCURRENCY", "1"),
+            ),
+            worker_poll_interval_seconds=_parse_positive_float(
+                "PUNCTURE_API_WORKER_POLL_INTERVAL_SECONDS",
+                source.get("PUNCTURE_API_WORKER_POLL_INTERVAL_SECONDS", "0.5"),
+            ),
+            worker_heartbeat_interval_seconds=_parse_positive_float(
+                "PUNCTURE_API_WORKER_HEARTBEAT_INTERVAL_SECONDS",
+                source.get(
+                    "PUNCTURE_API_WORKER_HEARTBEAT_INTERVAL_SECONDS",
+                    "5",
+                ),
+            ),
+            worker_lease_seconds=_parse_positive_float(
+                "PUNCTURE_API_WORKER_LEASE_SECONDS",
+                source.get("PUNCTURE_API_WORKER_LEASE_SECONDS", "30"),
+            ),
+            worker_shutdown_grace_seconds=_parse_positive_float(
+                "PUNCTURE_API_WORKER_SHUTDOWN_GRACE_SECONDS",
+                source.get(
+                    "PUNCTURE_API_WORKER_SHUTDOWN_GRACE_SECONDS",
+                    "30",
+                ),
+            ),
         )
 
 
@@ -164,13 +226,20 @@ class _PostgresHealthProbe:
         optional_probe: HealthProbe | None,
         *,
         artifact_gateway_configured: bool,
+        worker: RunWorker | None,
     ) -> None:
         self._repository = repository
         self._optional_probe = optional_probe
         self._artifact_gateway_configured = artifact_gateway_configured
+        self._worker = worker
 
     def status(self) -> str:
         self._repository.check_health()
+        if (
+            self._worker is not None
+            and self._worker.status.state is not WorkerState.RUNNING
+        ):
+            raise RuntimeError("configured execution worker is not running")
         status = "UP" if self._artifact_gateway_configured else "DEGRADED"
         if self._optional_probe is None:
             return status
@@ -186,7 +255,7 @@ class _PostgresHealthProbe:
 def create_postgres_app(
     settings: PostgresApiSettings,
     *,
-    executor: RunExecutor,
+    executor: RunExecutor | RecoverableRunExecutor,
     authenticator: PrincipalAuthenticator,
     authorizer: ResourceAuthorizer,
     artifact_gateway: ArtifactAccessGateway | None = None,
@@ -195,9 +264,9 @@ def create_postgres_app(
 ) -> FastAPI:
     """Compose FastAPI with PostgreSQL Run persistence and injected execution.
 
-    ``executor`` is intentionally mandatory.  The repository contains no
-    company algorithm implementation, and callers may inject their production
-    executor when it becomes available.
+    ``executor`` is intentionally mandatory. The repository contains no
+    company algorithm implementation. Worker mode requires the injected
+    executor to implement the recovery-safe claimed-execution port.
     """
 
     if not isinstance(settings, PostgresApiSettings):
@@ -211,7 +280,30 @@ def create_postgres_app(
         statement_timeout_ms=settings.statement_timeout_ms,
         lock_timeout_ms=settings.lock_timeout_ms,
     )
-    service = InMemoryRunService(executor, repository=repository)
+    worker: RunWorker | None = None
+    if settings.worker_enabled:
+        wakeup_event = RunWorker.create_wakeup_event()
+        worker_id = settings.worker_id or f"api-{os.getpid()}-{uuid4().hex}"
+        service = InMemoryRunService(
+            executor,
+            repository=repository,
+            deferred_execution=True,
+            execution_notifier=wakeup_event.set,
+        )
+        worker = RunWorker(
+            repository,
+            service,
+            config=settings.to_worker_config(worker_id=worker_id),
+            wakeup_event=wakeup_event,
+        )
+    else:
+        service = InMemoryRunService(executor, repository=repository)
+
+    startup_hooks = []
+    if settings.migrate_on_startup:
+        startup_hooks.append(repository.migrate)
+    if worker is not None:
+        startup_hooks.append(worker.start)
     app = create_app(
         service,
         authenticator=authenticator,
@@ -221,14 +313,18 @@ def create_postgres_app(
             repository,
             optional_health_probe,
             artifact_gateway_configured=artifact_gateway is not None,
+            worker=worker,
         ),
         metrics=metrics,
         sse_config=settings.to_sse_config(),
+        additional_metrics=(worker.metrics,) if worker is not None else (),
         max_request_body_bytes=settings.max_request_body_bytes,
-        startup_hooks=(repository.migrate,) if settings.migrate_on_startup else (),
+        startup_hooks=tuple(startup_hooks),
+        shutdown_hooks=(worker.stop,) if worker is not None else (),
     )
     app.state.run_repository = repository
     app.state.run_service = service
+    app.state.run_worker = worker
     return app
 
 

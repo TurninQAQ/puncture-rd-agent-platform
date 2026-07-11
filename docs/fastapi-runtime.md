@@ -18,15 +18,17 @@ Implemented in this node:
 - bounded JSON event pages plus ordered SSE replay with canonical reconnect
   cursors, heartbeat comments, terminal-tail draining and connection limits;
 - fixed public error responses, health, low-cardinality Prometheus metrics, and
-  PostgreSQL Run/event repository composition.
+  PostgreSQL Run/event repository composition;
+- durable execution intents, background worker claims, independent heartbeat,
+  lease expiry/reclaim, fenced writes and FastAPI lifespan shutdown/recovery.
 
-The company executor is intentionally not implemented. `create_postgres_app`
-requires a `RunExecutor` instance, so the real implementation can be connected
-later without changing an endpoint. The artifact and authorization ports follow
-the same rule.
-
-Asynchronous worker dispatch, execution heartbeat/reclaim, and API-layer
-SIGTERM/restart recovery remain later Task 07 nodes.
+The company executor is intentionally not implemented. With the production
+worker enabled, `create_postgres_app` requires an injected
+`RecoverableRunExecutor` with `recovery_safe = True`; its claimed entry point
+receives the Run/trace/version/generation identity, active-claim assertion and
+cooperative stop callback. The real implementation can therefore be connected
+later without changing an endpoint. Artifact and authorization follow the same
+injected-port rule.
 
 ## Endpoints
 
@@ -119,13 +121,13 @@ never receives an internal URI, checksum, private metadata, or raw volume.
 `puncture_agent.api.postgres_app.create_postgres_app` composes:
 
 ```text
-injected RunExecutor
-        |
-InMemoryRunService (service name retained for compatibility)
-        |
-PostgresRunRepository
-        |
 FastAPI transport
+        |
+InMemoryRunService (deferred mode; historical class name)
+        | durable intent + wakeup
+PostgresRunRepository <---- RunWorker heartbeat/claim/reclaim
+        |
+injected RecoverableRunExecutor
 ```
 
 Despite its historical class name, `InMemoryRunService` accepts a durable
@@ -148,6 +150,13 @@ Configuration uses:
 | `PUNCTURE_API_SSE_MAX_CONNECTION_SECONDS` | `600` | maximum stream lifetime, 0.05–3600 s |
 | `PUNCTURE_API_SSE_MAX_CONNECTIONS` | `200` | per-process global stream limit |
 | `PUNCTURE_API_SSE_MAX_CONNECTIONS_PER_TENANT` | `20` | per-process tenant stream limit |
+| `PUNCTURE_API_WORKER_ENABLED` | `true` | enable durable background execution |
+| `PUNCTURE_API_WORKER_ID` | generated | bounded process/worker identity |
+| `PUNCTURE_API_WORKER_CONCURRENCY` | `1` | maximum active claims, 1–256 |
+| `PUNCTURE_API_WORKER_POLL_INTERVAL_SECONDS` | `0.5` | idle durable-job polling interval |
+| `PUNCTURE_API_WORKER_HEARTBEAT_INTERVAL_SECONDS` | `5` | independent claim heartbeat interval |
+| `PUNCTURE_API_WORKER_LEASE_SECONDS` | `30` | database-clock lease; at least 3 heartbeats |
+| `PUNCTURE_API_WORKER_SHUTDOWN_GRACE_SECONDS` | `30` | cooperative execution shutdown grace |
 
 Prefer a one-shot deployment migration and leave
 `PUNCTURE_API_MIGRATE_ON_STARTUP=false` on API replicas. If startup migration is
@@ -155,6 +164,58 @@ enabled, it runs once in the FastAPI lifespan before requests are accepted; it
 never runs in a request path. `/health` verifies both PostgreSQL connectivity
 and the exact stored migration checksum without returning the DSN, host, schema,
 or backend exception.
+
+The v1-to-v2 deployment is not a mixed-version rolling-write protocol. Quiesce
+v1 API writers, apply v2, then start worker-enabled replicas; an old process
+cannot persist the new approval intent after v2 is installed.
+
+Worker startup follows migration in the lifespan. Shutdown first stops new
+claims, signals active executors, and continues heartbeat during the grace
+period. If an executor still has not returned, heartbeat stops and the claim is
+left untouched until its PostgreSQL lease expires; it is not immediately
+released into concurrent execution. `/health` is `DOWN` when the configured
+worker supervisor is no longer running. `/metrics` adds fixed-dimension worker
+claim, heartbeat, outcome, claim-loss, shutdown-timeout and supervisor-failure
+counters without Run, tenant, case, worker or trace labels.
+
+Setting `PUNCTURE_API_WORKER_ENABLED=false` retains the old synchronous mode for
+local compatibility. It does not provide process-restart recovery and should
+not be presented as the production topology.
+
+## Durable execution and recovery
+
+Migration v2 adds private `run_execution_jobs` rows keyed by
+`(tenant_id, run_id, execution_version)`. Each row stores the canonical and
+fingerprinted execution intent (`CREATE`, full `APPROVAL` decision, or
+`RESUME`), generation, owner token, worker ID, claimed/heartbeat/lease times,
+and release/completion times. The public Run and event schemas do not change.
+
+Claims use PostgreSQL's clock and `FOR UPDATE SKIP LOCKED`. Every ordinary
+event append and terminal transition validates generation, owner, intent,
+unexpired lease, current Run version and `RUNNING` status in the same
+transaction as the write. Reclaim increments generation. Generation is not
+part of the version-scoped event key, so an exact recovery replay returns the
+original sequence while changed content conflicts. Approval decisions are
+persisted atomically with `WAITING_APPROVAL -> RUNNING`, rather than being held
+only in API-process memory.
+
+The v2 migration backfills a completed version-1 `CREATE` history for every
+legacy Run so idempotent create replay remains valid. A version-1 Run that is
+still `RUNNING` keeps that CREATE job claimable; a later-version `RUNNING` Run
+also receives a conservative current `RESUME` job. A pre-v2 process crash that
+lost an in-memory approval decision cannot reconstruct that decision; the
+deployer must review such legacy Runs. New approval jobs preserve the complete
+decision.
+
+The process-level probe starts the real FastAPI/PostgreSQL composition, commits
+one injected-port result under a stable PostgreSQL `call_id`, sends SIGTERM,
+and starts a second API process. The second worker reclaims the same Run at a
+higher generation, replays the stable event identity, observes the existing
+port result and completes with one terminal event. This verifies the recovery
+plumbing and injected idempotency contract. It does not claim that an arbitrary
+company algorithm or external service is exactly-once: production adapters
+must supply stable tool/task IDs plus their own durable idempotency/outbox
+boundary for side effects.
 
 Example composition (the named implementations are supplied by the deployer):
 
@@ -220,15 +281,33 @@ python -m unittest \
   tests.api.test_fastapi_app.FastApiPostgresIntegrationTests -v
 ```
 
+Worker and process-recovery tests:
+
+```bash
+python -m unittest tests.api.test_run_worker -v
+
+PUNCTURE_TEST_POSTGRES_DSN='<private-test-dsn>' \
+PUNCTURE_API_SIGTERM_EVIDENCE_DIR='<private-output-directory>' \
+python -m tests.api.postgres_api_sigterm_probe orchestrate
+```
+
 CI pins FastAPI `0.115.12`, HTTPX `0.28.1`, and Pydantic `2.13.4`, and has
-dedicated no-skip gates for the transport suite, eight SSE tests, PostgreSQL Run
-repository, and PostgreSQL composition.
+dedicated no-skip gates for fourteen transport/body tests, nine worker tests,
+eight SSE tests, eight PostgreSQL Run repository tests, four PostgreSQL
+execution-job tests, PostgreSQL composition, and an independent PostgreSQL 16
+SIGTERM/reclaim job with uploaded evidence.
 
 The 10,000-event test proves bounded, gap-free in-memory paging and frame order;
 it is not a production latency or throughput baseline. Real reverse-proxy slow
 consumer behavior, cluster-wide capacity control, database fault timing during
 an already-open stream, and production HTTP/PostgreSQL performance still need
 deployment-environment evidence.
+
+The recovery probe does not cover host failure, network partition, PostgreSQL
+WAL crash recovery, GPU-kernel cancellation, or atomicity between a company
+system's internal side effect and its idempotency record. An in-flight
+synchronous callback that ignores the stop signal can remain alive until the
+process exits; generation/lease fencing prevents its late repository writes.
 
 Injected authentication/authorization implementations must enforce their own
 network and backend deadlines. The SSE wrapper stops awaiting them at the stream

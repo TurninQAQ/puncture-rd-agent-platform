@@ -13,9 +13,13 @@ from unittest import mock
 from uuid import uuid4
 
 from puncture_agent.runtime import (
+    ApprovalDecision,
     EventType,
     PostgresRunRepository,
     RunEventDraft,
+    RunExecutionIntent,
+    RunExecutionIntentKind,
+    RunExecutionRepository,
     RunRequest,
     RunSnapshot,
     RunStatus,
@@ -26,6 +30,7 @@ from puncture_agent.runtime.errors import (
     RunRepositoryIdempotencyConflict,
     RunRepositoryIntegrityError,
     RunRepositoryNotFound,
+    RunRepositoryTransitionError,
     RunRepositoryUnavailable,
     RunRepositoryVersionConflict,
 )
@@ -217,15 +222,14 @@ class PostgresRunRepositoryContractTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.closed = False
                 self.autocommit = False
-                self.health_row = None
+                self.health_rows = {}
                 self.commits = 0
                 self.rollbacks = 0
                 self.closes = 0
 
             def execute(self, statement, parameters=()):
-                del parameters
                 if "SELECT name, checksum_sha256" in statement:
-                    return Cursor(self.health_row)
+                    return Cursor(self.health_rows.get(parameters[0]))
                 return Cursor()
 
             def commit(self) -> None:
@@ -243,10 +247,13 @@ class PostgresRunRepositoryContractTests(unittest.TestCase):
             "postgresql://database.example.test/agent",
             connection_factory=lambda *args, **kwargs: healthy_connection,
         )
-        checksum = sha256(
-            "\n".join(healthy._migration_statements()).encode("utf-8")
-        ).hexdigest()
-        healthy_connection.health_row = ("initial-run-event-store", checksum)
+        healthy_connection.health_rows = {
+            version: (
+                name,
+                sha256("\n".join(statements).encode("utf-8")).hexdigest(),
+            )
+            for version, name, statements in healthy._migration_versions()
+        }
 
         healthy.check_health()
 
@@ -264,6 +271,22 @@ class PostgresRunRepositoryContractTests(unittest.TestCase):
         self.assertEqual(0, invalid_connection.commits)
         self.assertEqual(1, invalid_connection.rollbacks)
         self.assertEqual(1, invalid_connection.closes)
+
+    def test_execution_contract_preserves_v1_and_exposes_v2(self) -> None:
+        repository = PostgresRunRepository(
+            "postgresql://database.example.test/agent"
+        )
+        self.assertIsInstance(repository, RunExecutionRepository)
+        self.assertEqual(
+            "c358594722a0a42311981f4547110077cf6d389cc7758cd6a2c84c65a710ce00",
+            sha256(
+                "\n".join(repository._migration_statements()).encode("utf-8")
+            ).hexdigest(),
+        )
+        versions = repository._migration_versions()
+        self.assertEqual([1, 2], [item[0] for item in versions])
+        self.assertEqual("initial-run-event-store", versions[0][1])
+        self.assertEqual("durable-run-execution-jobs", versions[1][1])
 
 
 @unittest.skipUnless(
@@ -1175,6 +1198,451 @@ class PostgresRunRepositoryTests(unittest.TestCase):
                     for item in progressed_events
                 ),
             )
+
+
+@unittest.skipUnless(
+    POSTGRES_DSN and _psycopg_available(),
+    "PostgreSQL execution repository environment is not configured",
+)
+class PostgresRunExecutionRepositoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.schema = f"run_exec_{uuid4().hex[:20]}"
+        self.repository = self._repository()
+        self.repository.migrate()
+
+    def tearDown(self) -> None:
+        import psycopg
+
+        with psycopg.connect(POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute("SET lock_timeout = '5s'")
+            connection.execute("SET statement_timeout = '10s'")
+            connection.execute(f'DROP SCHEMA IF EXISTS "{self.schema}" CASCADE')
+
+    def _repository(self, *, connection_factory=None):
+        return PostgresRunRepository(
+            POSTGRES_DSN,
+            schema=self.schema,
+            connect_timeout_seconds=5,
+            statement_timeout_ms=10_000,
+            lock_timeout_ms=5_000,
+            application_name=f"run-exec-{uuid4().hex[:20]}",
+            connection_factory=connection_factory,
+        )
+
+    def _execute_sql(self, statement: str, parameters=()):
+        import psycopg
+
+        with psycopg.connect(POSTGRES_DSN, autocommit=True) as connection:
+            cursor = connection.execute(statement, parameters)
+            return cursor.fetchall() if cursor.description is not None else []
+
+    def _create(self, marker: str):
+        run_request = request(idempotency_key=f"{marker}-{uuid4().hex}")
+        run = self.repository.create_or_get_started(
+            started_snapshot(run_request),
+            initial_events(),
+        ).run
+        return run_request, run
+
+    def test_v1_schema_upgrade_backfills_running_create_job(self) -> None:
+        run_request, created = self._create("v1-upgrade")
+        terminal_request, terminal_created = self._create("v1-terminal")
+        terminal = self.repository.compare_and_swap(
+            terminal_created.snapshot.run_id,
+            tenant_id=terminal_request.tenant_id,
+            expected_version=terminal_created.version,
+            snapshot=replace(
+                terminal_created.snapshot,
+                status=RunStatus.SUCCEEDED,
+                updated_at="2026-07-11T12:00:01.000Z",
+                final_report={"legacy": "terminal"},
+            ),
+            events=(
+                RunEventDraft(
+                    EventType.RUN_COMPLETED,
+                    None,
+                    {"status": RunStatus.SUCCEEDED.value},
+                ),
+            ),
+        )
+        resume_request, resume_created = self._create("v1-resume")
+        failed = self.repository.compare_and_swap(
+            resume_created.snapshot.run_id,
+            tenant_id=resume_request.tenant_id,
+            expected_version=resume_created.version,
+            snapshot=replace(
+                resume_created.snapshot,
+                status=RunStatus.FAILED,
+                updated_at="2026-07-11T12:00:01.000Z",
+                checkpoint={"recoverable": True},
+                error={"code": "LEGACY_TIMEOUT"},
+            ),
+            events=(
+                RunEventDraft(
+                    EventType.RUN_FAILED,
+                    None,
+                    {"code": "LEGACY_TIMEOUT"},
+                ),
+            ),
+        )
+        resumed = self.repository.compare_and_swap(
+            resume_created.snapshot.run_id,
+            tenant_id=resume_request.tenant_id,
+            expected_version=failed.version,
+            snapshot=replace(
+                failed.snapshot,
+                status=RunStatus.RUNNING,
+                updated_at="2026-07-11T12:00:02.000Z",
+                error=None,
+            ),
+        )
+        v1_checksum = self._execute_sql(
+            f'SELECT checksum_sha256 FROM "{self.schema}".schema_migrations '
+            "WHERE version = 1"
+        )[0][0]
+        self._execute_sql(
+            f'DROP TABLE "{self.schema}".run_execution_jobs'
+        )
+        self._execute_sql(
+            f'DELETE FROM "{self.schema}".schema_migrations WHERE version = 2'
+        )
+
+        self.repository.migrate()
+        self.repository.check_health()
+
+        self.assertEqual(
+            v1_checksum,
+            self._execute_sql(
+                f'SELECT checksum_sha256 FROM "{self.schema}".schema_migrations '
+                "WHERE version = 1"
+            )[0][0],
+        )
+        replayed = self.repository.create_or_get_started(
+            started_snapshot(terminal_request),
+            initial_events(),
+        )
+        self.assertFalse(replayed.created)
+        self.assertEqual(terminal, replayed.run)
+        self.assertEqual(
+            [(1, "CREATE", True)],
+            self._execute_sql(
+                f'SELECT execution_version, intent_kind, '
+                f'completed_at IS NOT NULL FROM "{self.schema}".'
+                "run_execution_jobs WHERE tenant_id = %s AND run_id = %s "
+                "ORDER BY execution_version",
+                (terminal_request.tenant_id, terminal.snapshot.run_id),
+            ),
+        )
+        self.assertEqual(
+            [(1, "CREATE", True), (3, "RESUME", False)],
+            self._execute_sql(
+                f'SELECT execution_version, intent_kind, '
+                f'completed_at IS NOT NULL FROM "{self.schema}".'
+                "run_execution_jobs WHERE tenant_id = %s AND run_id = %s "
+                "ORDER BY execution_version",
+                (resume_request.tenant_id, resumed.snapshot.run_id),
+            ),
+        )
+        claim = self.repository.claim_next_execution(
+            worker_id="worker-v1-upgrade",
+            owner_token=f"owner-v1-upgrade-{uuid4().hex}",
+            lease_seconds=1.0,
+        )
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(created.snapshot.run_id, claim.run.snapshot.run_id)
+        self.assertEqual(run_request.tenant_id, claim.run.snapshot.request.tenant_id)
+        self.assertEqual(RunExecutionIntentKind.CREATE, claim.intent.kind)
+        self.assertEqual(1, claim.generation)
+
+    def test_execution_claim_lifecycle_enqueue_and_db_ttl_fencing(self) -> None:
+        run_request, created = self._create("claim-lifecycle")
+        claim = self.repository.claim_next_execution(
+            worker_id="worker-a",
+            owner_token=f"owner-a-{uuid4().hex}",
+            lease_seconds=1.0,
+        )
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(RunExecutionIntentKind.CREATE, claim.intent.kind)
+        self.assertEqual(
+            claim,
+            self.repository.claim_next_execution(
+                worker_id=claim.worker_id,
+                owner_token=claim.owner_token,
+                lease_seconds=1.0,
+            ),
+        )
+        with self.assertRaises(RunRepositoryTransitionError):
+            self.repository.claim_next_execution(
+                worker_id="different-worker",
+                owner_token=claim.owner_token,
+                lease_seconds=1.0,
+            )
+
+        draft = RunEventDraft(
+            EventType.NODE_STARTED,
+            "claimed-node",
+            {"claimed": True},
+            event_key="execution-v1:claimed-node",
+        )
+        appended = self.repository.append_if_claimed(claim, event=draft)
+        self.assertEqual(
+            appended,
+            self._repository().append_if_claimed(claim, event=draft),
+        )
+        heartbeat = self.repository.heartbeat_execution_claim(
+            claim,
+            lease_seconds=1.0,
+        )
+        self.assertGreaterEqual(heartbeat.heartbeat_at, claim.heartbeat_at)
+        lease_before_abandon = self._execute_sql(
+            f'SELECT lease_expires_at, released_at FROM "{self.schema}".'
+            "run_execution_jobs WHERE tenant_id = %s AND run_id = %s "
+            "AND execution_version = 1",
+            (run_request.tenant_id, created.snapshot.run_id),
+        )[0]
+        self.repository.abandon_execution_claim(heartbeat)
+        lease_after_abandon = self._execute_sql(
+            f'SELECT lease_expires_at, released_at FROM "{self.schema}".'
+            "run_execution_jobs WHERE tenant_id = %s AND run_id = %s "
+            "AND execution_version = 1",
+            (run_request.tenant_id, created.snapshot.run_id),
+        )[0]
+        self.assertEqual(lease_before_abandon, lease_after_abandon)
+
+        self.repository.release_execution_claim(heartbeat)
+        with self.assertRaises(ExecutionSuperseded):
+            self.repository.assert_execution_claim(heartbeat)
+        reclaimed = self.repository.claim_next_execution(
+            worker_id="worker-b",
+            owner_token=f"owner-b-{uuid4().hex}",
+            lease_seconds=1.0,
+        )
+        self.assertIsNotNone(reclaimed)
+        assert reclaimed is not None
+        self.assertEqual(2, reclaimed.generation)
+        with self.assertRaises(ExecutionSuperseded):
+            self.repository.append_if_claimed(
+                heartbeat,
+                event=RunEventDraft(
+                    EventType.NODE_COMPLETED,
+                    "stale-node",
+                    {},
+                    event_key="execution-v1:stale-node",
+                ),
+            )
+
+        waiting_snapshot = replace(
+            reclaimed.run.snapshot,
+            status=RunStatus.WAITING_APPROVAL,
+            updated_at="2026-07-11T12:00:01.000Z",
+            checkpoint={"stage": "approval"},
+            approval_id="approval-pg-execution",
+        )
+        waiting = self.repository.compare_and_swap_if_claimed(
+            reclaimed,
+            snapshot=waiting_snapshot,
+            events=(
+                RunEventDraft(
+                    EventType.APPROVAL_REQUESTED,
+                    None,
+                    {"approval_id": "approval-pg-execution"},
+                ),
+            ),
+        )
+        approval_intent = RunExecutionIntent(
+            RunExecutionIntentKind.APPROVAL,
+            ApprovalDecision(
+                approval_id="approval-pg-execution",
+                approved=True,
+                principal_id="approver-pg",
+                comment="approved",
+            ),
+        )
+        resumed_snapshot = replace(
+            waiting.snapshot,
+            status=RunStatus.RUNNING,
+            updated_at="2026-07-11T12:00:02.000Z",
+            checkpoint={"stage": "resumed"},
+            approval_id=None,
+        )
+        with self.assertRaises(RunRepositoryTransitionError):
+            self.repository.compare_and_swap_and_enqueue(
+                created.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+                expected_version=waiting.version,
+                snapshot=resumed_snapshot,
+                intent=RunExecutionIntent(RunExecutionIntentKind.RESUME),
+            )
+        resumed = self.repository.compare_and_swap_and_enqueue(
+            created.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            expected_version=waiting.version,
+            snapshot=resumed_snapshot,
+            intent=approval_intent,
+        )
+        self.assertEqual(
+            resumed,
+            self._repository().compare_and_swap_and_enqueue(
+                created.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+                expected_version=waiting.version,
+                snapshot=resumed_snapshot,
+                intent=approval_intent,
+            ),
+        )
+        with self.assertRaises(RunRepositoryVersionConflict):
+            self.repository.compare_and_swap_and_enqueue(
+                created.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+                expected_version=waiting.version,
+                snapshot=resumed_snapshot,
+                intent=RunExecutionIntent(RunExecutionIntentKind.RESUME),
+            )
+        approval_claim = self.repository.claim_next_execution(
+            worker_id="worker-c",
+            owner_token=f"owner-c-{uuid4().hex}",
+            lease_seconds=1.0,
+        )
+        self.assertIsNotNone(approval_claim)
+        assert approval_claim is not None
+        self.assertEqual(approval_intent, approval_claim.intent)
+        succeeded_snapshot = replace(
+            approval_claim.run.snapshot,
+            status=RunStatus.SUCCEEDED,
+            updated_at="2026-07-11T12:00:03.000Z",
+            final_report={"ok": True},
+        )
+        succeeded = self.repository.compare_and_swap_if_claimed(
+            approval_claim,
+            snapshot=succeeded_snapshot,
+            events=(RunEventDraft(EventType.RUN_COMPLETED, None, {}),),
+        )
+        self.assertEqual(
+            succeeded,
+            self.repository.compare_and_swap_if_claimed(
+                approval_claim,
+                snapshot=succeeded_snapshot,
+                events=(RunEventDraft(EventType.RUN_COMPLETED, None, {}),),
+            ),
+        )
+        job_rows = self._execute_sql(
+            f'SELECT execution_version, intent_kind, completed_at IS NOT NULL '
+            f'FROM "{self.schema}".run_execution_jobs '
+            "WHERE tenant_id = %s AND run_id = %s ORDER BY execution_version",
+            (run_request.tenant_id, created.snapshot.run_id),
+        )
+        self.assertEqual([(1, "CREATE", True), (3, "APPROVAL", True)], job_rows)
+
+        ttl_request, ttl_run = self._create("claim-ttl")
+        ttl_claim = self.repository.claim_next_execution(
+            worker_id="worker-ttl-a",
+            owner_token=f"owner-ttl-a-{uuid4().hex}",
+            lease_seconds=0.1,
+        )
+        self.assertIsNotNone(ttl_claim)
+        assert ttl_claim is not None
+        self.repository.abandon_execution_claim(ttl_claim)
+        self.assertIsNone(
+            self.repository.claim_next_execution(
+                worker_id="worker-ttl-b",
+                owner_token=f"owner-ttl-probe-{uuid4().hex}",
+                lease_seconds=1.0,
+            )
+        )
+        time.sleep(0.2)
+        ttl_reclaimed = self.repository.claim_next_execution(
+            worker_id="worker-ttl-b",
+            owner_token=f"owner-ttl-b-{uuid4().hex}",
+            lease_seconds=1.0,
+        )
+        self.assertIsNotNone(ttl_reclaimed)
+        assert ttl_reclaimed is not None
+        self.assertEqual(ttl_run.snapshot.run_id, ttl_reclaimed.run.snapshot.run_id)
+        self.assertEqual(ttl_request.tenant_id, ttl_reclaimed.run.snapshot.request.tenant_id)
+        self.assertEqual(2, ttl_reclaimed.generation)
+        with self.assertRaises(ExecutionSuperseded):
+            self.repository.assert_execution_claim(ttl_claim)
+
+    def test_claimed_writes_reconcile_commit_acknowledgement_loss(self) -> None:
+        run_request, created = self._create("claim-ack")
+        claim_fault = _CommitAcknowledgementLoss()
+        claim = self._repository(
+            connection_factory=_commit_acknowledgement_loss_factory(claim_fault)
+        ).claim_next_execution(
+            worker_id="worker-ack",
+            owner_token=f"owner-ack-{uuid4().hex}",
+            lease_seconds=2.0,
+        )
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(1, claim_fault.raised_count)
+
+        append_fault = _CommitAcknowledgementLoss()
+        draft = RunEventDraft(
+            EventType.TOOL_CALLED,
+            "ack-tool",
+            {"call_id": "ack-call"},
+            event_key="execution-v1:ack-call",
+        )
+        appended = self._repository(
+            connection_factory=_commit_acknowledgement_loss_factory(append_fault)
+        ).append_if_claimed(claim, event=draft)
+        self.assertEqual(1, append_fault.raised_count)
+        self.assertEqual(
+            appended,
+            self.repository.append_if_claimed(claim, event=draft),
+        )
+
+        target = replace(
+            created.snapshot,
+            status=RunStatus.SUCCEEDED,
+            updated_at="2026-07-11T12:00:01.000Z",
+            final_report={"ack": True},
+        )
+        cas_fault = _CommitAcknowledgementLoss()
+        committed = self._repository(
+            connection_factory=_commit_acknowledgement_loss_factory(cas_fault)
+        ).compare_and_swap_if_claimed(
+            claim,
+            snapshot=target,
+            events=(RunEventDraft(EventType.RUN_COMPLETED, None, {}),),
+        )
+        self.assertEqual(1, cas_fault.raised_count)
+        self.assertEqual(2, committed.version)
+        self.assertEqual(
+            committed,
+            self.repository.compare_and_swap_if_claimed(
+                claim,
+                snapshot=target,
+                events=(RunEventDraft(EventType.RUN_COMPLETED, None, {}),),
+            ),
+        )
+        rows = self._execute_sql(
+            f'SELECT count(*) FROM "{self.schema}".run_events '
+            "WHERE tenant_id = %s AND run_id = %s AND event_key = %s",
+            (run_request.tenant_id, created.snapshot.run_id, draft.event_key),
+        )
+        self.assertEqual(1, rows[0][0])
+
+    def test_skip_locked_claimers_take_distinct_runs(self) -> None:
+        run_ids = {self._create(f"parallel-{index}")[1].snapshot.run_id for index in range(8)}
+        barrier = Barrier(8)
+
+        def claim(index: int):
+            barrier.wait(timeout=30)
+            return self._repository().claim_next_execution(
+                worker_id=f"worker-{index}",
+                owner_token=f"owner-{index}-{uuid4().hex}",
+                lease_seconds=2.0,
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            claims = list(pool.map(claim, range(8)))
+        self.assertNotIn(None, claims)
+        claimed_ids = {item.run.snapshot.run_id for item in claims if item is not None}
+        self.assertEqual(run_ids, claimed_ids)
 
 
 if __name__ == "__main__":

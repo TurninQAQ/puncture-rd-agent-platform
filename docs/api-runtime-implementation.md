@@ -2,7 +2,8 @@
 
 ## Completed production boundaries
 
-Task 07 is not complete. The first production-facing boundary provides:
+Task 07's repository/API runtime scope is complete through six
+production-facing boundaries. The first boundary provides:
 
 - Pydantic v2 request, approval, snapshot, event and structured-error adapters
   without changing the locked framework-neutral dataclasses;
@@ -141,6 +142,43 @@ from its last event ID. Injected synchronous authentication/authorization ports
 must also enforce their own backend deadlines because Python cannot kill a
 company callback thread that ignores cancellation.
 
+The sixth production-facing boundary now provides:
+
+- a private durable execution intent per Run version. `CREATE`, full
+  `APPROVAL` decisions and `RESUME` are committed with their lifecycle
+  transition instead of relying on process memory;
+- PostgreSQL migration v2 for `run_execution_jobs`, while preserving the v1
+  migration SQL/checksum byte-for-byte. Claims use a generation, unique owner
+  token, worker ID, database-clock heartbeat and lease;
+- `FOR UPDATE SKIP LOCKED` bounded claiming across API/worker instances, plus
+  commit-unknown reconciliation for claim, heartbeat, claimed append and
+  claimed lifecycle CAS;
+- same-transaction claim fencing on every execution event and terminal write.
+  Reclaim increments generation, while stable version-scoped event keys remain
+  generation-independent for exact replay;
+- a bounded `RunWorker` supervisor with independent heartbeat threads,
+  configurable concurrency/poll/lease/grace, low-cardinality metrics, visible
+  supervisor failure, duplicate-owner defense and conservative TTL takeover;
+- FastAPI lifespan composition that migrates before worker startup, reports a
+  stopped supervisor as unhealthy, exports worker metrics, stops new claims on
+  shutdown, signals active execution and keeps heartbeating only through the
+  grace period;
+- process-level SIGTERM evidence: process A commits one injected-port result,
+  times out shutdown without releasing the active lease, and exits; process B
+  reclaims the same Run at generation 2, reuses the stable `call_id`, reaches
+  `SUCCEEDED`, preserves contiguous events and emits exactly one terminal
+  event;
+- an explicit `RecoverableRunExecutor` port and `RunExecutionContext`. Company
+  algorithms remain unimplemented; the test executor only proves connectivity
+  to an injected, PostgreSQL-idempotent port.
+
+Every historical Run receives completed version-1 `CREATE` history so
+idempotent replay remains valid. A version-1 `RUNNING` row keeps that CREATE job
+claimable; a later-version `RUNNING` row also receives a conservative current
+`RESUME` job. A decision that existed only in a pre-v2 crashed approval process
+cannot be reconstructed and requires deployment review. New approval jobs
+store the complete decision atomically.
+
 ## Verification
 
 Local Python 3.10 results on 2026-07-11:
@@ -167,12 +205,12 @@ Ran 8 tests in 3.117s
 OK
 
 python3 run_tests.py (dependency-free final regression)
-Ran 631 tests in 10.155s
-OK (skipped=56)
+Ran 653 tests
+OK (skipped=61)
 
 PUNCTURE_TEST_POSTGRES_DSN=<private-test-dsn> \
 PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. python3 run_tests.py
-Ran 631 tests in 35.411s
+Ran 653 tests
 OK (skipped=6)
 
 PYTHONPATH=<FastAPI dependencies>:src:. python3 -m unittest \
@@ -187,16 +225,66 @@ PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. python3 -m unittest \
   tests.api.test_postgres_run_repository.PostgresRunRepositoryTests -v
 Ran 9 tests
 OK
+
+PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. python3 -m unittest \
+  tests.api.test_http_contracts.PydanticHttpContractTests \
+  tests.api.test_fastapi_app.RawBodyAdmissionTests \
+  tests.api.test_fastapi_app.FastApiTransportTests \
+  tests.api.test_fastapi_app.SseCoreTests \
+  tests.api.test_fastapi_app.FastApiSseTests \
+  tests.api.test_run_worker.RunWorkerTests -v
+Ran 38 tests
+OK (zero skips)
+
+PUNCTURE_TEST_POSTGRES_DSN=<private-test-dsn> \
+PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. python3 -m unittest \
+  tests.api.test_postgres_run_repository.PostgresRunExecutionRepositoryTests -v
+Ran 4 tests
+OK (zero skips)
+
+PUNCTURE_TEST_POSTGRES_DSN=<private-test-dsn> \
+PUNCTURE_API_SIGTERM_EVIDENCE_DIR=<private-output-directory> \
+PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. \
+python3 -m tests.api.postgres_api_sigterm_probe orchestrate
+generation 1 -> 2; status SUCCEEDED; side_effect_count 1; event_count 5
 ```
 
 The dependency-free run executes the pure-ASGI body-admission tests, the two
 framework-neutral privacy tests and repository contract tests while explicitly
 skipping implementation-backed transport/database cases. The dependency run
-executes all seven Pydantic tests, all thirteen FastAPI transport/body tests and
-the dedicated eight-test SSE gate; the PostgreSQL environment adds the one HTTP
-composition test and eight Run repository tests. The Pydantic suite pins
+executes all seven Pydantic tests, all fourteen FastAPI transport/body tests,
+the nine worker tests and the dedicated eight-test SSE gate; the PostgreSQL
+environment adds the one HTTP composition test, eight Run repository tests and
+four execution-job tests. The Pydantic suite pins
 JSON-schema required fields, task enum, artifact count, extra-field rejection
 and JSON round-trip behavior.
+
+### API-001 through API-016
+
+| Case | Result | Evidence |
+|---|---|---|
+| API-001 valid create | PASS | deferred PostgreSQL/FastAPI composition reaches the Mock terminal state |
+| API-002 idempotent create | PASS | tenant-scoped unique request returns one Run and one execution |
+| API-003 empty case | PASS | Pydantic/body admission rejects before Run creation |
+| API-004 unknown task type | PASS | locked task enum returns structured invalid request |
+| API-005 unknown Run | PASS | tenant-safe fixed `NOT_FOUND` mapping |
+| API-006 ordered replay | PASS | contiguous repository sequence and SSE/JSON replay tests |
+| API-007 reconnect cursor | PASS | strict exclusive cursor and no acknowledged-event replay |
+| API-008 approval resume | PASS | complete approval intent is atomically enqueued and executed |
+| API-009 wrong approval | PASS | fixed conflict with unchanged checkpoint |
+| API-010 repeated approval | PASS | no second job/node execution |
+| API-011 cancel running | PASS | version/claim fence rejects later executor writes |
+| API-012 terminal cancel/resume | PASS | lifecycle conflict leaves terminal state unchanged |
+| API-013 unauthorized resources | PASS | current tenant/case/artifact authorization fails closed |
+| API-014 dependency timeout | PASS | recoverable `FAILED` checkpoint and fixed error |
+| API-015 process recovery | PASS | API SIGTERM generation reclaim plus existing durable tool replay evidence |
+| API-016 redaction | PASS | public response/event/privacy and metric-label tests |
+
+The local injected failure probe used a 0.60-second lease and 0.15-second
+shutdown grace. Process B reached the recovered terminal state in about 0.42
+seconds after it started polling. This is fault-injection evidence, not a
+production latency target. No new production HTTP/PostgreSQL throughput claim
+is made.
 
 Remote evidence on 2026-07-11:
 
@@ -263,13 +351,17 @@ Remote evidence on 2026-07-11:
 The following remain `NOT_RUN`/not implemented and must not be inferred from the
 completed boundaries:
 
-- an execution reclaim/heartbeat protocol for workers that die while a Run
-  remains `RUNNING`;
-- process/SIGTERM restart recovery at the API Run layer;
 - a concrete OIDC/JWT verifier, company case/project authorizer, company
   artifact gateway and company algorithm executor (their ports are complete);
+- production exactly-once semantics for arbitrary company/GPU/external side
+  effects. The recovery probe supplies a test-only PostgreSQL stable-call
+  ledger; each production adapter still needs a durable idempotency/outbox
+  boundary;
 - a production HTTP/PostgreSQL concurrency and performance baseline. The
   in-memory bounded 10,000-event replay correctness test is complete, but it is
   not a production throughput claim;
 - reverse-proxy slow-consumer/backpressure evidence and cluster-wide SSE
-  capacity control.
+  capacity control;
+- host failure, network partition, PostgreSQL SIGKILL/WAL crash recovery and
+  forcible cancellation of a synchronous GPU/company callback that ignores the
+  cooperative stop signal.
