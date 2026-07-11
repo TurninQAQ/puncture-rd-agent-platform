@@ -218,6 +218,22 @@ Remote PostgreSQL 16 evidence on 2026-07-11:
   `pg_terminate_backend` lease loss and takeover, and visibility of the terminal
   checkpoint before the first stream event is acknowledged.
 
+Remote PostgreSQL service-restart evidence on 2026-07-11:
+
+- commit `eec87fec49fe7aa32e08389c1bed9d1da904c350` completed
+  [GitHub Actions run 29145858819](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29145858819)
+  successfully;
+- the dedicated job creates an interrupted checkpoint in Python process A,
+  restarts the same PostgreSQL 16 service container, waits for its health check,
+  and restores/resumes the checkpoint in Python process B;
+- the probe fails unless the process PIDs differ, PostgreSQL postmaster start
+  time changes, the cluster system identifier and server version remain equal,
+  the pre/post checkpoint SHA-256 values match, the resumed graph succeeds, and
+  the completed `generate_candidate_paths` call remains exactly once;
+- artifact `postgres-restart-recovery-eec87fec49fe7aa32e08389c1bed9d1da904c350`
+  is 5.69 KB with workflow digest
+  `sha256:6d471b09986ac48b7c3ce15da86212e9f5406599d07681314e3006ecc5069e83`.
+
 - 537 tests pass in the dependency-free environment;
 - 545 tests pass with real LangGraph 1.2.9 available;
 - the graph suite with real dependencies available runs 128 tests: 121 pass and
@@ -244,6 +260,8 @@ Remote PostgreSQL 16 evidence on 2026-07-11:
   without replaying the already completed candidate-generation node;
 - the PostgreSQL 16 CI gate runs all six database tests without skips on all
   three supported Python versions;
+- the PostgreSQL service-restart job preserves the interrupted checkpoint and
+  resumes it in a fresh Python process without replaying completed work;
 - compileall and whitespace checks are separate final gates.
 
 Isolated graph-only benchmark on Linux 5.15, Intel Xeon Gold 6230, Python
@@ -275,10 +293,10 @@ for a controlled benchmark host.
 
 The following remain `NOT_RUN`, not implicitly complete:
 
-- restarting the PostgreSQL service/container itself and restoring the graph in
-  a fresh OS process. CI now verifies fresh saver/runtime instances against a
-  real PostgreSQL 16 service, but the service remains running throughout those
-  six tests;
+- deleting/replacing the PostgreSQL container and restoring from an external
+  durable volume, host failure, SIGKILL/WAL crash recovery, or a PostgreSQL
+  version upgrade. The checked-in restart gate performs a health-checked restart
+  of the same service container;
 - forced process termination after a side-effecting tool returns but before the
   graph checkpoint. Deterministic state-loss/restart tests now prove SQLite
   replay count remains one, but an actual process-kill harness is still `NOT_RUN`;
