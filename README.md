@@ -41,6 +41,8 @@ python3 examples/local_mcp_demo.py
 
 [commit `67c214b` 的真实 LangGraph 完整矩阵](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29147890458) 覆盖 MCS/规划成功、缺输入、geometry/label fail-closed、无可行路径、一次重试恢复、重试耗尽、不可重试错误和 malformed model；另用 `Barrier(20)` 强制 20 个 worker 同时进入真实图节点，交替执行 10 个规划流和 10 个 MCS 流，并逐会话核对工具序列、case 请求和完整 checkpoint。该 workflow 的三版本常规测试及 PostgreSQL restart、benchmark、process-kill 任务全部成功。
 
+[commit `3c4c6fc` 的安全 API 契约边界](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29148721224) 新增 Pydantic v2 request/response/error adapter、可信身份注入、递归 authority/raw-image/credential/URI/JWT 拒绝、深度公共视图脱敏和固定 HTTP 错误映射。Python 3.10/3.11/3.12 的专门 Pydantic no-skip 门均成功；这仍不是 FastAPI endpoint、SSE 或 PostgreSQL Run Repository 完成声明。
+
 ## Reading order
 
 1. `docs/architecture.md`

@@ -57,7 +57,7 @@ Task 07 的第一个生产边界节点已完成：Pydantic v2 request/response/e
 body 伪造的 tenant/principal/role/scope，可信权限只能由认证上下文注入；原始影像字段、
 敏感 metadata、任意 URI、Bearer/JWT/token 和非 JSON/非有限值在进入 Runtime 前拒绝。
 所有 snapshot/event/error 公共视图执行深度脱敏，未知内部错误只返回固定 500/503 消息。
-Pydantic 2.13.4 已显式固定，三版本 CI 配置了独立 no-skip gate。FastAPI endpoint、
+Pydantic 2.13.4 已显式固定，commit `3c4c6fc` 的三版本 CI 独立 no-skip gate 已通过。FastAPI endpoint、
 SSE、原始 HTTP body 解析前限流、PostgreSQL Run Repository 和 OIDC 尚未完成。
 
 SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码、

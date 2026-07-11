@@ -45,6 +45,17 @@ skips seven Pydantic tests explicitly. The implementation-dependency run and CI
 execute all nine. The Pydantic suite pins JSON-schema required fields, task
 enum, artifact count, extra-field rejection and JSON round-trip behavior.
 
+Remote evidence on 2026-07-11:
+
+- commit `3c4c6fcfc6d0bd54bcf52089e45707267f1f04c2` completed
+  [GitHub Actions run 29148721224](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29148721224)
+  successfully;
+- the Python 3.10, 3.11 and 3.12 jobs each installed Pydantic `2.13.4`, imported
+  the adapters and passed the dedicated `Pydantic API contracts (skips
+  forbidden)` step with zero skips;
+- the same workflow also passed all regular suites, PostgreSQL checkpoint and
+  lease gates, service restart, checkpoint benchmark and process-kill recovery.
+
 ## Still not implemented
 
 The following remain `NOT_RUN`/not implemented and must not be inferred from the
