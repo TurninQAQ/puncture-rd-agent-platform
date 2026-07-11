@@ -33,7 +33,7 @@ python3 examples/local_rag_demo.py
 python3 examples/local_mcp_demo.py
 ```
 
-当前本地 Python 3.10 标准环境基线：执行 528 项测试，511 项通过、17 项门控跳过；使用隔离的 LangGraph 1.2.9 依赖路径重跑同一套测试时，519 项通过、9 项门控跳过。graph/eval 定向套件分别为 102 项（98 通过、4 项 PostgreSQL/反向依赖门控跳过）和 10 项全通过，其中 8 项测试实际执行真实 `StateGraph`（7 项 graph 集成/故障测试和 1 项 Eval），其余生产分支矩阵继续使用确定性的 Fake API。新增的 14 项租约测试覆盖 SQLite 双 manager 竞争/续租/过期接管、PostgreSQL 参数化 advisory-lock 协议、跨 Runtime `run/resume/stream` 互斥、不同 thread 并行和 lease-lost 人工核对路径。CI 已精确固定 LangGraph 1.2.9、PostgreSQL checkpointer 3.1.0 和 httpx 0.28.1，并使用受限版本范围安装 psycopg；workflow 计划使用 PostgreSQL 16 服务执行持久化与锁测试，但尚不能替代本地或远端实际通过证据。真实 LangGraph 的 100 ms P95 工程门槛默认只记录，需在受控基准机设置 `PUNCTURE_ENFORCE_PERFORMANCE_GATES=1` 才会硬性执行；重复运行曾出现超过门槛的抖动。`local_rag_demo.py` 可运行企业 RAG 摄取、混合检索、ACL-negative 和 Citation；`local_mcp_demo.py` 可运行三个 MCP Server 的十个强类型工具。两者均不需要网络、GPU 或第三方依赖。
+当前本地 Python 3.10 标准环境基线：执行 557 项测试，537 项通过、20 项门控跳过；使用隔离的 LangGraph 1.2.9 依赖路径重跑同一套测试时，545 项通过、12 项门控跳过。graph/eval 定向套件分别为 128 项（121 通过、6 项 PostgreSQL 和 1 项反向依赖门控跳过）和 10 项全通过，其中 8 项测试实际执行真实 `StateGraph`（7 项 graph 集成/故障测试和 1 项 Eval），其余生产分支矩阵继续使用确定性的 Fake API。14 项租约测试覆盖 SQLite 双 manager 竞争/续租/过期接管、PostgreSQL 参数化 advisory-lock 协议、跨 Runtime `run/resume/stream` 互斥、不同 thread 并行和 lease-lost 人工核对路径；可信 Artifact 校验测试覆盖输入/输出的 case、状态、类型、完整几何、生产者版本和直接父链。CI 已精确固定 LangGraph 1.2.9、PostgreSQL checkpointer 3.1.0 和 httpx 0.28.1，并使用受限版本范围安装 psycopg；workflow 使用 PostgreSQL 16 服务执行独立且禁止 skip 的持久化与锁测试，本机无 DSN 时仍明确保留门控边界。真实 LangGraph 的 100 ms P95 工程门槛默认只记录，需在受控基准机设置 `PUNCTURE_ENFORCE_PERFORMANCE_GATES=1` 才会硬性执行；重复运行曾出现超过门槛的抖动。`local_rag_demo.py` 可运行企业 RAG 摄取、混合检索、ACL-negative 和 Citation；`local_mcp_demo.py` 可运行三个 MCP Server 的十个强类型工具。两者均不需要网络、GPU 或第三方依赖。
 
 ## Reading order
 

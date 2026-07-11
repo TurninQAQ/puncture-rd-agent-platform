@@ -58,9 +58,16 @@ jobs:
           bash -n deploy/rag-search/entrypoint.sh
           bash -n deploy/rag-search/scripts/container_healthcheck.sh
       - name: Test
+        run: python run_tests.py
+      - name: PostgreSQL/LangGraph integration (skips forbidden)
         env:
           PUNCTURE_TEST_POSTGRES_DSN: postgresql://puncture_test:puncture_test@127.0.0.1:5432/puncture_agent_test?sslmode=disable
-        run: python run_tests.py
+        run: >-
+          python -c
+          "import sys, unittest;
+          suite = unittest.defaultTestLoader.loadTestsFromName('tests.graph.test_langgraph_postgres');
+          result = unittest.TextTestRunner(verbosity=2).run(suite);
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)"
 
   release-tag:
     needs: standard-library-tests

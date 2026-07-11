@@ -197,18 +197,18 @@ Local Python 3.10.12 results on 2026-07-11:
 
 ```text
 python3 run_tests.py
-Ran 554 tests in 9.729s
-OK (skipped=17)
+Ran 557 tests in 9.696s
+OK (skipped=20)
 
 PYTHONPATH=/tmp/lginstall3:src:. python3 run_tests.py
-Ran 554 tests in 21.759s
-OK (skipped=9)
+Ran 557 tests in 21.951s
+OK (skipped=12)
 ```
 
 - 537 tests pass in the dependency-free environment;
 - 545 tests pass with real LangGraph 1.2.9 available;
-- the graph suite with real dependencies available runs 125 tests: 121 pass and
-  three PostgreSQL tests plus the inverse missing-dependency guard are skipped;
+- the graph suite with real dependencies available runs 128 tests: 121 pass and
+  six PostgreSQL tests plus the inverse missing-dependency guard are skipped;
 - eight tests execute the actual `StateGraph` (seven graph integration/smoke/
   fault tests and one Eval test); the broader failure/concurrency matrix uses the
   deterministic Fake API to isolate branch semantics;
