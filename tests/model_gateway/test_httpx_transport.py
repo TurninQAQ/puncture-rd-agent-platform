@@ -170,8 +170,9 @@ class HttpxTransportOfflineTests(unittest.TestCase):
                 "puncture_agent.model_gateway.http_transport.importlib.import_module",
                 return_value=fake_httpx,
             ),
-            mock.patch(
-                "puncture_agent.model_gateway.http_transport.ssl.create_default_context",
+            mock.patch.object(
+                ssl,
+                "create_default_context",
                 return_value=sentinel_context,
             ) as create_context,
         ):
