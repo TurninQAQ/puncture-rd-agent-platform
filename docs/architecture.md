@@ -55,7 +55,7 @@ resolve constraints
 
 - `model_gateway`: Mock Qwen + 已实现的 vLLM/Qwen 生产适配器
 - `rag`: in-memory documents -> Elasticsearch/OpenSearch RAG
-- `tooling`: fixed mock outputs -> C++/TensorRT/Python algorithms
+- `tooling`: three implemented MCP/local adapter groups -> future company C++/TensorRT/Python algorithms
 - `agent`: mock state runner -> LangGraph StateGraph
 - `observability`: in-memory trace -> OpenTelemetry/Langfuse/Phoenix
 

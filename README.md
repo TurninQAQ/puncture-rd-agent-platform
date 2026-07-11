@@ -5,7 +5,7 @@
 本仓库当前提供：
 
 - 固定的输入输出契约；
-- 10 个算法工具的 Stub/Mock；
+- 10 个算法工具的固定契约、Stub/Mock 与本地可替换适配器；
 - Qwen、RAG、Agent Runtime、API、Trace/Eval 的接口骨架；
 - 可运行的 Mock 端到端流程；
 - Contract Tests；
@@ -13,8 +13,10 @@
 - 已实现的 Module 0：SQLite 持久化 Artifact Registry、原子本地对象存储、幂等发布与访问审计。
 - 已实现的 Module 1：Qwen/vLLM OpenAI 兼容网关、严格工具/结构化输出校验、安全流式传输与私有化部署模板。
 - 已实现的 Module 2：本地可运行的企业 Hybrid RAG、文档摄取、BM25 + dense + RRF + rerank、ACL/版本过滤、Citation、离线 Eval，以及 OpenSearch/Qwen Embedding/Reranker 可选适配器。
+- 已实现的 Module 3：三个 MCP Tool Server、十个强类型工具适配器、JSON Schema/structuredContent、Artifact ID 安全解析、权限/超时/幂等/Trace、stdio JSON-RPC Demo，以及可替换的 MCS/TensorRT/规划算法端口。
+- 主体已实现、尚未发布的 Module 4：由锁定 JSON 拓扑编译的 LangGraph 主图与两个子图、TypedDict/checkpoint 安全边界、同步事件流、interrupt/resume、Model/RAG/MCP 节点适配器和 PostgreSQL saver 配置入口。
 
-当前仍未实现：真实 MCS 解析、TensorRT 推理、医学图像算法、路径规划、安全评估或真实 LangGraph。Qwen/vLLM、OpenSearch、Qwen Embedding/Reranker 的代码与部署资产已经完成离线验收，但本仓库不声称已经在目标 GPU/集群上完成模型下载、服务启动或性能基准；现场步骤见对应 runbook。
+当前仍未接入公司真实 MCS 解析、TensorRT 推理、医学图像算法、路径规划和安全评估。Module 3 的 deterministic backend 只验证 Agent/MCP 工程链路，不读取真实体素或替代公司算法。Module 4 已用隔离安装的 LangGraph 1.2.9 验证真实 `StateGraph`、子图 checkpoint、动态中断/恢复、跨 runtime 安全 checkpoint 恢复以及 MCP trace 传播；默认无第三方依赖环境仍会显式跳过这些门控测试。PostgreSQL 16 服务和重启测试已写入 CI workflow，但本地主机没有测试 DSN，本次工作树也没有远端 CI 运行证据。进程在“外部工具完成、图 checkpoint 前”崩溃的 exactly-once 窗口、跨 worker 同 thread single-flight，以及远端输出 Artifact 的可信 Registry 归属校验仍未证明。Qwen/vLLM、OpenSearch、Qwen Embedding/Reranker 的代码与部署资产已经完成离线验收，但本仓库不声称已经在目标 GPU/集群上完成模型下载、服务启动或性能基准；现场步骤见对应 runbook。
 
 ## Core rule
 
@@ -28,9 +30,10 @@
 python3 run_tests.py
 PYTHONPATH="$PWD/src:$PWD" python3 -m puncture_agent.api.demo
 python3 examples/local_rag_demo.py
+python3 examples/local_mcp_demo.py
 ```
 
-当前本地 Python 3.10 基线：执行 346 项测试，339 项通过、7 项门控跳过（2 项模型网关真实 `httpx` 集成测试和 5 项私有 vLLM 测试）；`local_rag_demo.py` 无需网络或第三方依赖即可运行企业 RAG 摄取、混合检索、ACL-negative 和 Citation 流程。
+当前本地 Python 3.10 标准环境基线：执行 498 项测试，482 项通过、16 项门控跳过；使用隔离的 LangGraph 1.2.9 依赖路径重跑同一套测试时，490 项通过、8 项门控跳过。graph/eval 定向套件分别为 87 项（84 通过、3 项 PostgreSQL/反向依赖门控跳过）和 10 项全通过，其中 8 项测试实际执行真实 `StateGraph`（7 项 graph 集成/故障测试和 1 项 Eval），其余生产分支矩阵继续使用确定性的 Fake API。CI 已精确固定 LangGraph 1.2.9、PostgreSQL checkpointer 3.1.0 和 httpx 0.28.1，并使用受限版本范围安装 psycopg；workflow 计划使用 PostgreSQL 16 服务执行持久化测试，但尚不能替代本地或远端实际通过证据。真实 LangGraph 的 100 ms P95 工程门槛默认只记录，需在受控基准机设置 `PUNCTURE_ENFORCE_PERFORMANCE_GATES=1` 才会硬性执行；重复运行曾出现超过门槛的抖动。`local_rag_demo.py` 可运行企业 RAG 摄取、混合检索、ACL-negative 和 Citation；`local_mcp_demo.py` 可运行三个 MCP Server 的十个强类型工具。两者均不需要网络、GPU 或第三方依赖。
 
 ## Reading order
 
@@ -43,9 +46,12 @@ python3 examples/local_rag_demo.py
 7. `docs/module-delegation-playbook.md`
 8. `docs/testing-rag.md`
 9. `docs/rag-deployment-runbook.md`
-10. `docs/versioning.md`
-11. `contracts/README.md`
-12. 对应的 `specs/*.md`、`tasks/task-*.md` 和 Contract Tests
+10. `docs/mcp-tool-runtime.md`
+11. `docs/testing-mcp.md`
+12. `docs/langgraph-runtime-implementation.md`
+13. `docs/versioning.md`
+14. `contracts/README.md`
+15. 对应的 `specs/*.md`、`tasks/task-*.md` 和 Contract Tests
 
 ## Module implementation order
 

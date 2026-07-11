@@ -80,6 +80,8 @@ class TraceRecorder:
 
     def __init__(self, exporter: TraceExporter | None = None) -> None:
         self.exporter = exporter or InMemoryTraceExporter()
+        self._export_failure_count = 0
+        self._export_failure_lock = Lock()
 
     @contextmanager
     def start_span(
@@ -87,11 +89,16 @@ class TraceRecorder:
         name: str,
         *,
         attributes: Mapping[str, Any] | None = None,
+        trace_id: str | None = None,
     ) -> Iterator[SpanRecord]:
         stack = _span_stack.get()
         parent = stack[-1] if stack else None
+        if trace_id is not None and (
+            not isinstance(trace_id, str) or not trace_id.strip()
+        ):
+            raise ValueError("trace_id must be a non-empty string when provided")
         span = SpanRecord(
-            trace_id=parent.trace_id if parent else uuid4().hex,
+            trace_id=parent.trace_id if parent else (trace_id or uuid4().hex),
             span_id=uuid4().hex[:16],
             parent_span_id=parent.span_id if parent else None,
             name=name,
@@ -116,7 +123,13 @@ class TraceRecorder:
             span.ended_at_unix_ns = time.time_ns()
             span.duration_ms = (ended_perf_ns - started_perf_ns) / 1_000_000
             _span_stack.reset(token)
-            self.exporter.export(span)
+            try:
+                self.exporter.export(span)
+            except Exception:
+                # Observability is deliberately non-fatal: a trace sink outage
+                # must not turn a completed tool/graph transition into a replay.
+                with self._export_failure_lock:
+                    self._export_failure_count += 1
 
     def add_event(
         self,
@@ -138,3 +151,8 @@ class TraceRecorder:
     def current_span(self) -> SpanRecord | None:
         stack = _span_stack.get()
         return stack[-1] if stack else None
+
+    @property
+    def export_failure_count(self) -> int:
+        with self._export_failure_lock:
+            return self._export_failure_count

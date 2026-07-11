@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "puncture-rd-agent-platform"
-version = "0.4.0"
-description = "Contract-first internal R&D agent with local hybrid RAG and Qwen adapters"
+version = "0.5.0"
+description = "Contract-first internal R&D agent with local Qwen, RAG and MCP adapters"
 requires-python = ">=3.10"
 dependencies = []
 
@@ -14,8 +14,9 @@ implementation = [
   "pydantic>=2.7",
   "fastapi>=0.115",
   "uvicorn>=0.30",
-  "langgraph>=1.0",
-  "mcp>=1.0",
+  "langgraph>=1.2.9,<2",
+  "langgraph-checkpoint-postgres>=3.1,<4",
+  "mcp>=1.27,<2",
   "httpx>=0.27",
   "psycopg[binary]>=3.2",
   "opentelemetry-api>=1.27",
@@ -31,6 +32,7 @@ packages = [
   "puncture_agent.artifacts",
   "puncture_agent.mocks",
   "puncture_agent.model_gateway",
+  "puncture_agent.mcp",
   "puncture_agent.observability",
   "puncture_agent.rag",
   "puncture_agent.runtime",

@@ -1,6 +1,7 @@
 """Tool catalog, stubs, and registry used by the Agent runtime."""
 
 from .catalog import TOOL_DEFINITIONS
+from .factory import AdapterRegistryBundle, bind_tool_handlers, build_adapter_registry
 from .registry import ToolDefinition, ToolRegistry
 
 
@@ -15,4 +16,12 @@ def build_mock_registry() -> ToolRegistry:
     return registry
 
 
-__all__ = ["TOOL_DEFINITIONS", "ToolDefinition", "ToolRegistry", "build_mock_registry"]
+__all__ = [
+    "AdapterRegistryBundle",
+    "TOOL_DEFINITIONS",
+    "ToolDefinition",
+    "ToolRegistry",
+    "bind_tool_handlers",
+    "build_adapter_registry",
+    "build_mock_registry",
+]

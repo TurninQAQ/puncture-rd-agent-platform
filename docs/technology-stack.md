@@ -26,6 +26,12 @@
 | Answer grounding | citation contract | chunk ID, document ID, version, section, evidence sufficiency, abstention |
 | Evaluation | Golden Set | Recall@K, MRR, nDCG@K, citation precision/recall, answer faithfulness, no-answer accuracy |
 
+Module 3 has implemented the local MCP portion of the first table: three
+logical servers, ten JSON-Schema tools, structured content, stdio, artifact
+resolution, principal/case/tool authorization, timeout/idempotency and optional
+stable official SDK v1 binding.  Streamable HTTP/OAuth and company algorithms
+remain future deployment work.
+
 ## 3. Observability and evaluation
 
 - OpenTelemetry: trace/span/context propagation, attributes, metrics, logs correlation.

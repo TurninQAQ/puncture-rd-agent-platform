@@ -16,8 +16,8 @@ The repository uses semantic versions and one release per completed module.
 | `v0.8.0` | OpenTelemetry and production Eval pipeline |
 
 Detailed release evidence is stored under `docs/releases/`, for example
-`docs/releases/v0.2.0.md`, `docs/releases/v0.3.0.md` and
-`docs/releases/v0.4.0.md`.
+`docs/releases/v0.2.0.md`, `docs/releases/v0.3.0.md`,
+`docs/releases/v0.4.0.md` and `docs/releases/v0.5.0.md`.
 
 Source release and operational deployment evidence are separate. A module may be
 released when its code, offline protocol tests and deployable assets pass the

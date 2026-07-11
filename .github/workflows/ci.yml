@@ -12,6 +12,20 @@ permissions:
 jobs:
   standard-library-tests:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: puncture_test
+          POSTGRES_PASSWORD: puncture_test
+          POSTGRES_DB: puncture_agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U puncture_test -d puncture_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     strategy:
       fail-fast: false
       matrix:
@@ -21,8 +35,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install production HTTP transport dependency
-        run: python -m pip install --disable-pip-version-check httpx==0.28.1
+      - name: Install production runtime dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          httpx==0.28.1
+          'langgraph==1.2.9'
+          'langgraph-checkpoint-postgres==3.1.0'
+          'psycopg[binary]>=3.2,<4'
+      - name: Verify production runtime imports
+        env:
+          PYTHONPATH: .:src
+        run: >-
+          python -c
+          "from puncture_agent.agent import langgraph_available;
+          from langgraph.checkpoint.postgres import PostgresSaver;
+          assert langgraph_available()"
       - name: Compile
         run: python -m compileall -q contracts src tests benchmarks examples deploy/qwen-vllm/scripts deploy/rag-search/scripts
       - name: Validate deployment shell
@@ -31,6 +58,8 @@ jobs:
           bash -n deploy/rag-search/entrypoint.sh
           bash -n deploy/rag-search/scripts/container_healthcheck.sh
       - name: Test
+        env:
+          PUNCTURE_TEST_POSTGRES_DSN: postgresql://puncture_test:puncture_test@127.0.0.1:5432/puncture_agent_test?sslmode=disable
         run: python run_tests.py
 
   release-tag:

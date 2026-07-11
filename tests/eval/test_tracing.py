@@ -71,6 +71,23 @@ class TracingTests(unittest.TestCase):
             self.assertEqual("OK", records[0]["status"])
             self.assertEqual("tool.called", records[0]["events"][0]["name"])
 
+        class FailingExporter:
+            def export(self, span):
+                del span
+                raise OSError("private trace sink detail")
+
+        tracer = TraceRecorder(FailingExporter())
+        runtime = GraphRuntime(
+            PROJECT_ROOT / "graph" / "main_graph.json",
+            build_mock_handlers(),
+            tracer=tracer,
+        )
+        state = runtime.run(
+            AgentState(user_query="对 Case-102 做路径规划")
+        )
+        self.assertEqual("SUCCEEDED", state.status)
+        self.assertGreater(tracer.export_failure_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

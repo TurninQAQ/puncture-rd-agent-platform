@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -83,7 +83,10 @@ class AgentState:
     def to_dict(self) -> dict[str, Any]:
         """Return a deep, JSON-ready mapping suitable for checkpointing."""
 
-        return deepcopy(asdict(self))
+        # AgentState fields are already the framework-neutral checkpoint shape;
+        # deepcopying the instance dictionary is materially faster than the
+        # generic dataclasses.asdict recursion while preserving isolation.
+        return deepcopy(self.__dict__)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "AgentState":

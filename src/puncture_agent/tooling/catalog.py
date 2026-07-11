@@ -32,6 +32,13 @@ _TIMEOUTS_MS = {
     "verify_skin_penetration": 10_000,
 }
 
+_WRITE_TOOLS = {
+    "convert_mcs_to_nifti",
+    "run_segmentation",
+    "extract_skin_surface",
+    "generate_candidate_paths",
+}
+
 TOOL_DEFINITIONS = {
     name: ToolDefinition(
         name=name,
@@ -39,7 +46,10 @@ TOOL_DEFINITIONS = {
         request_type=TOOL_REQUEST_TYPES[name],
         result_type=TOOL_RESULT_TYPES[name],
         description=_DESCRIPTIONS[name],
-        read_only=True,
+        read_only=name not in _WRITE_TOOLS,
+        destructive=False,
+        idempotent=True,
+        open_world=False,
         default_timeout_ms=_TIMEOUTS_MS[name],
     )
     for name in TOOL_REQUEST_TYPES

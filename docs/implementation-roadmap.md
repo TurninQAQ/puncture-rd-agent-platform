@@ -20,13 +20,27 @@
 
 按三个 MCP Server 分批替换 10 个 Mock。
 
+状态：三个本地 MCP Server、十个强类型工具适配器、可注入公司算法端口、
+Artifact 安全解析、权限/超时/幂等/Trace 以及 stdio Demo 已完成。当前使用
+deterministic manifest backend，不声称重写或验证了公司 MCS、TensorRT、
+形态学、路径规划或安全算法。
+
 ## Phase 4: LangGraph
 
 根据 `graph/*.json` 构建真实 StateGraph，复用现有 node 输入输出。
 
+状态：已新增生产 `StateGraph` 编译器、两个 compiled subgraph、TypedDict 状态边界、
+同步 checkpoint/event 接口、动态 interrupt/resume、MCP/Model/RAG 适配器和并发隔离测试。
+隔离安装的 LangGraph 1.2.9 已验证真实图、子图恢复和 MCP trace；PostgreSQL saver、CI 服务
+配置与跨 runtime 恢复测试已落地。本机无 PostgreSQL 测试 DSN，真实数据库执行、工具返回后到
+图 checkpoint 前的进程崩溃 exactly-once 证据、跨 worker 同 thread 锁、可信输出 Artifact
+Registry 校验和 API 接线仍待完成，详见
+`docs/langgraph-runtime-implementation.md`。
+
 ## Phase 5: runtime and evaluation
 
-接入 PostgreSQL Checkpoint、FastAPI、SSE、OpenTelemetry 与回归 Harness。
+完成 PostgreSQL 运行证据与持久幂等账本，并接入 FastAPI、SSE、OpenTelemetry
+和生产回归 Harness。
 
 ## Change policy
 

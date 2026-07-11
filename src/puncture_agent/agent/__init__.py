@@ -1,14 +1,36 @@
-"""Contract-first mock runtime for the puncture R&D agent.
-
-The package intentionally uses only the Python standard library.  A later
-implementation can replace :class:`GraphRuntime` with LangGraph while keeping
-the JSON graph specifications, :class:`AgentState`, node names, and tests.
-"""
+"""Contract-first reference and production runtimes for the R&D agent."""
 
 from .graph_spec import GraphSpec, GraphSpecError, load_graph_spec, validate_graph_spec
+from .langgraph_runtime import (
+    GraphStreamEvent,
+    LangGraphCheckpointError,
+    LangGraphConcurrencyError,
+    LangGraphDependencyError,
+    LangGraphRuntime,
+    langgraph_available,
+    open_postgres_checkpointer,
+)
+from .langgraph_state import (
+    ProductionAgentState,
+    RawBytesStateError,
+    StateConversionError,
+    StateSizeLimitError,
+    state_from_mapping,
+    state_to_mapping,
+)
 from .nodes import build_mock_handlers
+from .production_nodes import build_production_handlers
 from .runtime import GraphExecutionError, GraphRuntime
 from .state import AgentState, AgentStatus, TaskType, VerificationStatus
+from .tool_bridge import (
+    DEFAULT_TOOL_BRIDGE_POLICY,
+    McpToolExecutor,
+    ToolBridgeContractError,
+    ToolBridgeError,
+    ToolBridgePolicy,
+    ToolBridgeResponseError,
+    ToolBridgeTransportError,
+)
 
 __all__ = [
     "AgentState",
@@ -17,9 +39,30 @@ __all__ = [
     "GraphRuntime",
     "GraphSpec",
     "GraphSpecError",
+    "GraphStreamEvent",
+    "LangGraphCheckpointError",
+    "LangGraphConcurrencyError",
+    "LangGraphDependencyError",
+    "LangGraphRuntime",
+    "McpToolExecutor",
+    "ProductionAgentState",
+    "RawBytesStateError",
+    "StateConversionError",
+    "StateSizeLimitError",
     "TaskType",
+    "ToolBridgeContractError",
+    "ToolBridgeError",
+    "ToolBridgePolicy",
+    "ToolBridgeResponseError",
+    "ToolBridgeTransportError",
     "VerificationStatus",
+    "DEFAULT_TOOL_BRIDGE_POLICY",
     "build_mock_handlers",
+    "build_production_handlers",
+    "langgraph_available",
     "load_graph_spec",
+    "open_postgres_checkpointer",
+    "state_from_mapping",
+    "state_to_mapping",
     "validate_graph_spec",
 ]

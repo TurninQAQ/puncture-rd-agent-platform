@@ -47,6 +47,7 @@ class TracerLike(Protocol):
         name: str,
         *,
         attributes: Mapping[str, Any] | None = None,
+        trace_id: str | None = None,
     ) -> Any:
         ...
 

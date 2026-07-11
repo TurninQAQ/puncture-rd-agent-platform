@@ -5,6 +5,74 @@ Semantic Versioning while it is below 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Optional LangGraph 1.2 production runtime that compiles the locked JSON main
+  graph and both child graphs while retaining the dependency-free reference runner.
+- Exact AgentState/TypedDict checkpoint conversion with raw-byte, JSON and 1 MiB
+  state guards, synchronous durability, isolated thread IDs and an API event stream.
+- Dynamic interrupt/resume, same-thread missing-input restart, trace continuation
+  across runtime instances, and conservative event buffering until sync streams drain.
+- Explicit Qwen structured-request and enterprise RAG node adapters.
+- Ten-tool Agent-to-MCP contract bridge with opaque Artifact handles, principal
+  propagation, versioned replay identity and frozen policy defaults.
+
+### Changed
+
+- Production node normalization now accepts frozen MCP result fields and reports
+  only candidates accepted by deterministic safety evaluation.
+- Remote MCP responses are validated recursively against frozen result types;
+  normalized contract values are retained, result Artifact identities are bound
+  to request/envelope identities, and storage URIs fail closed instead of being
+  accepted or silently rewritten. RAG must cover every task-required active
+  module before tools may run.
+- Retryable transport timeouts/dependency failures remain distinct from contract
+  violations, and safety candidate summary/assessment partitions fail closed.
+
+### Verification
+
+- Local Python 3.10 standard environment: 498 tests run, 482 passed and 16
+  explicitly gated dependency/private-service tests skipped.
+- Isolated LangGraph 1.2.9 run: 498 tests run, 490 passed and 8 gated tests
+  skipped. Eight tests execute the real `StateGraph`; the larger deterministic
+  branch matrix remains on the Fake API. Real coverage includes local MCP trace
+  propagation, dynamic interrupt/resume, durable state/interrupt boundary
+  failures and cross-runtime in-memory recovery.
+- `langgraph-checkpoint-postgres` 3.1.0 and psycopg import locally; PostgreSQL 16
+  service wiring is present in CI but has not been observed running from this
+  worktree. Local PostgreSQL restart execution, distributed same-thread locking,
+  trusted output-Artifact registry validation and the post-tool/pre-checkpoint
+  process-kill window remain `NOT_RUN` without the required service/harness.
+- The real-LangGraph <=100 ms P95 threshold is retained but is not a normal CI
+  hard gate because repeated shared-host runs showed threshold-crossing jitter;
+  controlled runners can enforce it with `PUNCTURE_ENFORCE_PERFORMANCE_GATES=1`.
+
+## [0.5.0] - 2026-07-11
+
+### Added
+
+- Three logical MCP servers exposing all ten frozen algorithm tools through deterministic `tools/list` and `tools/call` behavior.
+- Dependency-free MCP 2025-11-25 JSON-RPC/stdio demo with generated input/output JSON Schema, structured content and text fallback.
+- Strict dataclass request codec, opaque artifact-handle resolution and model-visible artifact public projections with no storage URI/checksum leakage.
+- Principal/case/tool authorization, bounded deadlines, stable error envelopes, trace identity validation and exact handler-catalog binding.
+- Injectable case-data, segmentation and planning/safety ports plus deterministic manifest backends that preserve company-algorithm boundaries.
+- Optional stable official Python SDK v1 adapter and explicit `mcp>=1.27,<2` dependency pin.
+- Local ten-tool demonstration, subprocess stdio handshake test, implementation guide and module verification runbook.
+
+### Security
+
+- Reject full `ArtifactRef` injection at the MCP boundary; only registered opaque artifact IDs may resolve to internal URIs/checksums.
+- Enforce authenticated caller equality and case/tool allowlists before a handler executes.
+- Redact internal artifact locations from structured content, text compatibility blocks, trace summaries and adapter errors.
+- Fail closed on geometry, permission, missing required masks, unsafe backend downgrades and response identity/version drift.
+
+### Verification
+
+- Local Python 3.10 suite: 428 tests run, 421 passed and 7 explicitly gated model-service tests skipped.
+- Ten adapter calls across three local MCP servers pass; stdio initialize, initialized notification and tool discovery pass in a subprocess.
+- Contract, adapter, negative/failure, idempotency, compileall and whitespace checks pass.
+- Official SDK transport installation, Streamable HTTP/OAuth, company algorithms, real MCS/NIfTI, TensorRT/GPU and target-hardware benchmarks remain `NOT_RUN`.
+
 ## [0.4.0] - 2026-07-11
 
 ### Added

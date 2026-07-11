@@ -1,0 +1,250 @@
+# LangGraph Runtime Implementation Note
+
+## Status
+
+Task 06 now has an unreleased production-runtime implementation while the
+dependency-free `GraphRuntime` remains the behavioral reference.
+
+Implemented and locally verified:
+
+- `AgentState` <-> `TypedDict` checkpoint conversion with deep-copy isolation;
+- recursive rejection of raw bytes, non-finite numbers, non-string object keys,
+  non-JSON values and checkpoints larger than 1 MiB;
+- compilation of the three locked JSON graphs into a LangGraph-compatible main
+  graph and two directly attached compiled subgraphs;
+- deterministic routing in checked-in edge order, bounded main/subgraph steps,
+  `configurable.thread_id` isolation and synchronous checkpoint durability;
+- in-memory test checkpointer, PostgreSQL saver lifecycle factory and a
+  framework-neutral event stream;
+- dynamic interrupt/resume, same-thread missing-input restart and cross-runtime
+  continuation from a safe child-graph checkpoint;
+- bounded model structured-output parsing and compact ACL-aware RAG evidence;
+- fail-closed RAG module coverage for both task families;
+- all ten legacy Agent node request shapes mapped to the frozen MCP wire schemas;
+- opaque Artifact handles, principal propagation, stable idempotency identities
+  and URI/checksum/raw-byte rejection;
+- recursive frozen MCP response/result validation, normalized frozen values,
+  request/envelope Artifact identity binding and versioned idempotency identities
+  without changing shared contracts;
+- accepted-candidate-only reporting and deterministic manual-review handling.
+
+The standard-library environment intentionally has no optional LangGraph or
+PostgreSQL packages, so dependency-gated tests remain explicit there. An isolated
+dependency path was used to run LangGraph `1.2.9` and the real `StateGraph`
+tests locally. `langgraph-checkpoint-postgres` `3.1.0` and `psycopg` `3.3.4`
+import successfully, while actual PostgreSQL execution remains CI-gated because
+this host has no disposable database/DSN.
+
+## Node-to-callable mapping
+
+### Main graph
+
+| JSON node | Production callable |
+|---|---|
+| `parse_request` | `production_nodes._model_parse_node` + `GatewayRequestPlanner` |
+| `retrieve_project_knowledge` | `production_nodes._rag_node` + `RagKnowledgeRetriever` |
+| `resolve_case_context` | `production_nodes._resolve_production_case_context` |
+| `task_router` | `nodes._noop`; outgoing JSON conditions decide the branch |
+| `data_model_subgraph` | compiled `graph/data_model_subgraph.json` |
+| `planning_safety_subgraph` | compiled `graph/planning_safety_subgraph.json` |
+| `result_verifier` | `nodes._result_verifier` -> deterministic `verify_agent_state` |
+| `error_recovery` | `nodes._error_recovery` |
+| `request_missing_data` | `nodes._request_missing_data` |
+| `report_generator` | `nodes._report_generator` |
+
+### Data/model subgraph
+
+| JSON node | Callable |
+|---|---|
+| `inspect_case_metadata` | `nodes._inspect_case_metadata` -> `McpToolExecutor` |
+| `validate_geometry` | `nodes._validate_geometry` |
+| `conversion_router` | `nodes._noop` + JSON conditions |
+| `convert_mcs_to_nifti` | `nodes._convert_mcs_to_nifti` -> `McpToolExecutor` |
+| `validate_label_schema` | `nodes._validate_label_schema` -> `McpToolExecutor` |
+| `segmentation_router` | `nodes._noop` + JSON conditions |
+| `run_segmentation` | `nodes._run_segmentation` -> `McpToolExecutor` |
+| `validate_segmentation_result` | `nodes._validate_segmentation_result` -> `McpToolExecutor` |
+| `skin_processing_router` | `nodes._noop` + JSON conditions |
+| `extract_skin_surface` | `nodes._extract_skin_surface` -> `McpToolExecutor` |
+| `finalize_data_model` | `nodes._finalize_data_model` |
+
+### Planning/safety subgraph
+
+| JSON node | Callable |
+|---|---|
+| `ensure_required_artifacts` | `nodes._ensure_required_artifacts` |
+| `artifact_router` | `nodes._noop` + JSON conditions |
+| `resolve_planning_constraints` | `nodes._resolve_planning_constraints` |
+| `generate_candidate_paths` | `nodes._generate_candidate_paths` -> `McpToolExecutor` |
+| `candidate_router` | `nodes._noop` + JSON conditions |
+| `evaluate_path_safety` | `nodes._evaluate_path_safety` -> `McpToolExecutor` |
+| `evaluate_intraoperative_risk` | `nodes._evaluate_intraoperative_risk` -> `McpToolExecutor` |
+| `verify_skin_penetration` | `nodes._verify_skin_penetration` -> `McpToolExecutor` |
+| `finalize_planning` | `nodes._finalize_planning` |
+
+## Construction
+
+Production startup must inject all external dependencies explicitly:
+
+```python
+from puncture_agent.agent import (
+    LangGraphRuntime,
+    McpToolExecutor,
+    build_production_handlers,
+    open_postgres_checkpointer,
+)
+
+tool_executor = McpToolExecutor(
+    mcp_runtimes_or_clients,
+    principal=principal_provider,
+)
+handlers = build_production_handlers(
+    tool_executor=tool_executor,
+    model_gateway=qwen_gateway,
+    rag_service=rag_client,
+    access_scope_provider=authenticated_scope_provider,
+)
+
+with open_postgres_checkpointer(postgres_dsn, setup=False) as saver:
+    runtime = LangGraphRuntime(
+        "graph/main_graph.json",
+        handlers,
+        checkpointer=saver,
+    )
+    final_state = runtime.run(initial_state)
+```
+
+`setup=True` performs the official saver migration and belongs in an explicit
+deployment migration/startup step, not on every request. Do not use the default
+in-memory saver for a production process that must survive restart.
+
+## Failure routing and checkpoint boundaries
+
+- Missing or ambiguous model input, incomplete task-required RAG evidence, or
+  missing Artifact IDs routes to `AWAITING_INPUT` before an algorithm tool runs.
+- `TIMEOUT` and temporary `DEPENDENCY_FAILED` transport failures are retryable.
+  The child graph finalizes `ERROR`, the verifier returns `NEED_RETRY`, and
+  `error_recovery` re-enters the task subgraph only while the bounded budget
+  remains. The platform cap is three retries; reference state defaults to one.
+- Contract/schema/permission/geometry failures are non-retryable and fail closed
+  to manual review. A valid `NO_CANDIDATE_PATH`/`NO_FEASIBLE_PATH` response is a
+  no-result business terminal and does not run downstream safety tools.
+- LangGraph writes with `durability="sync"`. API events are buffered until the
+  underlying stream drains, so a visible transition is not acknowledged while
+  the synchronous graph stream is still checkpointing.
+- Dynamic interrupts resume with the same `configurable.thread_id` and trace ID.
+  A completed child node before an interrupt is restored without replaying that
+  node. A terminal missing-input workflow can merge explicit updates and start a
+  new pass from `START` on the same thread.
+- This boundary protects completed graph nodes. It cannot by itself make an
+  external side effect exactly-once if a process dies after the tool returns but
+  before the following graph checkpoint; the tool service needs a persistent
+  idempotency ledger for that crash window.
+- Dynamic interrupt values cross the same JSON/raw-byte/size boundary before
+  LangGraph can persist them. Invalid values become a durable terminal
+  `STATE_BOUNDARY_ERROR` instead of leaving an unreadable interrupted thread.
+- Same-thread single-flight is enforced inside one `LangGraphRuntime` instance.
+  Multiple workers sharing one saver still require a PostgreSQL advisory/lease
+  lock or an equivalent run-level idempotency coordinator.
+
+## Verification evidence
+
+Local Python 3.10.12 results on 2026-07-11:
+
+```text
+python3 run_tests.py
+Ran 498 tests in 9.614s
+OK (skipped=16)
+
+PYTHONPATH=/tmp/lginstall3:src:. python3 run_tests.py
+Ran 498 tests in 22.442s
+OK (skipped=8)
+```
+
+- 482 tests pass in the dependency-free environment;
+- 490 tests pass with real LangGraph 1.2.9 available;
+- the graph suite with real dependencies available runs 87 tests: 84 pass and
+  only two PostgreSQL tests plus the inverse missing-dependency guard are skipped;
+- eight tests execute the actual `StateGraph` (seven graph integration/smoke/
+  fault tests and one Eval test); the broader failure/concurrency matrix uses the
+  deterministic Fake API to isolate branch semantics;
+- the Eval suite runs 10 tests with 100% reference contract success, 100% report
+  schema validity and zero forbidden-node violations;
+- 20 concurrent isolated sessions complete without cross-session state leakage
+  on the deterministic Fake API; the equivalent real-LangGraph matrix is `NOT_RUN`;
+- all ten legacy node request shapes decode as their frozen request dataclasses;
+- real LangGraph child nodes and four local MCP planning calls share one trace ID;
+- a real dynamic interrupt resumes across a new runtime from the child checkpoint
+  without replaying the already completed candidate-generation node;
+- compileall and whitespace checks are separate final gates.
+
+Isolated graph-only benchmark on Linux 5.15, Intel Xeon Gold 6230, Python
+3.10.12 and LangGraph 1.2.9, with five warm-ups, three rounds of 50
+immediate-fake samples and nearest-rank percentiles:
+
+```text
+PYTHONPATH=/tmp/lginstall3:src:. python3 -m unittest \
+  tests.graph.test_langgraph_runtime.RealLangGraphSmokeTests.test_real_stategraph_graph_only_p95_records_engineering_gate -v
+
+round P95 63.173 / 72.295 / 76.292 ms
+median round P95 72.295 ms
+aggregate P50 40.702 ms
+aggregate P95 71.088 ms
+max 123.432 ms
+serialized reference checkpoint 12,979 bytes
+```
+
+The checked-in test prints its measured values so future runs can be compared.
+The <=100 ms engineering threshold was not consistently met across repeated
+manual runs: another isolated run contained a 102.745 ms round, and a loaded
+graph-suite run measured a 101.397 ms median round P95. Those two observations
+are manual records rather than checked-in fixtures. The threshold was not raised.
+Normal CI records a sanity baseline;
+`PUNCTURE_ENFORCE_PERFORMANCE_GATES=1` enables the original hard <=100 ms gate
+for a controlled benchmark host.
+
+## Not yet verified
+
+The following remain `NOT_RUN`, not implicitly complete:
+
+- disposable PostgreSQL setup and restart/resume execution on this host (the
+  automated CI-gated tests and PostgreSQL 16 service wiring are present, but no
+  successful remote workflow result was available during this implementation);
+- forced process termination after a side-effecting tool returns but before the
+  graph checkpoint, proving backend execution count remains one; an injected
+  complete saver outage in a manual, non-checked-in fault-injection experiment
+  reproduced a duplicate tool call after a new runtime resumed from the older
+  checkpoint;
+- a persistent tool-side idempotency ledger or external run registry that closes
+  that reproduced crash window;
+- distributed single-flight for two workers/runtimes executing the same thread;
+  the current guard is process/runtime-instance local;
+- blocking real-saver proof that no API node event is acknowledged before a sync
+  checkpoint finishes; deterministic stream-buffer tests cover the adapter logic;
+- the complete failure matrix and 20-session concurrency test on real LangGraph,
+  rather than only the focused real smoke/integration cases;
+- registry-backed proof that every supplied and remotely returned Artifact ID
+  belongs to the authenticated case, expected type/status and compatible geometry
+  lineage. The bridge rejects URI identities, cross-case declarations, unbound
+  result IDs and result/envelope disagreement, but cannot trust a remote envelope's
+  self-declared ownership without an authoritative registry query;
+- using retrieved rule contents to derive numeric planning constraints and label
+  policy, rather than using RAG as a required versioned-evidence gate while the
+  frozen `ToolBridgePolicy` remains authoritative;
+- an end-to-end retrieved-document prompt-injection case proving model output
+  cannot expand the fixed graph/tool authorization set;
+- one trace containing model, RAG, graph/node and remote tool spans; current real
+  integration proves graph/node/state/local-MCP trace identity only;
+- child-subgraph container spans; child node spans currently remain directly
+  parented to the graph span;
+- API streaming capacity/heartbeat behavior: safe acknowledgement currently
+  buffers all node states until the graph stream drains, with a worst-case memory
+  shape of roughly `max_steps * 1 MiB`;
+- live model/RAG/MCP network clients, OAuth/OIDC, OpenTelemetry and API wiring;
+- PostgreSQL checkpoint save/resume P50/P95 evidence.
+
+Checkpointing does not make an external side effect exactly-once by itself.
+Stable bridge idempotency keys and a persistent tool-side idempotency ledger are
+required for crash-safe replay. Chained output Artifact IDs also require a live
+registry-backed MCP Artifact resolver; the static demo resolver is not a
+production registry.

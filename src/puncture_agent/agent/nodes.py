@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import nullcontext
 from dataclasses import asdict, is_dataclass
 from typing import Any, Mapping, Protocol
 
@@ -171,11 +172,112 @@ def _response_result(response: Mapping[str, Any]) -> Any:
     return response.get("data")
 
 
+def _artifact_id_from(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, Mapping):
+        artifact_id = value.get("artifact_id")
+        if isinstance(artifact_id, str) and artifact_id.strip():
+            return artifact_id
+    if hasattr(value, "artifact_id"):
+        artifact_id = getattr(value, "artifact_id")
+        if isinstance(artifact_id, str) and artifact_id.strip():
+            return artifact_id
+    return None
+
+
+def _selected_candidate(state: AgentState) -> dict[str, Any] | None:
+    accepted = list(state.safety_result.get("accepted_candidate_ids", []))
+    safest = state.safety_result.get("safest_candidate_id")
+    preferred_ids = [safest] if safest else []
+    preferred_ids.extend(candidate_id for candidate_id in accepted if candidate_id != safest)
+    by_id = {
+        candidate.get("candidate_id"): candidate
+        for candidate in state.candidate_paths
+        if isinstance(candidate, Mapping)
+    }
+    for candidate_id in preferred_ids:
+        candidate = by_id.get(candidate_id)
+        if isinstance(candidate, dict):
+            return candidate
+    if accepted:
+        return None
+    return None
+
+
+def _normalize_risk_flags(result: Any) -> dict[str, Any]:
+    if not isinstance(result, Mapping):
+        return {}
+    legacy = result.get("risk_flags")
+    if isinstance(legacy, Mapping):
+        return dict(legacy)
+
+    normalized: dict[str, Any] = {
+        "contradictory": False,
+        "requires_manual_review": bool(result.get("requires_manual_review", False)),
+        "overall_level": result.get("overall_level"),
+        "needle_tip_in_lung": result.get("needle_in_lung"),
+        "large_vessel_entry": result.get("large_vessel_penetration"),
+    }
+    flags = result.get("flags", ())
+    seen_levels: dict[str, set[str]] = {}
+    if isinstance(flags, (list, tuple)):
+        for flag in flags:
+            if not isinstance(flag, Mapping):
+                continue
+            structure = str(flag.get("structure", "")).strip().lower()
+            level = str(flag.get("level", "")).strip().upper()
+            if not structure or level not in {"SAFE", "WARNING", "STOP", "UNKNOWN"}:
+                continue
+            seen_levels.setdefault(structure, set()).add(level)
+            if level == "WARNING":
+                normalized[f"{structure}_warning"] = True
+            elif level == "STOP":
+                normalized[f"{structure}_stop"] = True
+            elif level == "UNKNOWN":
+                normalized["requires_manual_review"] = True
+    normalized["contradictory"] = any(
+        "SAFE" in levels and ("WARNING" in levels or "STOP" in levels)
+        for levels in seen_levels.values()
+    )
+    return normalized
+
+
+def _report_safety_result(state: AgentState) -> dict[str, Any]:
+    if state.task_type != TaskType.PLANNING_SAFETY:
+        return dict(state.safety_result)
+    accepted = list(state.safety_result.get("accepted_candidate_ids", []))
+    accepted_set = set(accepted)
+    result: dict[str, Any] = {"accepted_candidate_ids": accepted}
+    safest = state.safety_result.get("safest_candidate_id")
+    if safest in accepted_set:
+        result["safest_candidate_id"] = safest
+    assessments = state.safety_result.get("assessments")
+    if isinstance(assessments, (list, tuple)):
+        result["assessments"] = [
+            item
+            for item in assessments
+            if isinstance(item, Mapping) and item.get("candidate_id") in accepted_set
+        ]
+    clearances = state.safety_result.get("minimum_clearance_mm")
+    if isinstance(clearances, Mapping):
+        result["minimum_clearance_mm"] = {
+            candidate_id: value
+            for candidate_id, value in clearances.items()
+            if candidate_id in accepted_set
+        }
+    if "elapsed_ms" in state.safety_result:
+        result["elapsed_ms"] = state.safety_result["elapsed_ms"]
+    return result
+
+
 def _execute_tool(
     state: AgentState,
     executor: ToolExecutor,
     tool_name: str,
     request: Mapping[str, Any],
+    *,
+    valid_outcome_codes: tuple[str, ...] = (),
 ) -> tuple[bool, Any]:
     call_id = f"call-{len(state.tool_calls) + 1:04d}"
     state.tool_calls.append(
@@ -225,12 +327,74 @@ def _execute_tool(
             },
         }
     else:
-        raw_response = executor.execute(tool_name, request)
+        bind_state = getattr(executor, "bind_state", None)
+        binding = bind_state(state) if callable(bind_state) else nullcontext()
+        try:
+            with binding:
+                raw_response = executor.execute(tool_name, request)
+        except Exception as exc:
+            try:
+                from .tool_bridge import (
+                    ToolBridgeError,
+                    ToolBridgeResponseError,
+                    ToolBridgeTransportError,
+                )
+            except ImportError:  # pragma: no cover - package import guard
+                ToolBridgeError = ()  # type: ignore[assignment,misc]
+                ToolBridgeResponseError = ()  # type: ignore[assignment,misc]
+                ToolBridgeTransportError = ()  # type: ignore[assignment,misc]
+            bridge_error = isinstance(exc, ToolBridgeError)
+            bridge_response_error = isinstance(exc, ToolBridgeResponseError)
+            bridge_transport_error = isinstance(exc, ToolBridgeTransportError)
+            timeout_error = isinstance(exc, TimeoutError)
+            dependency_error = isinstance(exc, (ConnectionError, OSError))
+            if bridge_transport_error:
+                error_code = exc.code
+                error_message = (
+                    "tool transport exceeded its bounded deadline"
+                    if exc.code == "TIMEOUT"
+                    else "tool transport dependency is temporarily unavailable"
+                )
+                retryable = bool(exc.retryable)
+            elif timeout_error:
+                error_code = "TIMEOUT"
+                error_message = "tool transport exceeded its bounded deadline"
+                retryable = True
+            elif dependency_error:
+                error_code = "DEPENDENCY_FAILED"
+                error_message = "tool transport dependency is temporarily unavailable"
+                retryable = True
+            elif bridge_response_error:
+                error_code = "CONTRACT_VIOLATION"
+                error_message = "remote tool response violated the frozen MCP contract"
+                retryable = False
+            elif bridge_error:
+                error_code = "INVALID_ARGUMENT"
+                error_message = "tool request violated the frozen MCP contract"
+                retryable = False
+            else:
+                error_code = "INTERNAL_ERROR"
+                error_message = (
+                    f"tool executor rejected an unexpected {type(exc).__name__}"
+                )
+                retryable = False
+            raw_response = {
+                "status": "FAILED",
+                "result": None,
+                "error": {
+                    "code": error_code,
+                    "message": error_message,
+                    "retryable": retryable,
+                },
+            }
 
     response = _to_mapping(raw_response)
     status = _response_status(response)
-    success = status in {"SUCCESS", "SUCCEEDED", "OK"}
-    state.tool_calls[-1]["status"] = "SUCCESS" if success else "FAILED"
+    result_value = _response_result(response)
+    success = status in {"SUCCESS", "SUCCEEDED", "OK"} or (
+        status == "PARTIAL" and result_value is not None
+    )
+    state.tool_calls[-1]["status"] = status if success else "FAILED"
     state.tool_results.append(
         {
             "call_id": call_id,
@@ -245,7 +409,20 @@ def _execute_tool(
             error = {"code": "TOOL_FAILED", "message": str(error)}
         code = str(error.get("code", "TOOL_FAILED"))
         message = str(error.get("message", f"Tool {tool_name} failed"))
-        retryable = bool(error.get("retryable", code in {"TIMEOUT", "RETRYABLE_ERROR"}))
+        raw_retryable = error.get("retryable")
+        retryable = (
+            raw_retryable
+            if type(raw_retryable) is bool
+            else code in {"TIMEOUT", "DEPENDENCY_FAILED", "RETRYABLE_ERROR"}
+            and raw_retryable is None
+        )
+        if code in valid_outcome_codes:
+            state.tool_calls[-1]["status"] = "NO_RESULT"
+            state.metadata["last_valid_tool_outcome"] = {
+                "tool_name": tool_name,
+                "code": code,
+            }
+            return True, None
         state.metadata["last_tool_error"] = {
             "tool_name": tool_name,
             "code": code,
@@ -259,7 +436,11 @@ def _execute_tool(
             details={"tool_name": tool_name, "call_id": call_id},
         )
         return False, None
-    return True, _response_result(response)
+    if status == "PARTIAL":
+        partial = state.metadata.setdefault("partial_tool_results", [])
+        if tool_name not in partial:
+            partial.append(tool_name)
+    return True, result_value
 
 
 def _noop(_: AgentState, __: NodeContext) -> NodeOutcome:
@@ -424,6 +605,14 @@ def _inspect_case_metadata(
         {
             "case_id": state.case_id,
             "ct_artifact_id": state.artifacts.get("ct"),
+            "related_artifact_ids": [
+                artifact_id
+                for artifact_id in (
+                    state.artifacts.get("raw_labels"),
+                    state.artifacts.get("labels_nifti"),
+                )
+                if artifact_id
+            ],
             "input_format": state.metadata.get("input_format", "NIFTI"),
         },
     )
@@ -434,7 +623,15 @@ def _inspect_case_metadata(
 
 def _validate_geometry(state: AgentState, _: NodeContext) -> NodeOutcome:
     geometry = state.metadata.get("case_geometry")
-    valid = bool(geometry) and not state.metadata.get("force_geometry_mismatch", False)
+    if isinstance(geometry, Mapping) and "ready_for_next_stage" in geometry:
+        valid = bool(
+            geometry.get("ready_for_next_stage")
+            and geometry.get("all_geometries_compatible")
+            and geometry.get("required_types_present")
+        )
+    else:
+        valid = bool(geometry)
+    valid = valid and not state.metadata.get("force_geometry_mismatch", False)
     state.metadata["geometry_valid"] = valid
     state.metadata["requires_conversion"] = (
         str(state.metadata.get("input_format", "NIFTI")).upper() == "MCS"
@@ -462,13 +659,20 @@ def _convert_mcs_to_nifti(
         },
     )
     if ok and result:
-        state.artifacts["labels_nifti"] = result.get("output_artifact_id")
+        output_artifact_id = result.get("output_artifact_id") or _artifact_id_from(
+            result.get("output_artifact")
+        )
+        if output_artifact_id:
+            state.artifacts["labels_nifti"] = output_artifact_id
     return NodeOutcome(output=result)
 
 
 def _validate_label_schema(
     state: AgentState, _: NodeContext, executor: ToolExecutor
 ) -> NodeOutcome:
+    if state.metadata.get("last_tool_error"):
+        state.metadata["label_schema_valid"] = False
+        return NodeOutcome(output={"skipped": "upstream tool failed"})
     ok, result = _execute_tool(
         state,
         executor,
@@ -507,12 +711,33 @@ def _run_segmentation(
         },
     )
     if ok and result:
-        state.artifacts.setdefault("segmentation_masks", {}).update(
-            result.get("mask_artifact_ids", {})
+        legacy_masks = result.get("mask_artifact_ids", {})
+        if isinstance(legacy_masks, Mapping):
+            state.artifacts.setdefault("segmentation_masks", {}).update(legacy_masks)
+        segmentation_artifact_id = _artifact_id_from(
+            result.get("segmentation_artifact")
         )
+        if segmentation_artifact_id:
+            state.artifacts["segmentation_artifact"] = segmentation_artifact_id
+            produced_labels = result.get("produced_labels", ())
+            label_names = [
+                item.get("label_name")
+                for item in produced_labels
+                if isinstance(item, Mapping) and isinstance(item.get("label_name"), str)
+            ]
+            if not label_names:
+                label_names = list(
+                    state.metadata.get("requested_segmentation_labels", ())
+                    or ("skin", "lung", "heart")
+                )
+            state.artifacts["segmentation_masks"] = {
+                name: segmentation_artifact_id for name in label_names
+            }
         state.metadata["segmentation_metrics"] = {
-            "latency_ms": result.get("latency_ms"),
-            "gpu_memory_mb": result.get("gpu_memory_mb"),
+            "latency_ms": result.get("latency_ms", result.get("inference_time_ms")),
+            "gpu_memory_mb": result.get(
+                "gpu_memory_mb", result.get("peak_gpu_memory_mb")
+            ),
         }
     return NodeOutcome(output=result)
 
@@ -520,13 +745,22 @@ def _run_segmentation(
 def _validate_segmentation_result(
     state: AgentState, _: NodeContext, executor: ToolExecutor
 ) -> NodeOutcome:
+    if state.metadata.get("last_tool_error"):
+        state.metadata["segmentation_valid"] = False
+        return NodeOutcome(output={"skipped": "upstream tool failed"})
+    segmentation_artifact_id = state.artifacts.get("segmentation_artifact")
+    mask_artifact_ids = (
+        {"segmentation": segmentation_artifact_id}
+        if segmentation_artifact_id
+        else state.artifacts.get("segmentation_masks", {})
+    )
     ok, result = _execute_tool(
         state,
         executor,
         "validate_segmentation_result",
         {
             "case_id": state.case_id,
-            "mask_artifact_ids": state.artifacts.get("segmentation_masks", {}),
+            "mask_artifact_ids": mask_artifact_ids,
             "reference_ct_artifact_id": state.artifacts.get("ct"),
         },
     )
@@ -546,6 +780,8 @@ def _validate_segmentation_result(
 def _extract_skin_surface(
     state: AgentState, _: NodeContext, executor: ToolExecutor
 ) -> NodeOutcome:
+    if state.metadata.get("last_tool_error"):
+        return NodeOutcome(output={"skipped": "upstream tool failed"})
     masks = state.artifacts.get("segmentation_masks", {})
     ok, result = _execute_tool(
         state,
@@ -558,7 +794,11 @@ def _extract_skin_surface(
         },
     )
     if ok and result:
-        state.artifacts["skin_surface"] = result.get("skin_surface_artifact_id")
+        surface_id = result.get("skin_surface_artifact_id") or _artifact_id_from(
+            result.get("surface_artifact")
+        )
+        if surface_id:
+            state.artifacts["skin_surface"] = surface_id
     return NodeOutcome(output=result)
 
 
@@ -626,6 +866,7 @@ def _generate_candidate_paths(
             "target_artifact_id": state.artifacts.get("target"),
             **state.planning_constraints,
         },
+        valid_outcome_codes=("NO_CANDIDATE_PATH", "NO_FEASIBLE_PATH"),
     )
     state.candidate_paths = list(result.get("candidates", [])) if ok and result else []
     return NodeOutcome(output=result)
@@ -644,34 +885,52 @@ def _evaluate_path_safety(
             "danger_mask_artifact_ids": state.artifacts.get("danger_masks", {}),
             "safety_radius_mm": state.planning_constraints.get("safety_radius_mm"),
         },
+        valid_outcome_codes=("NO_FEASIBLE_PATH",),
     )
-    state.safety_result = dict(result or {}) if ok else {}
+    state.safety_result = (
+        dict(result)
+        if ok and isinstance(result, Mapping)
+        else ({"accepted_candidate_ids": []} if ok else {})
+    )
     return NodeOutcome(output=result)
 
 
 def _evaluate_intraoperative_risk(
     state: AgentState, _: NodeContext, executor: ToolExecutor
 ) -> NodeOutcome:
+    if state.metadata.get("last_tool_error"):
+        state.risk_flags = {}
+        return NodeOutcome(output={"skipped": "upstream tool failed"})
+    selected = _selected_candidate(state)
+    if selected is None:
+        state.risk_flags = {}
+        return NodeOutcome(output={"skipped": "no accepted candidate"})
+    state.metadata["selected_candidate_id"] = selected.get("candidate_id")
     ok, result = _execute_tool(
         state,
         executor,
         "evaluate_intraoperative_risk",
         {
             "case_id": state.case_id,
-            "planned_entry_point_world_mm": state.candidate_paths[0][
-                "entry_point_world_mm"
-            ],
-            "needle_tip_world_mm": state.candidate_paths[0]["target_point_world_mm"],
+            "planned_entry_point_world_mm": selected["entry_point_world_mm"],
+            "needle_tip_world_mm": selected["target_point_world_mm"],
             "danger_mask_artifact_ids": state.artifacts.get("danger_masks", {}),
         },
     )
-    state.risk_flags = dict((result or {}).get("risk_flags", {})) if ok else {}
+    state.risk_flags = _normalize_risk_flags(result) if ok else {}
     return NodeOutcome(output=result)
 
 
 def _verify_skin_penetration(
     state: AgentState, _: NodeContext, executor: ToolExecutor
 ) -> NodeOutcome:
+    if state.metadata.get("last_tool_error"):
+        state.skin_penetration_result = {}
+        return NodeOutcome(output={"skipped": "upstream tool failed"})
+    selected = _selected_candidate(state)
+    if selected is None:
+        state.skin_penetration_result = {}
+        return NodeOutcome(output={"skipped": "no accepted candidate"})
     ok, result = _execute_tool(
         state,
         executor,
@@ -679,14 +938,14 @@ def _verify_skin_penetration(
         {
             "case_id": state.case_id,
             "skin_mask_artifact_id": state.artifacts.get("skin"),
-            "planned_entry_point_world_mm": state.candidate_paths[0][
-                "entry_point_world_mm"
-            ],
-            "needle_tip_world_mm": state.candidate_paths[0]["target_point_world_mm"],
+            "planned_entry_point_world_mm": selected["entry_point_world_mm"],
+            "needle_tip_world_mm": selected["target_point_world_mm"],
             "sample_step_voxel": 0.5,
         },
     )
     state.skin_penetration_result = dict(result or {}) if ok else {}
+    if ok and result and "crossed_skin" in result:
+        state.skin_penetration_result["penetrated"] = bool(result["crossed_skin"])
     return NodeOutcome(output=result)
 
 
@@ -746,6 +1005,16 @@ def _report_generator(state: AgentState, _: NodeContext) -> NodeOutcome:
     else:
         state.status = AgentStatus.FAILED
 
+    accepted_ids = set(state.safety_result.get("accepted_candidate_ids", []))
+    report_candidates = (
+        [
+            candidate
+            for candidate in state.candidate_paths
+            if candidate.get("candidate_id") in accepted_ids
+        ]
+        if state.task_type == TaskType.PLANNING_SAFETY and accepted_ids
+        else ([] if state.task_type == TaskType.PLANNING_SAFETY else state.candidate_paths)
+    )
     state.final_report = {
         "report_version": "1.0",
         "session_id": state.session_id,
@@ -755,10 +1024,11 @@ def _report_generator(state: AgentState, _: NodeContext) -> NodeOutcome:
         "verification_status": state.verification_status,
         "verification_reasons": state.metadata.get("verification_reasons", []),
         "citations": state.citations,
-        "candidate_paths": state.candidate_paths,
-        "safety_result": state.safety_result,
+        "candidate_paths": report_candidates,
+        "safety_result": _report_safety_result(state),
         "risk_flags": state.risk_flags,
         "skin_penetration_result": state.skin_penetration_result,
+        "selected_candidate_id": state.metadata.get("selected_candidate_id"),
         "data_validation": {
             "geometry_valid": state.metadata.get("geometry_valid"),
             "label_schema_valid": state.metadata.get("label_schema_valid"),

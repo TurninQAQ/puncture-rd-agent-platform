@@ -9,7 +9,7 @@
 | Area | Upstream baseline | What to reuse | What this project adds |
 |---|---|---|---|
 | Agent graph | [langchain-ai/langgraph](https://github.com/langchain-ai/langgraph) | state graph, conditional edge, checkpoint, interrupt/resume concepts | fixed medical/industrial tool contracts, two deterministic subgraphs, fail-closed verifier, artifact-only large-data flow |
-| Tool protocol | [modelcontextprotocol/specification](https://github.com/modelcontextprotocol/specification) and MCP SDKs | tool schema, discovery and transport conventions | three internal server boundaries, case/tenant context, artifact permission, idempotency and safety error taxonomy |
+| Tool protocol | [modelcontextprotocol/specification](https://github.com/modelcontextprotocol/modelcontextprotocol) 2025-11-25 and stable Python SDK v1.x | tool schema, discovery, structured content, stdio and Streamable HTTP conventions | three internal server boundaries, safe artifact handles, principal/case/tool permission, idempotency and safety error taxonomy |
 | Private LLM serving | [vllm-project/vllm](https://github.com/vllm-project/vllm) | OpenAI-compatible serving, batching, streaming, distributed inference | normalized gateway, Qwen-specific deployment profile, structured-output validation, retry/circuit-breaker and trace fields |
 | Qwen model family | [QwenLM](https://github.com/QwenLM) | tokenizer/model usage and deployment guidance | enterprise prompt/tool policy, version pinning, internal evaluation and fallback behavior |
 | Search/RAG | [elastic/elasticsearch](https://github.com/elastic/elasticsearch) or [opensearch-project/OpenSearch](https://github.com/opensearch-project/OpenSearch) | BM25, vector search, filters | version-aware project corpus, ACL before ranking, RRF/rerank, citation and evidence sufficiency |
@@ -35,6 +35,13 @@ Do not fork or rewrite upstream frameworks. Implement adapters:
 - `runtime` isolates FastAPI and checkpoint repositories.
 
 Mock classes remain available so every module can be developed without all upstream dependencies running.
+
+Module 3 deliberately pins the optional Python SDK to `mcp>=1.27,<2`.  The
+official SDK's `main` branch documents a pre-release v2 line, while v1.x remains
+the stable production recommendation as of the recorded release audit.  The
+dependency-free local dispatcher targets MCP `2025-11-25`; installing the
+optional SDK changes the transport implementation, not the internal tool
+contracts or adapters.
 
 ## 4. Upstream verification checklist
 

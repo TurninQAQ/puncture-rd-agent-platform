@@ -25,6 +25,9 @@ class ToolDefinition:
     result_type: type[Any]
     description: str
     read_only: bool = True
+    destructive: bool = False
+    idempotent: bool = True
+    open_world: bool = False
     default_timeout_ms: int = 30_000
 
     def __post_init__(self) -> None:
@@ -32,6 +35,8 @@ class ToolDefinition:
             raise ValueError("tool name, version, and description are required")
         if self.default_timeout_ms <= 0:
             raise ValueError("default_timeout_ms must be positive")
+        if self.read_only and self.destructive:
+            raise ValueError("a read-only tool cannot be destructive")
 
 
 class ToolRegistry:
@@ -79,7 +84,7 @@ class ToolRegistry:
                 warnings=(),
                 error=ErrorDetail(
                     code=ErrorCode.INTERNAL_ERROR,
-                    message=f"unhandled tool exception: {type(exc).__name__}: {exc}",
+                    message=f"unhandled tool exception: {type(exc).__name__}",
                     retryable=False,
                 ),
                 started_at=now,

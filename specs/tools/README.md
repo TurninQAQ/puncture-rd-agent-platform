@@ -4,6 +4,15 @@ This directory is the hand-off contract for replacing deterministic mocks with
 company implementations.  Read this file and the selected tool specification
 before editing code.
 
+## Current local adapter status
+
+Module 3 now includes three registry-ready adapter groups in
+`src/puncture_agent/tooling/case_data.py`, `segmentation.py` and `planning.py`,
+plus the MCP wire/runtime layer in `src/puncture_agent/mcp/`.  Their deterministic
+manifest backends are executable protocol fixtures, not medical algorithms.
+Future company integration should implement the declared ports and inject them
+through `build_adapter_registry()` while retaining these local backends for CI.
+
 ## Non-negotiable integration rules
 
 1. Do not rename, add, remove, or reinterpret fields in `contracts/tool_inputs.py`

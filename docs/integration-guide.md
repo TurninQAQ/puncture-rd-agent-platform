@@ -6,6 +6,8 @@
 2. 阅读该模块使用的 `contracts/`。
 3. 先运行现有 Contract Tests，记录基线。
 4. 只替换 Stub 内部实现，不修改签名和返回类型。
+   Module 3 之后优先实现对应 Port，并通过 `build_adapter_registry()` 注入，
+   不要在 MCP Runtime 中加入算法或环境分支。
 5. 增加算法单元测试和失败测试。
 6. 运行 `python3 run_tests.py`。
 7. 运行该任务卡规定的验收场景。
@@ -27,4 +29,3 @@
 - 已知限制；
 - 性能数据；
 - 是否修改契约。
-
