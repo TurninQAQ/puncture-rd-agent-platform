@@ -205,6 +205,19 @@ Ran 557 tests in 21.951s
 OK (skipped=12)
 ```
 
+Remote PostgreSQL 16 evidence on 2026-07-11:
+
+- commit `7c99712d3f19665100a0e850abc03beb13dd0a58` completed the full
+  [GitHub Actions run 29145487743](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29145487743)
+  successfully;
+- Python 3.10, 3.11 and 3.12 each passed the regular suite and a separate
+  six-test PostgreSQL/LangGraph gate where any skip is a failure;
+- the database gate proves checkpoint restoration across saver/runtime
+  reconstruction without duplicate tool calls, dynamic child interrupt/resume,
+  two-runtime same-thread exclusion, direct advisory-lock contention,
+  `pg_terminate_backend` lease loss and takeover, and visibility of the terminal
+  checkpoint before the first stream event is acknowledged.
+
 - 537 tests pass in the dependency-free environment;
 - 545 tests pass with real LangGraph 1.2.9 available;
 - the graph suite with real dependencies available runs 128 tests: 121 pass and
@@ -229,6 +242,8 @@ OK (skipped=12)
 - real LangGraph child nodes and four local MCP planning calls share one trace ID;
 - a real dynamic interrupt resumes across a new runtime from the child checkpoint
   without replaying the already completed candidate-generation node;
+- the PostgreSQL 16 CI gate runs all six database tests without skips on all
+  three supported Python versions;
 - compileall and whitespace checks are separate final gates.
 
 Isolated graph-only benchmark on Linux 5.15, Intel Xeon Gold 6230, Python
@@ -260,23 +275,22 @@ for a controlled benchmark host.
 
 The following remain `NOT_RUN`, not implicitly complete:
 
-- disposable PostgreSQL setup and restart/resume execution on this host (the
-  automated CI-gated tests and PostgreSQL 16 service wiring are present, but no
-  successful remote workflow result was available during this implementation);
+- restarting the PostgreSQL service/container itself and restoring the graph in
+  a fresh OS process. CI now verifies fresh saver/runtime instances against a
+  real PostgreSQL 16 service, but the service remains running throughout those
+  six tests;
 - forced process termination after a side-effecting tool returns but before the
   graph checkpoint. Deterministic state-loss/restart tests now prove SQLite
   replay count remains one, but an actual process-kill harness is still `NOT_RUN`;
 - a shared PostgreSQL/dedicated replay ledger for multi-host MCP servers and
   atomic coordination between the tool's internal side effect and ledger commit;
-- actual PostgreSQL execution of the gated same-thread advisory-lock test and a
-  true multi-process/network-partition fault run; deterministic dual-runtime
-  coverage is complete, but this host has no PostgreSQL test DSN;
+- a true multi-process/network-partition fault run. Real PostgreSQL same-thread
+  contention and backend termination/takeover are verified in CI, but the two
+  runtime contenders currently execute as threads in one Python process;
 - durable fencing or an incident record for the narrow case where the dedicated
   advisory-lock connection is lost while a stale handler's external side effect
   is still completing; the MCP replay ledger and manual reconciliation remain
   required because a session lock alone cannot fence arbitrary external systems;
-- blocking real-saver proof that no API node event is acknowledged before a sync
-  checkpoint finishes; deterministic stream-buffer tests cover the adapter logic;
 - the complete failure matrix and 20-session concurrency test on real LangGraph,
   rather than only the focused real smoke/integration cases;
 - live multi-host execution against the deployment's shared Artifact Registry

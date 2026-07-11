@@ -36,15 +36,18 @@ deterministic manifest backend，不声称重写或验证了公司 MCS、TensorR
 测试替身和生产 PostgreSQL session advisory-lock manager，并覆盖竞争、续租、锁丢失和
 fail-closed 行为。MCP 桥接层现已在调用前和接收远端结果后查询可信 Artifact Registry，校验
 case、ACL、AVAILABLE 状态、类型、完整几何、生产者版本和直接父链；远端自声明的 Artifact
-公开视图不能成为自身的信任来源。本机无 PostgreSQL 测试 DSN，真实数据库运行证据、工具
-返回后到图 checkpoint 前的进程崩溃 exactly-once 证据和 API 接线仍待完成，详见
+公开视图不能成为自身的信任来源。GitHub Actions 已在 Python 3.10/3.11/3.12 与 PostgreSQL
+16 上分别执行 6 项禁止 skip 的真实数据库测试，覆盖 checkpoint 恢复、interrupt、竞争、
+backend termination/takeover 和 stream durability；PostgreSQL 服务真重启、独立进程恢复、
+工具返回后到图 checkpoint 前的进程崩溃 exactly-once 证据和 API 接线仍待完成，详见
 `docs/langgraph-runtime-implementation.md`。
 
 ## Phase 5: runtime and evaluation
 
-SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码与
-确定性双 Runtime 证据也已完成。下一步完成共享 PostgreSQL 账本、checkpoint/租约
-现场运行证据，并接入 FastAPI、SSE、OpenTelemetry 和生产回归 Harness。
+SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成，跨 worker 租约代码、
+确定性双 Runtime 证据和 PostgreSQL 16 CI 现场运行也已完成。下一步完成 PostgreSQL
+服务重启/独立进程恢复、checkpoint P50/P95、共享 PostgreSQL 账本，并接入 FastAPI、
+SSE、OpenTelemetry 和生产回归 Harness。
 
 ## Change policy
 
