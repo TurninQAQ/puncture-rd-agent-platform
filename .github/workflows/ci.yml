@@ -39,6 +39,7 @@ jobs:
         run: >-
           python -m pip install --disable-pip-version-check
           httpx==0.28.1
+          'pydantic==2.13.4'
           'langgraph==1.2.9'
           'langgraph-checkpoint-postgres==3.1.0'
           'psycopg[binary]>=3.2,<4'
@@ -47,8 +48,11 @@ jobs:
           PYTHONPATH: .:src
         run: >-
           python -c
-          "from puncture_agent.agent import langgraph_available;
+          "import pydantic;
+          from puncture_agent.agent import langgraph_available;
+          from puncture_agent.api.http_contracts import RunCreateBody;
           from langgraph.checkpoint.postgres import PostgresSaver;
+          assert pydantic.__version__ == '2.13.4';
           assert langgraph_available()"
       - name: Compile
         run: python -m compileall -q contracts src tests benchmarks examples deploy/qwen-vllm/scripts deploy/rag-search/scripts
@@ -59,6 +63,15 @@ jobs:
           bash -n deploy/rag-search/scripts/container_healthcheck.sh
       - name: Test
         run: python run_tests.py
+      - name: Pydantic API contracts (skips forbidden)
+        env:
+          PYTHONPATH: .:src
+        run: >-
+          python -c
+          "import sys, unittest;
+          suite = unittest.defaultTestLoader.loadTestsFromName('tests.api.test_http_contracts.PydanticHttpContractTests');
+          result = unittest.TextTestRunner(verbosity=2).run(suite);
+          sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)"
       - name: PostgreSQL/LangGraph integration (skips forbidden)
         if: ${{ always() }}
         env:

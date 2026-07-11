@@ -11,7 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 implementation = [
-  "pydantic>=2.7",
+  "pydantic>=2.7,<3",
   "fastapi>=0.115",
   "uvicorn>=0.30",
   "langgraph>=1.2.9,<2",
