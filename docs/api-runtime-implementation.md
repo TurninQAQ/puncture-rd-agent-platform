@@ -195,6 +195,15 @@ Remote evidence on 2026-07-11:
   successful commit;
 - the same workflow kept the independent PostgreSQL service-restart,
   checkpoint benchmark and real process-kill recovery jobs green.
+- commit `b8da00f3e2e51c967308fe52ab7fbb8b7e37cf6d` completed
+  [GitHub Actions run 29155728747](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29155728747)
+  successfully;
+- each Python 3.10, 3.11 and 3.12 matrix job passed the full suite plus exact,
+  zero-skip gates for seven Pydantic contracts, thirteen FastAPI/body-admission
+  tests, eight PostgreSQL Run repository tests and one FastAPI/PostgreSQL
+  composition test;
+- the same workflow kept PostgreSQL restart recovery, real process-kill replay
+  protection and the hosted checkpoint benchmark green.
 
 ## Still not implemented
 
