@@ -25,4 +25,5 @@ dist/
 .vscode/
 trace-output/
 eval-output/
+benchmark-results/
 /var/

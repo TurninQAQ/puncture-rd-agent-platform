@@ -134,8 +134,71 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  postgres-checkpoint-benchmark:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: puncture_test
+          POSTGRES_PASSWORD: puncture_test
+          POSTGRES_DB: puncture_agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U puncture_test -d puncture_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install production runtime dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          httpx==0.28.1
+          'langgraph==1.2.9'
+          'langgraph-checkpoint-postgres==3.1.0'
+          'psycopg[binary]>=3.2,<4'
+          'jsonschema==4.26.0'
+      - name: Measure PostgreSQL checkpoint save and resume
+        env:
+          PUNCTURE_TEST_POSTGRES_DSN: postgresql://puncture_test:puncture_test@127.0.0.1:5432/puncture_agent_test?sslmode=disable
+        run: >-
+          python benchmarks/langgraph_postgres_checkpoint_benchmark.py
+          --warmups 5
+          --rounds 3
+          --samples-per-round 50
+          --environment-label github-actions-ubuntu-24.04
+          --storage-label gha-postgres16-ephemeral-service
+          --output "${RUNNER_TEMP}/langgraph-postgres-checkpoint.json"
+      - name: Validate PostgreSQL checkpoint benchmark schema
+        run: >-
+          python -c
+          "import json, jsonschema, os, pathlib;
+          root = pathlib.Path('.');
+          schema = json.loads((root / 'benchmarks/schemas/langgraph-postgres-checkpoint-v1.schema.json').read_text());
+          result = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'langgraph-postgres-checkpoint.json').read_text());
+          jsonschema.Draft202012Validator.check_schema(schema);
+          jsonschema.Draft202012Validator(schema).validate(result)"
+      - name: Upload PostgreSQL checkpoint benchmark
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-checkpoint-benchmark-${{ github.sha }}
+          path: ${{ runner.temp }}/langgraph-postgres-checkpoint.json
+          if-no-files-found: error
+          retention-days: 30
+
   release-tag:
-    needs: [standard-library-tests, postgres-restart-recovery]
+    needs:
+      - standard-library-tests
+      - postgres-restart-recovery
+      - postgres-checkpoint-benchmark
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&

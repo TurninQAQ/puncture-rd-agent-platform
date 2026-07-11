@@ -197,11 +197,11 @@ Local Python 3.10.12 results on 2026-07-11:
 
 ```text
 python3 run_tests.py
-Ran 557 tests in 9.696s
+Ran 562 tests in 9.727s
 OK (skipped=20)
 
-PYTHONPATH=/tmp/lginstall3:src:. python3 run_tests.py
-Ran 557 tests in 21.951s
+PYTHONPATH=/tmp/lgpg:src:. python3 run_tests.py
+Ran 562 tests in 22.074s
 OK (skipped=12)
 ```
 
@@ -234,9 +234,9 @@ Remote PostgreSQL service-restart evidence on 2026-07-11:
   is 5.69 KB with workflow digest
   `sha256:6d471b09986ac48b7c3ce15da86212e9f5406599d07681314e3006ecc5069e83`.
 
-- 537 tests pass in the dependency-free environment;
-- 545 tests pass with real LangGraph 1.2.9 available;
-- the graph suite with real dependencies available runs 128 tests: 121 pass and
+- 542 tests pass in the dependency-free environment;
+- 550 tests pass with real LangGraph 1.2.9 available;
+- the graph suite with real dependencies available runs 133 tests: 126 pass and
   six PostgreSQL tests plus the inverse missing-dependency guard are skipped;
 - eight tests execute the actual `StateGraph` (seven graph integration/smoke/
   fault tests and one Eval test); the broader failure/concurrency matrix uses the
@@ -262,6 +262,9 @@ Remote PostgreSQL service-restart evidence on 2026-07-11:
   three supported Python versions;
 - the PostgreSQL service-restart job preserves the interrupted checkpoint and
   resumes it in a fresh Python process without replaying completed work;
+- five offline PostgreSQL benchmark contract tests pin median P50/nearest-rank
+  P95 statistics, the original 50/150 ms limits, phase filtering, the
+  secret-free JSON schema and missing-DSN fail-closed behavior;
 - compileall and whitespace checks are separate final gates.
 
 Isolated graph-only benchmark on Linux 5.15, Intel Xeon Gold 6230, Python

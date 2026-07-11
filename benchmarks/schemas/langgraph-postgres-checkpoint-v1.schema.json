@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://puncture.internal/schemas/langgraph-postgres-checkpoint-v1.schema.json",
+  "title": "LangGraph PostgreSQL checkpoint benchmark v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "generated_at_utc",
+    "source",
+    "environment",
+    "workload",
+    "measurements",
+    "correctness",
+    "thresholds",
+    "gate",
+    "notes"
+  ],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "benchmark_id": {"const": "langgraph-postgres-checkpoint"},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "dirty", "command"],
+      "properties": {
+        "commit": {"type": "string", "minLength": 1},
+        "dirty": {"type": ["boolean", "null"]},
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "platform",
+        "cpu_model",
+        "logical_cpus",
+        "python",
+        "langgraph",
+        "langgraph_checkpoint_postgres",
+        "psycopg",
+        "storage_label",
+        "postgres"
+      ],
+      "properties": {
+        "label": {"type": "string", "minLength": 1},
+        "platform": {"type": "string", "minLength": 1},
+        "cpu_model": {"type": "string", "minLength": 1},
+        "logical_cpus": {"type": ["integer", "null"], "minimum": 1},
+        "python": {"type": "string", "minLength": 1},
+        "langgraph": {"type": "string", "minLength": 1},
+        "langgraph_checkpoint_postgres": {"type": "string", "minLength": 1},
+        "psycopg": {"type": "string", "minLength": 1},
+        "storage_label": {"type": "string", "minLength": 1},
+        "postgres": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "server_version",
+            "server_version_num",
+            "synchronous_commit"
+          ],
+          "properties": {
+            "server_version": {"type": "string", "minLength": 1},
+            "server_version_num": {"type": "integer", "minimum": 1},
+            "synchronous_commit": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "graph",
+        "interrupt_before",
+        "checkpoint_save_measurement",
+        "put_writes_in_checkpoint_save",
+        "resume_measurement",
+        "fake_dependencies",
+        "durability",
+        "concurrency",
+        "warmups",
+        "rounds",
+        "samples_per_round",
+        "p50_method",
+        "p95_method",
+        "setup_timed",
+        "resume_connection_model"
+      ],
+      "properties": {
+        "graph": {"const": "graph/main_graph.json"},
+        "interrupt_before": {"const": "report_generator"},
+        "checkpoint_save_measurement": {
+          "const": "successful synchronous PostgresSaver.put() call"
+        },
+        "put_writes_in_checkpoint_save": {"const": false},
+        "resume_measurement": {
+          "const": "public LangGraphRuntime.resume() through terminal state"
+        },
+        "fake_dependencies": {"const": true},
+        "durability": {"const": "sync"},
+        "concurrency": {"const": 1},
+        "warmups": {"type": "integer", "minimum": 0},
+        "rounds": {"type": "integer", "minimum": 1},
+        "samples_per_round": {"type": "integer", "minimum": 1},
+        "p50_method": {"const": "median"},
+        "p95_method": {"const": "nearest-rank"},
+        "setup_timed": {"const": false},
+        "resume_connection_model": {"type": "string", "minLength": 1}
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_save_ms",
+        "resume_end_to_end_ms",
+        "diagnostics"
+      ],
+      "properties": {
+        "checkpoint_save_ms": {"$ref": "#/$defs/measurement"},
+        "resume_end_to_end_ms": {"$ref": "#/$defs/measurement"},
+        "diagnostics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "put_writes_ms",
+            "run_to_interrupt_ms",
+            "checkpoint_state_bytes"
+          ],
+          "properties": {
+            "put_writes_ms": {"$ref": "#/$defs/measurement"},
+            "run_to_interrupt_ms": {"$ref": "#/$defs/measurement"},
+            "checkpoint_state_bytes": {"$ref": "#/$defs/measurement"}
+          }
+        }
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "interrupted",
+        "resumed",
+        "terminal_checkpoints_verified",
+        "tool_counts_unchanged",
+        "errors"
+      ],
+      "properties": {
+        "interrupted": {"type": "integer", "minimum": 1},
+        "resumed": {"type": "integer", "minimum": 1},
+        "terminal_checkpoints_verified": {"type": "integer", "minimum": 1},
+        "tool_counts_unchanged": {"const": true},
+        "errors": {"type": "array", "maxItems": 0}
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "save_p95_ms",
+        "resume_p95_ms",
+        "aggregate_pass",
+        "stability_pass",
+        "passed",
+        "required_rounds_passed",
+        "save_rounds_passed",
+        "resume_rounds_passed"
+      ],
+      "properties": {
+        "save_p95_ms": {"const": 50.0},
+        "resume_p95_ms": {"const": 150.0},
+        "aggregate_pass": {"type": "boolean"},
+        "stability_pass": {"type": "boolean"},
+        "passed": {"type": "boolean"},
+        "required_rounds_passed": {"type": "integer", "minimum": 1},
+        "save_rounds_passed": {"type": "integer", "minimum": 0},
+        "resume_rounds_passed": {"type": "integer", "minimum": 0}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "passed"],
+      "properties": {
+        "mode": {"enum": ["record", "enforce"]},
+        "passed": {"type": "boolean"}
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "p50", "p95", "max", "round_p95", "raw_rounds"],
+      "properties": {
+        "count": {"type": "integer", "minimum": 0},
+        "p50": {"type": ["number", "null"], "minimum": 0},
+        "p95": {"type": ["number", "null"], "minimum": 0},
+        "max": {"type": ["number", "null"], "minimum": 0},
+        "round_p95": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": ["number", "null"], "minimum": 0}
+        },
+        "raw_rounds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "items": {"type": "number", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}
