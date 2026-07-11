@@ -39,7 +39,17 @@ def copy_json_value(
 
         if isinstance(item, Enum):
             return visit(item.value, path=path, depth=depth)
-        if item is None or isinstance(item, (str, bool, int)):
+        if item is None or isinstance(item, bool):
+            return item
+        if isinstance(item, str):
+            if "\x00" in item:
+                raise RuntimeJsonBoundaryError(f"{path} contains a NUL character")
+            return item
+        if isinstance(item, int):
+            if item < -(2**63) or item > 2**63 - 1:
+                raise RuntimeJsonBoundaryError(
+                    f"{path} contains an integer outside the signed 64-bit range"
+                )
             return item
         if isinstance(item, float):
             if not isfinite(item):
@@ -56,6 +66,10 @@ def copy_json_value(
                     if not isinstance(key, str):
                         raise RuntimeJsonBoundaryError(
                             f"{path} contains a non-string key"
+                        )
+                    if "\x00" in key:
+                        raise RuntimeJsonBoundaryError(
+                            f"{path} contains a key with a NUL character"
                         )
                     copied[key] = visit(
                         child,

@@ -5,17 +5,20 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 from threading import RLock
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from .errors import (
     ExecutionSuperseded,
+    RunRepositoryEventConflict,
     RunRepositoryIdempotencyConflict,
     RunRepositoryNotFound,
     RunRepositoryTransitionError,
     RunRepositoryVersionConflict,
 )
-from .json_boundary import copy_json_mapping
+from .json_boundary import copy_json_mapping, copy_json_value
 from .models import EventType, RunEvent, RunRequest, RunSnapshot, RunStatus
 
 
@@ -32,14 +35,40 @@ class RunEventDraft:
     event_type: EventType
     node_name: str | None
     payload: Mapping[str, Any]
+    event_key: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.event_type, EventType):
             raise TypeError("event_type must be an EventType")
         if self.node_name is not None and not isinstance(self.node_name, str):
             raise TypeError("node_name must be a string or None")
+        if self.node_name is not None:
+            try:
+                encoded_node_name = self.node_name.encode("utf-8")
+            except UnicodeError as exc:
+                raise ValueError("node_name must be valid UTF-8") from exc
+            if "\x00" in self.node_name or len(encoded_node_name) > 512:
+                raise ValueError(
+                    "node_name must be a bounded UTF-8 string without NUL"
+                )
         if not isinstance(self.payload, Mapping):
             raise TypeError("event payload must be a mapping")
+        if self.event_key is not None:
+            if (
+                not isinstance(self.event_key, str)
+                or not self.event_key.strip()
+                or self.event_key != self.event_key.strip()
+            ):
+                raise ValueError("event_key must be a non-empty bounded string")
+            try:
+                encoded_event_key = self.event_key.encode("utf-8")
+            except UnicodeError as exc:
+                raise ValueError("event_key must be valid UTF-8") from exc
+            if len(encoded_event_key) > 256 or any(
+                character in self.event_key
+                for character in ("\r", "\n", "\x00")
+            ):
+                raise ValueError("event_key must be a non-empty bounded string")
         object.__setattr__(self, "payload", copy_json_mapping(self.payload))
 
 
@@ -64,10 +93,19 @@ class CreateRunResult:
 
 
 @dataclass(slots=True)
+class _StoredEventClaim:
+    execution_version: int
+    fingerprint: str
+    event: RunEvent
+
+
+@dataclass(slots=True)
 class _StoredRun:
     snapshot: RunSnapshot
+    request_fingerprint: str
     version: int
     events: list[RunEvent]
+    event_claims: dict[str, _StoredEventClaim]
 
 
 _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
@@ -103,6 +141,50 @@ _RUNNING_STREAM_EVENTS = frozenset(
         EventType.TOOL_RESULT,
     }
 )
+
+
+def _canonical_json(value: Any) -> str:
+    normalized = copy_json_value(value)
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _request_document(request: RunRequest) -> dict[str, Any]:
+    document = copy_json_value(
+        {
+            "case_id": request.case_id,
+            "user_query": request.user_query,
+            "task_type": request.task_type,
+            "idempotency_key": request.idempotency_key,
+            "tenant_id": request.tenant_id,
+            "principal_id": request.principal_id,
+            "artifact_ids": list(request.artifact_ids),
+            "metadata": request.metadata,
+        }
+    )
+    if not isinstance(document, dict):
+        raise TypeError("request document must remain a mapping")
+    return document
+
+
+def _request_fingerprint(request: RunRequest) -> str:
+    canonical = _canonical_json(_request_document(request)).encode("utf-8")
+    return sha256(canonical).hexdigest()
+
+
+def _event_fingerprint(event: RunEventDraft, execution_version: int) -> str:
+    document = {
+        "execution_version": execution_version,
+        "event_type": event.event_type.value,
+        "node_name": event.node_name,
+        "payload": event.payload,
+    }
+    return sha256(_canonical_json(document).encode("utf-8")).hexdigest()
 
 
 @runtime_checkable
@@ -181,6 +263,11 @@ class InMemoryRunRepository:
             raise RunRepositoryTransitionError(
                 "new runs require RUN_CREATED then RUN_STARTED"
             )
+        if any(event.event_key is not None for event in normalized_events):
+            raise RunRepositoryTransitionError(
+                "initial lifecycle events must not define event_key"
+            )
+        request_fingerprint = _request_fingerprint(normalized_snapshot.request)
         key = (
             normalized_snapshot.request.tenant_id,
             normalized_snapshot.request.idempotency_key,
@@ -189,7 +276,7 @@ class InMemoryRunRepository:
             existing_id = self._idempotency.get(key)
             if existing_id is not None:
                 existing = self._records[existing_id]
-                if existing.snapshot.request != normalized_snapshot.request:
+                if existing.request_fingerprint != request_fingerprint:
                     raise RunRepositoryIdempotencyConflict()
                 return CreateRunResult(self._view(existing), created=False)
             if normalized_snapshot.run_id in self._records:
@@ -197,8 +284,10 @@ class InMemoryRunRepository:
 
             stored = _StoredRun(
                 snapshot=normalized_snapshot,
+                request_fingerprint=request_fingerprint,
                 version=1,
                 events=[],
+                event_claims={},
             )
             for event in normalized_events:
                 self._append_event_locked(stored, event)
@@ -259,14 +348,33 @@ class InMemoryRunRepository:
             raise RunRepositoryTransitionError(
                 "state events must be committed atomically with a state transition"
             )
+        if normalized_event.event_key is None:
+            raise RunRepositoryTransitionError(
+                "running stream events require a stable event_key"
+            )
+        fingerprint = _event_fingerprint(normalized_event, expected_version)
         with self._lock:
             stored = self._require(run_id, tenant_id)
+            existing = stored.event_claims.get(normalized_event.event_key)
+            if existing is not None:
+                if (
+                    existing.execution_version != expected_version
+                    or existing.fingerprint != fingerprint
+                ):
+                    raise RunRepositoryEventConflict()
+                return deepcopy(existing.event)
             if (
                 stored.version != expected_version
                 or stored.snapshot.status is not RunStatus.RUNNING
             ):
                 raise ExecutionSuperseded("execution no longer owns this run")
-            return deepcopy(self._append_event_locked(stored, normalized_event))
+            appended = self._append_event_locked(stored, normalized_event)
+            stored.event_claims[normalized_event.event_key] = _StoredEventClaim(
+                execution_version=expected_version,
+                fingerprint=fingerprint,
+                event=appended,
+            )
+            return deepcopy(appended)
 
     def compare_and_swap(
         self,
@@ -286,10 +394,16 @@ class InMemoryRunRepository:
                 raise RunRepositoryVersionConflict()
             self._validate_replacement(stored.snapshot, normalized_snapshot)
             self._validate_transition_events(normalized_snapshot, normalized_events)
+            if any(event.event_key is not None for event in normalized_events):
+                raise RunRepositoryTransitionError(
+                    "lifecycle transition events must not define event_key"
+                )
             candidate = _StoredRun(
                 snapshot=normalized_snapshot,
+                request_fingerprint=stored.request_fingerprint,
                 version=stored.version + 1,
                 events=deepcopy(stored.events),
+                event_claims=deepcopy(stored.event_claims),
             )
             for event in normalized_events:
                 self._append_event_locked(candidate, event)
@@ -326,7 +440,9 @@ class InMemoryRunRepository:
         InMemoryRunRepository._validate_snapshot_state(replacement)
         if replacement.run_id != current.run_id:
             raise RunRepositoryTransitionError("run_id is immutable")
-        if replacement.request != current.request:
+        if _request_fingerprint(replacement.request) != _request_fingerprint(
+            current.request
+        ):
             raise RunRepositoryTransitionError("run request is immutable")
         if replacement.trace_id != current.trace_id:
             raise RunRepositoryTransitionError("trace_id is immutable")
@@ -410,6 +526,7 @@ class InMemoryRunRepository:
             event_type=event.event_type,
             node_name=event.node_name,
             payload=event.payload,
+            event_key=event.event_key,
         )
 
     @staticmethod

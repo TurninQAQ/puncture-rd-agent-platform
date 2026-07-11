@@ -20,6 +20,7 @@ from puncture_agent.runtime import (
 )
 from puncture_agent.runtime.errors import (
     ExecutionSuperseded,
+    RunRepositoryEventConflict,
     RunRepositoryIdempotencyConflict,
     RunRepositoryNotFound,
     RunRepositoryTransitionError,
@@ -131,6 +132,26 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
         with self.assertRaises(RunRepositoryNotFound):
             repository.get("run-001", tenant_id="tenant-b")
 
+        typed_request = request(
+            idempotency_key="typed-idempotency",
+            flag=True,
+        )
+        repository.create_or_get_started(
+            started_snapshot(typed_request, run_id="run-typed"),
+            initial_events(),
+        )
+        with self.assertRaises(RunRepositoryIdempotencyConflict):
+            repository.create_or_get_started(
+                started_snapshot(
+                    request(
+                        idempotency_key="typed-idempotency",
+                        flag=1,
+                    ),
+                    run_id="run-typed-conflict",
+                ),
+                initial_events(),
+            )
+
     def test_version_fences_events_and_terminal_transitions(self) -> None:
         repository = InMemoryRunRepository(clock=lambda: FIXED_TIME)
         created = repository.create_or_get_started(
@@ -141,7 +162,12 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
             "run-001",
             tenant_id="tenant-a",
             expected_version=created.run.version,
-            event=RunEventDraft(EventType.NODE_STARTED, "parse_request", {}),
+            event=RunEventDraft(
+                EventType.NODE_STARTED,
+                "parse_request",
+                {},
+                event_key="v1-parse-started",
+            ),
         )
         self.assertEqual(
             1,
@@ -167,7 +193,12 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
                 "run-001",
                 tenant_id="tenant-a",
                 expected_version=1,
-                event=RunEventDraft(EventType.NODE_COMPLETED, "parse_request", {}),
+                event=RunEventDraft(
+                    EventType.NODE_COMPLETED,
+                    "parse_request",
+                    {},
+                    event_key="v1-parse-completed",
+                ),
             )
         with self.assertRaises(RunRepositoryVersionConflict):
             repository.compare_and_swap(
@@ -244,12 +275,38 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeJsonBoundaryError):
             RunEventDraft(EventType.NODE_STARTED, "bad-key", {1: "integer-key"})
+        with self.assertRaises(RuntimeJsonBoundaryError):
+            RunEventDraft(
+                EventType.NODE_STARTED,
+                "nul-payload",
+                {"value": "before\x00after"},
+            )
+        with self.assertRaises(RuntimeJsonBoundaryError):
+            RunEventDraft(
+                EventType.NODE_STARTED,
+                "large-integer",
+                {"value": 2**63},
+            )
+        with self.assertRaises(ValueError):
+            RunEventDraft(EventType.NODE_STARTED, "bad\x00node", {})
+        with self.assertRaises(ValueError):
+            RunEventDraft(
+                EventType.NODE_STARTED,
+                "trimmed-key",
+                {},
+                event_key=" leading-space",
+            )
 
         created = repository.create_or_get_started(
             started_snapshot(request()),
             initial_events(),
         )
-        mutated_event = RunEventDraft(EventType.NODE_STARTED, "mutated", {})
+        mutated_event = RunEventDraft(
+            EventType.NODE_STARTED,
+            "mutated",
+            {},
+            event_key="v1-mutated",
+        )
         mutated_event.payload["raw"] = b"not-json"
         with self.assertRaises(RuntimeJsonBoundaryError):
             repository.append_if_running(
@@ -376,6 +433,7 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
                     EventType.NODE_STARTED,
                     f"node-{index}",
                     {"index": index},
+                    event_key=f"v1-node-{index}",
                 ),
             )
 
@@ -392,6 +450,93 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
             1,
             repository.get("run-001", tenant_id="tenant-a").version,
         )
+
+    def test_stream_event_key_is_idempotent_and_conflicts_on_content_change(self) -> None:
+        repository = InMemoryRunRepository(clock=lambda: FIXED_TIME)
+        created = repository.create_or_get_started(
+            started_snapshot(request()),
+            initial_events(),
+        )
+        draft = RunEventDraft(
+            EventType.TOOL_CALLED,
+            "tool-a",
+            {"call_id": "call-1"},
+            event_key="v1-tool-call-1",
+        )
+
+        first = repository.append_if_running(
+            "run-001",
+            tenant_id="tenant-a",
+            expected_version=created.run.version,
+            event=draft,
+        )
+        replayed = repository.append_if_running(
+            "run-001",
+            tenant_id="tenant-a",
+            expected_version=created.run.version,
+            event=draft,
+        )
+        self.assertEqual(first, replayed)
+        self.assertEqual(3, first.sequence)
+
+        cancelled = repository.compare_and_swap(
+            "run-001",
+            tenant_id="tenant-a",
+            expected_version=created.run.version,
+            snapshot=replace(
+                created.run.snapshot,
+                status=RunStatus.CANCELLED,
+                updated_at="2026-07-11T12:00:01.000Z",
+            ),
+            events=(RunEventDraft(EventType.RUN_CANCELLED, None, {}),),
+        )
+        replayed_after_terminal = repository.append_if_running(
+            "run-001",
+            tenant_id="tenant-a",
+            expected_version=created.run.version,
+            event=draft,
+        )
+        self.assertEqual(first, replayed_after_terminal)
+        self.assertEqual(2, cancelled.version)
+
+        with self.assertRaises(RunRepositoryEventConflict):
+            repository.append_if_running(
+                "run-001",
+                tenant_id="tenant-a",
+                expected_version=created.run.version,
+                event=RunEventDraft(
+                    EventType.TOOL_CALLED,
+                    "tool-a",
+                    {"call_id": "different"},
+                    event_key="v1-tool-call-1",
+                ),
+            )
+        with self.assertRaises(RunRepositoryEventConflict):
+            repository.append_if_running(
+                "run-001",
+                tenant_id="tenant-a",
+                expected_version=created.run.version,
+                event=RunEventDraft(
+                    EventType.TOOL_CALLED,
+                    "tool-a",
+                    {"call_id": "call-1", "typed": True},
+                    event_key="v1-tool-call-1",
+                ),
+            )
+        with self.assertRaisesRegex(
+            RunRepositoryTransitionError,
+            "event_key",
+        ):
+            repository.append_if_running(
+                "run-001",
+                tenant_id="tenant-a",
+                expected_version=cancelled.version,
+                event=RunEventDraft(EventType.NODE_STARTED, "missing-key", {}),
+            )
+
+        events = repository.get_events("run-001", tenant_id="tenant-a")
+        self.assertEqual(4, len(events))
+        self.assertEqual(EventType.RUN_CANCELLED, events[-1].event_type)
 
     def test_failed_terminal_event_build_rolls_back_state_and_version(self) -> None:
         class FailingClock:
@@ -494,6 +639,126 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
 
 
 class RunServiceConcurrencyTests(unittest.TestCase):
+    def test_exact_event_replay_after_cancel_still_stops_old_executor(self) -> None:
+        class ReplayAfterCancelExecutor:
+            def __init__(self) -> None:
+                self.entered = Event()
+                self.release = Event()
+                self.continued = False
+
+            def execute(self, run_request, emit, *, checkpoint=None, approval=None):
+                del run_request, checkpoint, approval
+                emit(
+                    EventType.NODE_STARTED,
+                    "replayed-node",
+                    {"step": 1},
+                    event_key="replayed-event",
+                )
+                self.entered.set()
+                if not self.release.wait(timeout=5.0):
+                    raise RuntimeError("test release timeout")
+                emit(
+                    EventType.NODE_STARTED,
+                    "replayed-node",
+                    {"step": 1},
+                    event_key="replayed-event",
+                )
+                self.continued = True
+                return ExecutionOutcome(
+                    status=RunStatus.SUCCEEDED,
+                    final_report={"unexpected": True},
+                )
+
+        executor = ReplayAfterCancelExecutor()
+        service = InMemoryRunService(executor)
+        run_request = request(idempotency_key="terminal-event-replay")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(service.create_run, run_request)
+            self.assertTrue(executor.entered.wait(timeout=5.0))
+            running = service.create_run(run_request)
+            cancelled = service.cancel(running.run_id, tenant_id="tenant-a")
+            executor.release.set()
+            completed_call = future.result(timeout=5.0)
+
+        self.assertEqual(RunStatus.CANCELLED, cancelled.status)
+        self.assertEqual(RunStatus.CANCELLED, completed_call.status)
+        self.assertFalse(executor.continued)
+        events = service.get_events(cancelled.run_id, tenant_id="tenant-a")
+        self.assertEqual(
+            1,
+            [event.node_name for event in events].count("replayed-node"),
+        )
+        self.assertEqual(EventType.RUN_CANCELLED, events[-1].event_type)
+
+    def test_executor_event_key_is_validated_before_namespacing(self) -> None:
+        invalid_keys = (123, "", "   ", " leading", "trailing ", "bad\x00key")
+
+        for index, invalid_key in enumerate(invalid_keys):
+            class InvalidEventKeyExecutor:
+                def execute(
+                    self,
+                    run_request,
+                    emit,
+                    *,
+                    checkpoint=None,
+                    approval=None,
+                ):
+                    del run_request, checkpoint, approval
+                    emit(
+                        EventType.NODE_STARTED,
+                        "invalid-key",
+                        {},
+                        event_key=invalid_key,
+                    )
+                    return ExecutionOutcome(
+                        status=RunStatus.SUCCEEDED,
+                        final_report={"unexpected": True},
+                    )
+
+            with self.subTest(index=index, invalid_key=invalid_key):
+                service = InMemoryRunService(InvalidEventKeyExecutor())
+                failed = service.create_run(
+                    request(idempotency_key=f"invalid-event-key-{index}")
+                )
+                self.assertEqual(RunStatus.FAILED, failed.status)
+                self.assertEqual(
+                    "EXECUTOR_CONTRACT_ERROR",
+                    failed.error["code"],
+                )
+
+    def test_executor_event_key_conflict_becomes_contract_failure(self) -> None:
+        class ConflictingEventKeyExecutor:
+            def execute(self, run_request, emit, *, checkpoint=None, approval=None):
+                del run_request, checkpoint, approval
+                emit(
+                    EventType.NODE_STARTED,
+                    "first-node",
+                    {"step": 1},
+                    event_key="stable-event-key",
+                )
+                emit(
+                    EventType.NODE_COMPLETED,
+                    "second-node",
+                    {"step": 2},
+                    event_key="stable-event-key",
+                )
+                return ExecutionOutcome(
+                    status=RunStatus.SUCCEEDED,
+                    final_report={"unexpected": True},
+                )
+
+        service = InMemoryRunService(ConflictingEventKeyExecutor())
+        failed = service.create_run(
+            request(idempotency_key="event-key-conflict")
+        )
+
+        self.assertEqual(RunStatus.FAILED, failed.status)
+        self.assertEqual("EXECUTOR_CONTRACT_ERROR", failed.error["code"])
+        events = service.get_events(failed.run_id, tenant_id="tenant-a")
+        self.assertIn("first-node", [event.node_name for event in events])
+        self.assertNotIn("second-node", [event.node_name for event in events])
+        self.assertEqual(EventType.RUN_FAILED, events[-1].event_type)
+
     def test_executor_event_payload_must_be_durable_json(self) -> None:
         class NonJsonEventExecutor:
             def execute(self, run_request, emit, *, checkpoint=None, approval=None):

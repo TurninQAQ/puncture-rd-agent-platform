@@ -5,11 +5,12 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from .errors import (
     ExecutionSuperseded,
+    RunRepositoryEventConflict,
     RunRepositoryError,
     RunRepositoryVersionConflict,
     RunServiceError,
@@ -40,7 +41,17 @@ def _utc_now() -> str:
     )
 
 
-Emit = Callable[[EventType, str | None, Mapping[str, Any]], None]
+class Emit(Protocol):
+    def __call__(
+        self,
+        event_type: EventType,
+        node_name: str | None,
+        payload: Mapping[str, Any],
+        *,
+        event_key: str | None = None,
+    ) -> None: ...
+
+
 _EXECUTION_STREAM_EVENTS = frozenset(
     {
         EventType.NODE_STARTED,
@@ -313,12 +324,16 @@ class InMemoryRunService:
         checkpoint = copy_json_mapping(snapshot.checkpoint) or None
         request = deepcopy(snapshot.request)
         pending_transition_events: list[RunEventDraft] = []
+        stream_event_ordinal = 0
 
         def emit(
             event_type: EventType,
             node_name: str | None,
             payload: Mapping[str, Any],
+            *,
+            event_key: str | None = None,
         ) -> None:
+            nonlocal stream_event_ordinal
             if pending_transition_events:
                 raise _ExecutorContractViolation(
                     "executor emitted an event after requesting approval"
@@ -333,11 +348,50 @@ class InMemoryRunService:
                 )
             try:
                 durable_payload = copy_json_mapping(payload)
+                if event_type is EventType.APPROVAL_REQUESTED:
+                    if event_key is not None:
+                        raise _ExecutorContractViolation(
+                            "approval lifecycle events cannot define event_key"
+                        )
+                    resolved_event_key = None
+                else:
+                    stream_event_ordinal += 1
+                    if event_key is not None:
+                        if (
+                            not isinstance(event_key, str)
+                            or not event_key
+                            or event_key != event_key.strip()
+                            or any(
+                                character in event_key
+                                for character in ("\r", "\n", "\x00")
+                            )
+                        ):
+                            raise _ExecutorContractViolation(
+                                "executor event_key is invalid"
+                            )
+                        try:
+                            encoded_event_key = event_key.encode("utf-8")
+                        except UnicodeError as exc:
+                            raise _ExecutorContractViolation(
+                                "executor event_key is invalid"
+                            ) from exc
+                        if len(encoded_event_key) > 256:
+                            raise _ExecutorContractViolation(
+                                "executor event_key is invalid"
+                            )
+                    resolved_event_key = (
+                        f"execution-v{run.version}:{event_key}"
+                        if event_key is not None
+                        else f"execution-v{run.version}-event-{stream_event_ordinal}"
+                    )
                 draft = RunEventDraft(
                     event_type,
                     node_name,
                     self._redact(durable_payload),
+                    event_key=resolved_event_key,
                 )
+            except _ExecutorContractViolation:
+                raise
             except (RuntimeJsonBoundaryError, TypeError, ValueError) as exc:
                 raise _ExecutorContractViolation(
                     "executor event crossed the JSON boundary"
@@ -350,11 +404,21 @@ class InMemoryRunService:
                 )
                 pending_transition_events.append(draft)
                 return
-            self.repository.append_if_running(
+            try:
+                self.repository.append_if_running(
+                    snapshot.run_id,
+                    tenant_id=tenant_id,
+                    expected_version=run.version,
+                    event=draft,
+                )
+            except RunRepositoryEventConflict as exc:
+                raise _ExecutorContractViolation(
+                    "executor reused event_key with different content"
+                ) from exc
+            self.repository.assert_running(
                 snapshot.run_id,
                 tenant_id=tenant_id,
                 expected_version=run.version,
-                event=draft,
             )
 
         try:

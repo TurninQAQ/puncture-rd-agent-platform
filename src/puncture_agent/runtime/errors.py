@@ -30,6 +30,14 @@ class RunRepositoryIdempotencyConflict(RunRepositoryError):
         )
 
 
+class RunRepositoryEventConflict(RunRepositoryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "CONFLICT",
+            "event key was reused for different event content",
+        )
+
+
 class RunRepositoryVersionConflict(RunRepositoryError):
     def __init__(self) -> None:
         super().__init__("CONFLICT", "run state changed concurrently")
@@ -47,6 +55,7 @@ class ExecutionSuperseded(RuntimeError):
 __all__ = [
     "ExecutionSuperseded",
     "RunRepositoryError",
+    "RunRepositoryEventConflict",
     "RunRepositoryIdempotencyConflict",
     "RunRepositoryNotFound",
     "RunRepositoryTransitionError",
