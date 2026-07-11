@@ -14,7 +14,7 @@ from contracts.artifacts import ArtifactRef
 from contracts.enums import ArtifactStatus, ArtifactType
 from contracts.geometry import VolumeGeometry
 
-from .registry import ArtifactRegistryError, Principal
+from .registry import ArtifactRegistryError, ArtifactValidationRecord, Principal
 from .store import ArtifactStore, ArtifactStoreError, Payload
 
 
@@ -43,6 +43,8 @@ class ArtifactRegistry(Protocol):
     def fail(self, artifact_id: str, reason: str) -> Any: ...
 
     def get_metadata(self, artifact_id: str) -> Any: ...
+
+    def get_validation_record(self, artifact_id: str) -> ArtifactValidationRecord: ...
 
     def resolve_uri(self, artifact_id: str, principal: Principal) -> str: ...
 

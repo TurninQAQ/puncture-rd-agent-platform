@@ -34,8 +34,10 @@ deterministic manifest backend，不声称重写或验证了公司 MCS、TensorR
 隔离安装的 LangGraph 1.2.9 已验证真实图、子图恢复和 MCP trace；PostgreSQL saver、CI 服务
 配置与跨 runtime 恢复测试已落地。跨 Runtime 的 `run/resume/stream` 已接 SQLite TTL/CAS
 测试替身和生产 PostgreSQL session advisory-lock manager，并覆盖竞争、续租、锁丢失和
-fail-closed 行为。本机无 PostgreSQL 测试 DSN，真实数据库运行证据、工具返回后到图 checkpoint
-前的进程崩溃 exactly-once 证据、可信输出 Artifact Registry 校验和 API 接线仍待完成，详见
+fail-closed 行为。MCP 桥接层现已在调用前和接收远端结果后查询可信 Artifact Registry，校验
+case、ACL、AVAILABLE 状态、类型、完整几何、生产者版本和直接父链；远端自声明的 Artifact
+公开视图不能成为自身的信任来源。本机无 PostgreSQL 测试 DSN，真实数据库运行证据、工具
+返回后到图 checkpoint 前的进程崩溃 exactly-once 证据和 API 接线仍待完成，详见
 `docs/langgraph-runtime-implementation.md`。
 
 ## Phase 5: runtime and evaluation

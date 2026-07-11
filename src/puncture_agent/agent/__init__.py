@@ -1,5 +1,12 @@
 """Contract-first reference and production runtimes for the R&D agent."""
 
+from .artifact_validation import (
+    ArtifactValidationError,
+    ArtifactValidationRegistry,
+    ArtifactValidationRejected,
+    ArtifactValidationUnavailable,
+    RegistryToolArtifactValidator,
+)
 from .graph_spec import GraphSpec, GraphSpecError, load_graph_spec, validate_graph_spec
 from .langgraph_runtime import (
     GraphStreamEvent,
@@ -43,11 +50,16 @@ from .tool_bridge import (
     ToolBridgePolicy,
     ToolBridgeResponseError,
     ToolBridgeTransportError,
+    ToolArtifactValidator,
 )
 
 __all__ = [
     "AgentState",
     "AgentStatus",
+    "ArtifactValidationError",
+    "ArtifactValidationRegistry",
+    "ArtifactValidationRejected",
+    "ArtifactValidationUnavailable",
     "GraphExecutionError",
     "GraphRuntime",
     "GraphSpec",
@@ -63,6 +75,7 @@ __all__ = [
     "ProductionAgentState",
     "PostgresAdvisoryThreadExecutionLeaseManager",
     "RawBytesStateError",
+    "RegistryToolArtifactValidator",
     "StateConversionError",
     "StateSizeLimitError",
     "SQLiteThreadExecutionLeaseManager",
@@ -78,6 +91,7 @@ __all__ = [
     "ToolBridgePolicy",
     "ToolBridgeResponseError",
     "ToolBridgeTransportError",
+    "ToolArtifactValidator",
     "VerificationStatus",
     "DEFAULT_TOOL_BRIDGE_POLICY",
     "build_mock_handlers",

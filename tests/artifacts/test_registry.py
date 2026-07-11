@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 
 from contracts.enums import ArtifactStatus, ArtifactType, CoordinateSystem
 from contracts.geometry import VolumeGeometry
-from puncture_agent.artifacts import ArtifactRegistryError, InMemoryArtifactRegistry, Principal
+from puncture_agent.artifacts import (
+    ArtifactRegistryError,
+    ArtifactValidationRecord,
+    InMemoryArtifactRegistry,
+    Principal,
+)
 
 
 CHECKSUM_A = "a" * 64
@@ -51,6 +57,52 @@ class ArtifactRegistryTests(unittest.TestCase):
         self.assertEqual(ArtifactStatus.PENDING, view.status)
         self.assertFalse(hasattr(view, "uri"))
         self.assertFalse(hasattr(view, "checksum_sha256"))
+
+    def test_validation_record_is_complete_and_storage_secret_free(self) -> None:
+        registry = InMemoryArtifactRegistry()
+        expected_geometry = geometry()
+        begin(
+            registry,
+            artifact_id="ct-parent",
+            key="parent-key",
+            volume_geometry=expected_geometry,
+        )
+        registry.finalize("ct-parent", CHECKSUM_A, 123)
+        registry.begin_registration(
+            artifact_id="label-child",
+            case_id="case-001",
+            artifact_type=ArtifactType.NIFTI_LABELMAP,
+            internal_uri="s3://private/never-expose/label-child.nii.gz",
+            created_by="private-uploader",
+            idempotency_key="private-idempotency-key",
+            producer_name="convert_mcs_to_nifti",
+            producer_version="1.0.0",
+            parent_artifact_ids=("ct-parent",),
+            geometry=expected_geometry,
+            metadata={"access_token": "never-expose-token"},
+        )
+        registry.finalize("label-child", CHECKSUM_B, 456)
+
+        record = registry.get_validation_record("label-child")
+
+        self.assertIsInstance(record, ArtifactValidationRecord)
+        self.assertEqual(registry.get_metadata("label-child"), record.public_view)
+        self.assertEqual(expected_geometry, record.geometry)
+        self.assertEqual(("ct-parent",), record.parent_artifact_ids)
+        projection = asdict(record)
+        self.assertEqual(
+            {"public_view", "geometry", "parent_artifact_ids"}, set(projection)
+        )
+        rendered = repr(record)
+        for forbidden in (
+            "s3://private/never-expose",
+            CHECKSUM_B,
+            "never-expose-token",
+            "private-uploader",
+            "private-idempotency-key",
+            "metadata=",
+        ):
+            self.assertNotIn(forbidden, rendered)
 
     def test_finalize_is_idempotent_but_cannot_overwrite(self) -> None:
         registry = InMemoryArtifactRegistry()
@@ -113,6 +165,20 @@ class ArtifactRegistryTests(unittest.TestCase):
         with self.assertRaises(ArtifactRegistryError) as cycle:
             begin(registry, artifact_id="seg-1", key="key-1", parents=("seg-1",))
         self.assertEqual("LINEAGE_CYCLE", cycle.exception.code)
+
+    def test_validation_record_rejects_out_of_band_lineage_cycle(self) -> None:
+        registry = InMemoryArtifactRegistry()
+        for index, artifact_id in enumerate(("cycle-a", "cycle-b", "cycle-c")):
+            begin(registry, artifact_id=artifact_id, key=f"cycle-key-{index}")
+            registry.finalize(artifact_id, f"{index + 1:x}" * 64, 10)
+
+        registry._records["cycle-a"].parent_artifact_ids = ("cycle-c",)
+        registry._records["cycle-b"].parent_artifact_ids = ("cycle-a",)
+        registry._records["cycle-c"].parent_artifact_ids = ("cycle-b",)
+
+        with self.assertRaises(ArtifactRegistryError) as raised:
+            registry.get_validation_record("cycle-a")
+        self.assertEqual("LINEAGE_CYCLE", raised.exception.code)
 
     def test_geometry_fingerprint_changes_with_spacing(self) -> None:
         same_a = geometry()

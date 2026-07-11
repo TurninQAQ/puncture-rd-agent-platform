@@ -4,6 +4,7 @@ from .identity import build_artifact_idempotency_key, canonical_json
 from .registry import (
     ArtifactLineage,
     ArtifactRegistryError,
+    ArtifactValidationRecord,
     InMemoryArtifactRegistry,
     Principal,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "ArtifactPublicationService",
     "ArtifactRegistry",
     "ArtifactRegistryError",
+    "ArtifactValidationRecord",
     "ArtifactStore",
     "ArtifactStoreError",
     "InMemoryArtifactRegistry",

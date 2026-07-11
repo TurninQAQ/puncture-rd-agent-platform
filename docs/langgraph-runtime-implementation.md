@@ -28,6 +28,9 @@ Implemented and locally verified:
 - recursive frozen MCP response/result validation, normalized frozen values,
   request/envelope Artifact identity binding and versioned idempotency identities
   without changing shared contracts;
+- atomic trusted-Registry snapshots for every supplied Artifact and every remote
+  output, including current case/ACL/status/type, full geometry, producer/version
+  and exact direct-lineage policies before any output can mutate Agent state;
 - accepted-candidate-only reporting and deterministic manual-review handling.
 
 The standard-library environment intentionally has no optional LangGraph or
@@ -93,13 +96,16 @@ from puncture_agent.agent import (
     LangGraphRuntime,
     McpToolExecutor,
     PostgresAdvisoryThreadExecutionLeaseManager,
+    RegistryToolArtifactValidator,
     build_production_handlers,
     open_postgres_checkpointer,
 )
 
+artifact_validator = RegistryToolArtifactValidator(artifact_registry)
 tool_executor = McpToolExecutor(
     mcp_runtimes_or_clients,
     principal=principal_provider,
+    artifact_validator=artifact_validator,
 )
 handlers = build_production_handlers(
     tool_executor=tool_executor,
@@ -125,6 +131,14 @@ in-memory saver for a production process that must survive restart. The lease
 manager opens a separate autocommit connection per execution and must never
 reuse the saver connection.
 
+`artifact_registry` must be the deployment's independent authority, not data
+copied from the remote MCP response. Its `get_validation_record()` operation
+returns one atomic snapshot containing only the public Artifact view, full
+geometry and direct parent IDs; it deliberately omits URI, checksum and private
+metadata. The checked-in in-memory and SQLite registries implement this port.
+A multi-host deployment must provide the same atomic contract from its shared
+Registry service/database.
+
 ## Failure routing and checkpoint boundaries
 
 - Missing or ambiguous model input, incomplete task-required RAG evidence, or
@@ -136,6 +150,19 @@ reuse the saver connection.
 - Contract/schema/permission/geometry failures are non-retryable and fail closed
   to manual review. A valid `NO_CANDIDATE_PATH`/`NO_FEASIBLE_PATH` response is a
   no-result business terminal and does not run downstream safety tools.
+- Trusted Artifact inputs are checked before transport. Successful/partial remote
+  outputs are checked again after frozen response normalization and sanitization,
+  but before the node can update `state.artifacts` or invoke a dependent tool.
+  A Registry outage becomes retryable `DEPENDENCY_FAILED`; an unregistered,
+  cross-case, unavailable, mistyped or forged Artifact becomes non-retryable
+  `CONTRACT_VIOLATION` without exposing Registry internals.
+- Artifact-producing tools have explicit output policies. Conversion,
+  segmentation and skin-surface outputs must match the Registry public view,
+  producer/version and exact parent set; geometry is exact except for the
+  approved conversion-compatibility tolerance. Candidate generation may return
+  zero or multiple `PATH_MASK` outputs, whose envelope set, CT geometry and full
+  request lineage must match exactly. Tools without an output policy cannot
+  smuggle an Artifact envelope.
 - LangGraph writes with `durability="sync"`. API events are buffered until the
   underlying stream drains, so a visible transition is not acknowledged while
   the synchronous graph stream is still checkpointing.
@@ -170,17 +197,17 @@ Local Python 3.10.12 results on 2026-07-11:
 
 ```text
 python3 run_tests.py
-Ran 528 tests in 10.253s
+Ran 554 tests in 9.729s
 OK (skipped=17)
 
 PYTHONPATH=/tmp/lginstall3:src:. python3 run_tests.py
-Ran 528 tests in 24.388s
+Ran 554 tests in 21.759s
 OK (skipped=9)
 ```
 
-- 511 tests pass in the dependency-free environment;
-- 519 tests pass with real LangGraph 1.2.9 available;
-- the graph suite with real dependencies available runs 102 tests: 98 pass and
+- 537 tests pass in the dependency-free environment;
+- 545 tests pass with real LangGraph 1.2.9 available;
+- the graph suite with real dependencies available runs 125 tests: 121 pass and
   three PostgreSQL tests plus the inverse missing-dependency guard are skipped;
 - eight tests execute the actual `StateGraph` (seven graph integration/smoke/
   fault tests and one Eval test); the broader failure/concurrency matrix uses the
@@ -195,6 +222,10 @@ OK (skipped=9)
 - 14 execution-lease tests prove backend contention/expiry/loss behavior and
   cross-runtime `run/run`, `resume/resume`, and `stream/run` exclusion while
   allowing different thread IDs to enter handlers concurrently;
+- 18 trusted Artifact validator tests, five bridge/state integration tests and
+  three atomic Registry-snapshot tests prove forged/unregistered outputs,
+  incorrect case/status/type/producer/version/geometry/lineage, ACL denial and
+  Registry outages all fail closed without storage-secret leakage;
 - real LangGraph child nodes and four local MCP planning calls share one trace ID;
 - a real dynamic interrupt resumes across a new runtime from the child checkpoint
   without replaying the already completed candidate-generation node;
@@ -248,11 +279,10 @@ The following remain `NOT_RUN`, not implicitly complete:
   checkpoint finishes; deterministic stream-buffer tests cover the adapter logic;
 - the complete failure matrix and 20-session concurrency test on real LangGraph,
   rather than only the focused real smoke/integration cases;
-- registry-backed proof that every supplied and remotely returned Artifact ID
-  belongs to the authenticated case, expected type/status and compatible geometry
-  lineage. The bridge rejects URI identities, cross-case declarations, unbound
-  result IDs and result/envelope disagreement, but cannot trust a remote envelope's
-  self-declared ownership without an authoritative registry query;
+- live multi-host execution against the deployment's shared Artifact Registry
+  service, including Registry failover/load evidence. The authority protocol,
+  in-memory/SQLite implementations and fail-closed bridge integration are locally
+  verified, but this host has no production shared-Registry endpoint;
 - using retrieved rule contents to derive numeric planning constraints and label
   policy, rather than using RAG as a required versioned-evidence gate while the
   frozen `ToolBridgePolicy` remains authoritative;

@@ -19,13 +19,23 @@ from contracts.artifacts import ArtifactRef  # noqa: E402
 from contracts.enums import ArtifactStatus, ArtifactType, CoordinateSystem  # noqa: E402
 from contracts.geometry import VolumeGeometry  # noqa: E402
 from contracts.tool_inputs import TOOL_REQUEST_TYPES  # noqa: E402
+from puncture_agent.agent.artifact_validation import (  # noqa: E402
+    RegistryToolArtifactValidator,
+)
+from puncture_agent.agent.nodes import build_mock_handlers  # noqa: E402
+from puncture_agent.agent.runtime import NodeContext  # noqa: E402
 from puncture_agent.agent.state import AgentState  # noqa: E402
 from puncture_agent.agent.tool_bridge import (  # noqa: E402
     DEFAULT_TOOL_BRIDGE_POLICY,
     McpToolExecutor,
+    ToolBridgeContextError,
     ToolBridgeContractError,
     ToolBridgeResponseError,
     ToolBridgeTransportError,
+)
+from puncture_agent.artifacts import (  # noqa: E402
+    ArtifactRegistryError,
+    InMemoryArtifactRegistry,
 )
 from puncture_agent.mcp import (  # noqa: E402
     InMemoryArtifactResolver,
@@ -73,6 +83,29 @@ def artifact(artifact_id: str, artifact_type: ArtifactType) -> ArtifactRef:
         producer_name="tool-bridge-test",
         producer_version="1",
     )
+
+
+def register_artifact(
+    registry: InMemoryArtifactRegistry,
+    value: ArtifactRef,
+    *,
+    producer_name: str | None = None,
+    producer_version: str | None = None,
+    parent_artifact_ids: tuple[str, ...] = (),
+) -> None:
+    registry.begin_registration(
+        case_id=value.case_id,
+        artifact_type=value.artifact_type,
+        internal_uri=value.uri,
+        created_by="tool-bridge-test",
+        idempotency_key=f"seed:{value.artifact_id}",
+        producer_name=producer_name or value.producer_name,
+        producer_version=producer_version or value.producer_version,
+        parent_artifact_ids=parent_artifact_ids,
+        geometry=value.geometry,
+        artifact_id=value.artifact_id,
+    )
+    registry.finalize(value.artifact_id, value.checksum_sha256, 1)
 
 
 class CapturingCaller:
@@ -470,6 +503,17 @@ class ToolBridgeTests(unittest.TestCase):
             second["context"]["idempotency_key"],
         )
 
+        denied_caller = NeverCalledCaller()
+        denied_executor = McpToolExecutor(
+            denied_caller,
+            principal=McpPrincipal("operator-denied", ("case-other",)),
+            session_id="principal-denied-session",
+            clock=lambda: FIXED_NOW,
+        )
+        with self.assertRaises(ToolBridgeContextError):
+            denied_executor.execute("inspect_case_metadata", request)
+        self.assertEqual(0, denied_caller.call_count)
+
     def test_tool_version_is_part_of_replay_identity(self) -> None:
         caller = NeverCalledCaller()
         executor = McpToolExecutor(
@@ -796,6 +840,220 @@ class ToolBridgeTests(unittest.TestCase):
                     "model_version": "v1",
                 },
             )
+
+    def test_trusted_registry_accepts_an_authoritative_remote_output(self) -> None:
+        registry = InMemoryArtifactRegistry()
+        register_artifact(registry, self.ct)
+        output = artifact(f"{CASE_ID}-seg-v1", ArtifactType.SEGMENTATION_MASK)
+        register_artifact(
+            registry,
+            output,
+            producer_name="run_segmentation",
+            producer_version="1.0.0",
+            parent_artifact_ids=(self.ct.artifact_id,),
+        )
+        delegate = self.callers["segmentation"].delegate
+
+        class AuthoritativeSegmentationCaller:
+            tool_names = ("run_segmentation",)
+
+            def call_tool(inner_self, name, arguments, *, principal):
+                result = delegate.call_tool(name, arguments, principal=principal)
+                protocol = result.to_protocol_result()
+                structured = protocol["structuredContent"]
+                structured["result"]["segmentation_artifact"][
+                    "producer_version"
+                ] = "1.0.0"
+                structured["artifacts"][0]["producer_version"] = "1.0.0"
+                return protocol
+
+        executor = McpToolExecutor(
+            AuthoritativeSegmentationCaller(),
+            principal=self.principal,
+            session_id="registry-valid-output",
+            clock=lambda: FIXED_NOW,
+            artifact_validator=RegistryToolArtifactValidator(registry),
+        )
+
+        response = executor.execute(
+            "run_segmentation",
+            {
+                "case_id": CASE_ID,
+                "ct_artifact_id": self.ct.artifact_id,
+                "model_version": "v1",
+            },
+        )
+
+        self.assertEqual(output.artifact_id, response["artifacts"][0]["artifact_id"])
+
+    def test_trusted_registry_rejects_consistent_remote_self_declaration(self) -> None:
+        registry = InMemoryArtifactRegistry()
+        register_artifact(registry, self.ct)
+        delegate = self.callers["segmentation"].delegate
+
+        class ConsistentlyForgingSegmentationCaller:
+            tool_names = ("run_segmentation",)
+
+            def __init__(inner_self) -> None:
+                inner_self.call_count = 0
+
+            def call_tool(inner_self, name, arguments, *, principal):
+                inner_self.call_count += 1
+                result = delegate.call_tool(name, arguments, principal=principal)
+                protocol = result.to_protocol_result()
+                structured = protocol["structuredContent"]
+                forged = dict(structured["artifacts"][0])
+                forged["artifact_id"] = "case-001-unregistered-output"
+                structured["result"]["segmentation_artifact"] = dict(forged)
+                structured["artifacts"] = [dict(forged)]
+                return protocol
+
+        caller = ConsistentlyForgingSegmentationCaller()
+        executor = McpToolExecutor(
+            caller,
+            principal=self.principal,
+            session_id="registry-forged-output",
+            clock=lambda: FIXED_NOW,
+            artifact_validator=RegistryToolArtifactValidator(registry),
+        )
+
+        with self.assertRaisesRegex(
+            ToolBridgeResponseError,
+            "trusted Artifact Registry rejected",
+        ):
+            executor.execute(
+                "run_segmentation",
+                {
+                    "case_id": CASE_ID,
+                    "ct_artifact_id": self.ct.artifact_id,
+                    "model_version": "v1",
+                },
+            )
+        self.assertEqual(1, caller.call_count)
+
+    def test_rejected_remote_artifact_never_mutates_artifact_state_or_runs_validation(self) -> None:
+        registry = InMemoryArtifactRegistry()
+        register_artifact(registry, self.ct)
+        delegate = self.callers["segmentation"].delegate
+
+        class ConsistentlyForgingSegmentationCaller:
+            tool_names = ("run_segmentation", "validate_segmentation_result")
+
+            def __init__(inner_self) -> None:
+                inner_self.call_count = 0
+
+            def call_tool(inner_self, name, arguments, *, principal):
+                inner_self.call_count += 1
+                result = delegate.call_tool(name, arguments, principal=principal)
+                protocol = result.to_protocol_result()
+                structured = protocol["structuredContent"]
+                forged = dict(structured["artifacts"][0])
+                forged["artifact_id"] = "case-001-unregistered-output"
+                structured["result"]["segmentation_artifact"] = dict(forged)
+                structured["artifacts"] = [dict(forged)]
+                return protocol
+
+        caller = ConsistentlyForgingSegmentationCaller()
+        executor = McpToolExecutor(
+            caller,
+            principal=self.principal,
+            session_id="registry-state-guard",
+            clock=lambda: FIXED_NOW,
+            artifact_validator=RegistryToolArtifactValidator(registry),
+        )
+        handlers = build_mock_handlers(executor)
+        state = AgentState(
+            user_query="segment",
+            session_id="registry-state-guard",
+            case_id=CASE_ID,
+            artifacts={"ct": self.ct.artifact_id},
+            metadata={"model_version": "v1"},
+        )
+        state.current_node = "data_model_subgraph.run_segmentation"
+        node_context = NodeContext(
+            "data_model_subgraph",
+            "run_segmentation",
+            state.current_node,
+            {},
+        )
+
+        handlers["run_segmentation"](state, node_context)
+
+        self.assertEqual({"ct": self.ct.artifact_id}, state.artifacts)
+        self.assertEqual("CONTRACT_VIOLATION", state.metadata["last_tool_error"]["code"])
+        self.assertEqual(1, caller.call_count)
+
+        state.current_node = "data_model_subgraph.validate_segmentation_result"
+        handlers["validate_segmentation_result"](
+            state,
+            NodeContext(
+                "data_model_subgraph",
+                "validate_segmentation_result",
+                state.current_node,
+                {},
+            ),
+        )
+        self.assertFalse(state.metadata["segmentation_valid"])
+        self.assertEqual(1, caller.call_count)
+
+    def test_trusted_registry_rejects_input_before_remote_execution(self) -> None:
+        caller = self.callers["segmentation"]
+        executor = McpToolExecutor(
+            caller,
+            principal=self.principal,
+            session_id="registry-invalid-input",
+            clock=lambda: FIXED_NOW,
+            artifact_validator=RegistryToolArtifactValidator(
+                InMemoryArtifactRegistry()
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ToolBridgeContractError,
+            "trusted Artifact Registry rejected",
+        ):
+            executor.execute(
+                "run_segmentation",
+                {
+                    "case_id": CASE_ID,
+                    "ct_artifact_id": self.ct.artifact_id,
+                    "model_version": "v1",
+                },
+            )
+        self.assertEqual([], caller.calls)
+
+    def test_trusted_registry_unavailability_is_retryable_and_fail_closed(self) -> None:
+        class UnavailableRegistry:
+            def get_validation_record(inner_self, artifact_id):
+                del artifact_id
+                raise ArtifactRegistryError(
+                    "STORAGE_ERROR",
+                    "private database details",
+                    retryable=True,
+                )
+
+        caller = self.callers["segmentation"]
+        executor = McpToolExecutor(
+            caller,
+            principal=self.principal,
+            session_id="registry-unavailable",
+            clock=lambda: FIXED_NOW,
+            artifact_validator=RegistryToolArtifactValidator(UnavailableRegistry()),
+        )
+
+        with self.assertRaises(ToolBridgeTransportError) as caught:
+            executor.execute(
+                "run_segmentation",
+                {
+                    "case_id": CASE_ID,
+                    "ct_artifact_id": self.ct.artifact_id,
+                    "model_version": "v1",
+                },
+            )
+        self.assertEqual("DEPENDENCY_FAILED", caught.exception.code)
+        self.assertTrue(caught.exception.retryable)
+        self.assertNotIn("private database", str(caught.exception))
+        self.assertEqual([], caller.calls)
 
     def test_ambiguous_multiple_segmentation_artifacts_fail_explicitly(self) -> None:
         with self.assertRaisesRegex(

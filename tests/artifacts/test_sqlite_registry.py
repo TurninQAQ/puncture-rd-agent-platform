@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from contracts.enums import ArtifactStatus, ArtifactType, CoordinateSystem
 from contracts.geometry import VolumeGeometry
+from puncture_agent.artifacts import ArtifactValidationRecord
 from puncture_agent.artifacts.registry import ArtifactRegistryError, Principal
 from puncture_agent.artifacts.registry import InMemoryArtifactRegistry
 from puncture_agent.artifacts.sqlite_registry import SQLiteArtifactRegistry
@@ -78,6 +79,7 @@ class SQLiteArtifactRegistryTests(unittest.TestCase):
             "invalidate",
             "mark_missing",
             "get_metadata",
+            "get_validation_record",
             "resolve_uri",
             "find_available_by_idempotency_key",
             "find_ready_by_idempotency_key",
@@ -135,6 +137,60 @@ class SQLiteArtifactRegistryTests(unittest.TestCase):
                 ("parent-a", "parent-z"),
                 registry.get_lineage("child").parent_artifact_ids,
             )
+
+    def test_validation_record_matches_memory_and_redacts_storage_fields(self) -> None:
+        memory = InMemoryArtifactRegistry()
+        expected_geometry = geometry()
+        snapshots = []
+        for registry in (memory, self.registry):
+            registry.begin_registration(
+                artifact_id="parent",
+                case_id="case-001",
+                artifact_type=ArtifactType.CT_VOLUME,
+                internal_uri="s3://private/never-expose/parent.nii.gz",
+                created_by="private-uploader",
+                idempotency_key="parent-key",
+                producer_name="fixture-loader",
+                producer_version="1.0.0",
+                geometry=expected_geometry,
+                metadata={"access_token": "parent-secret"},
+            )
+            registry.finalize("parent", CHECKSUM_A, 1024)
+            registry.begin_registration(
+                artifact_id="child",
+                case_id="case-001",
+                artifact_type=ArtifactType.NIFTI_LABELMAP,
+                internal_uri="s3://private/never-expose/child.nii.gz",
+                created_by="private-uploader",
+                idempotency_key="child-key",
+                producer_name="convert_mcs_to_nifti",
+                producer_version="1.0.0",
+                parent_artifact_ids=("parent",),
+                geometry=expected_geometry,
+                metadata={"access_token": "child-secret"},
+            )
+            registry.finalize("child", CHECKSUM_B, 512)
+            snapshots.append(registry.get_validation_record("child"))
+
+        self.assertEqual(snapshots[0], snapshots[1])
+        for snapshot in snapshots:
+            self.assertIsInstance(snapshot, ArtifactValidationRecord)
+            self.assertEqual(expected_geometry, snapshot.geometry)
+            self.assertEqual(("parent",), snapshot.parent_artifact_ids)
+            self.assertEqual(
+                {"public_view", "geometry", "parent_artifact_ids"},
+                set(asdict(snapshot)),
+            )
+            rendered = repr(snapshot)
+            for forbidden in (
+                "s3://private/never-expose",
+                CHECKSUM_B,
+                "child-secret",
+                "private-uploader",
+                "child-key",
+                "metadata=",
+            ):
+                self.assertNotIn(forbidden, rendered)
 
     def test_restart_preserves_artifact_geometry_metadata_and_lineage(self) -> None:
         expected_geometry = geometry()
@@ -469,10 +525,11 @@ class SQLiteArtifactRegistryTests(unittest.TestCase):
             )
 
         for artifact_id in ("cycle-a", "cycle-b", "cycle-c"):
-            with self.subTest(artifact_id=artifact_id):
-                with self.assertRaises(ArtifactRegistryError) as raised:
-                    self.registry.get_lineage(artifact_id)
-                self.assertEqual("LINEAGE_CYCLE", raised.exception.code)
+            for method_name in ("get_lineage", "get_validation_record"):
+                with self.subTest(artifact_id=artifact_id, method=method_name):
+                    with self.assertRaises(ArtifactRegistryError) as raised:
+                        getattr(self.registry, method_name)(artifact_id)
+                    self.assertEqual("LINEAGE_CYCLE", raised.exception.code)
 
     def test_two_registry_instances_concurrently_finalize_same_content_once(self) -> None:
         second_registry = SQLiteArtifactRegistry(self.database_path)

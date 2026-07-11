@@ -30,7 +30,12 @@ from contracts.enums import ArtifactStatus, ArtifactType, CoordinateSystem
 from contracts.geometry import VolumeGeometry
 
 from .identity import canonical_json
-from .registry import ArtifactLineage, ArtifactRegistryError, Principal
+from .registry import (
+    ArtifactLineage,
+    ArtifactRegistryError,
+    ArtifactValidationRecord,
+    Principal,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +389,18 @@ class SQLiteArtifactRegistry:
     def get_metadata(self, artifact_id: str) -> ArtifactPublicView:
         with self._transaction(write=False) as connection:
             return self._require_record(connection, artifact_id).to_public_view()
+
+    def get_validation_record(self, artifact_id: str) -> ArtifactValidationRecord:
+        """Read public identity, geometry and direct parents in one transaction."""
+
+        with self._transaction(write=False) as connection:
+            record = self._require_record(connection, artifact_id)
+            self._assert_acyclic_lineage(connection, artifact_id)
+            return ArtifactValidationRecord(
+                public_view=record.to_public_view(),
+                geometry=record.geometry,
+                parent_artifact_ids=record.parent_artifact_ids,
+            )
 
     def resolve_uri(self, artifact_id: str, principal: Principal) -> str:
         with self._transaction(write=False) as connection:

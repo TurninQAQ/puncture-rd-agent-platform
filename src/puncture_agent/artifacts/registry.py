@@ -50,6 +50,15 @@ class ArtifactLineage:
     child_artifact_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactValidationRecord:
+    """Server-side validation snapshot with no storage or private metadata."""
+
+    public_view: ArtifactPublicView
+    geometry: VolumeGeometry | None
+    parent_artifact_ids: tuple[str, ...]
+
+
 @dataclass(slots=True)
 class _ArtifactRecord:
     artifact_id: str
@@ -268,6 +277,18 @@ class InMemoryArtifactRegistry:
         with self._lock:
             return self._require_record(artifact_id).to_public_view()
 
+    def get_validation_record(self, artifact_id: str) -> ArtifactValidationRecord:
+        """Read public identity, geometry and direct parents under one lock."""
+
+        with self._lock:
+            record = self._require_record(artifact_id)
+            self._assert_acyclic_lineage(artifact_id)
+            return ArtifactValidationRecord(
+                public_view=record.to_public_view(),
+                geometry=record.geometry,
+                parent_artifact_ids=record.parent_artifact_ids,
+            )
+
     def resolve_uri(self, artifact_id: str, principal: Principal) -> str:
         with self._lock:
             record = self._require_record(artifact_id)
@@ -318,10 +339,42 @@ class InMemoryArtifactRegistry:
     def get_lineage(self, artifact_id: str) -> ArtifactLineage:
         with self._lock:
             record = self._require_record(artifact_id)
+            self._assert_acyclic_lineage(artifact_id)
             return ArtifactLineage(
                 artifact_id=artifact_id,
                 parent_artifact_ids=record.parent_artifact_ids,
                 child_artifact_ids=tuple(sorted(self._children.get(artifact_id, set()))),
+            )
+
+    def _assert_acyclic_lineage(self, artifact_id: str) -> None:
+        """Reject a legacy or out-of-band ancestor cycle without recursion."""
+
+        visited: set[str] = set()
+        active: set[str] = set()
+        stack: list[tuple[str, bool]] = [(artifact_id, False)]
+        while stack:
+            current_id, leaving = stack.pop()
+            if leaving:
+                active.remove(current_id)
+                visited.add(current_id)
+                continue
+            if current_id in active:
+                raise ArtifactRegistryError(
+                    "LINEAGE_CYCLE",
+                    f"artifact {artifact_id} has cyclic persisted lineage",
+                )
+            if current_id in visited:
+                continue
+            current = self._records.get(current_id)
+            if current is None:
+                raise ArtifactRegistryError(
+                    "STORAGE_ERROR", "artifact lineage references a missing record"
+                )
+            active.add(current_id)
+            stack.append((current_id, True))
+            stack.extend(
+                (parent_id, False)
+                for parent_id in reversed(current.parent_artifact_ids)
             )
 
     def _require_record(self, artifact_id: str) -> _ArtifactRecord:

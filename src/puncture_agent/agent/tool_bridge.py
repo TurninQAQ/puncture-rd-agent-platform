@@ -101,6 +101,26 @@ class ToolCaller(Protocol):
         ...
 
 
+@runtime_checkable
+class ToolArtifactValidator(Protocol):
+    """Trusted Registry validation applied around every remote tool call."""
+
+    def validate_request(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        principal: McpPrincipal,
+    ) -> None: ...
+
+    def validate_response(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        response: Mapping[str, Any],
+        principal: McpPrincipal,
+    ) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class LabelPolicy:
     name: str
@@ -292,6 +312,7 @@ class McpToolExecutor:
         trace_id: str | None = None,
         deadline_ms: int | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        artifact_validator: ToolArtifactValidator | None = None,
     ) -> None:
         if session_id is not None and not session_id.strip():
             raise ValueError("session_id must be non-empty when provided")
@@ -301,6 +322,13 @@ class McpToolExecutor:
             raise ValueError("deadline_ms must be positive when provided")
         if not callable(clock):
             raise TypeError("clock must be callable")
+        if artifact_validator is not None and (
+            not callable(getattr(artifact_validator, "validate_request", None))
+            or not callable(getattr(artifact_validator, "validate_response", None))
+        ):
+            raise TypeError(
+                "artifact_validator must expose validate_request() and validate_response()"
+            )
         self._callers = self._route_callers(callers)
         self._principal_source = principal
         self.policy = policy
@@ -308,6 +336,7 @@ class McpToolExecutor:
         self._trace_id = trace_id
         self._deadline_ms = deadline_ms
         self._clock = clock
+        self._artifact_validator = artifact_validator
         self._binding: ContextVar[_Binding | None] = ContextVar(
             f"mcp_tool_executor_binding_{id(self)}", default=None
         )
@@ -343,6 +372,11 @@ class McpToolExecutor:
         """Map one legacy node request, invoke MCP, and return structured content."""
 
         caller, principal, arguments = self._prepare_call(tool_name, request)
+        self._validate_request_artifacts(
+            tool_name,
+            arguments,
+            principal,
+        )
         try:
             raw_result = caller.call_tool(tool_name, arguments, principal=principal)
         except TimeoutError as exc:
@@ -373,6 +407,12 @@ class McpToolExecutor:
                     raw_result,
                     sanitized,
                 )
+                self._validate_response_artifacts(
+                    tool_name,
+                    arguments,
+                    sanitized,
+                    principal,
+                )
         except ToolBridgeResponseError:
             raise
         except ToolBridgeContractError as exc:
@@ -380,6 +420,55 @@ class McpToolExecutor:
         if not isinstance(sanitized, dict):  # defensive; root is checked above
             raise ToolBridgeResponseError("MCP structured content must be an object")
         return sanitized
+
+    def _validate_request_artifacts(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        principal: McpPrincipal,
+    ) -> None:
+        validator = self._artifact_validator
+        if validator is None:
+            return
+        try:
+            validator.validate_request(tool_name, arguments, principal)
+        except (ToolBridgeError, ToolBridgeTransportError):
+            raise
+        except Exception as exc:
+            if getattr(exc, "code", None) == "CONTRACT_VIOLATION":
+                raise ToolBridgeContractError(
+                    "trusted Artifact Registry rejected a tool input"
+                ) from exc
+            raise ToolBridgeTransportError(
+                "DEPENDENCY_FAILED",
+                "trusted Artifact Registry request validation failed",
+                retryable=bool(getattr(exc, "retryable", False)),
+            ) from exc
+
+    def _validate_response_artifacts(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        response: Mapping[str, Any],
+        principal: McpPrincipal,
+    ) -> None:
+        validator = self._artifact_validator
+        if validator is None:
+            return
+        try:
+            validator.validate_response(tool_name, arguments, response, principal)
+        except (ToolBridgeError, ToolBridgeTransportError):
+            raise
+        except Exception as exc:
+            if getattr(exc, "code", None) == "CONTRACT_VIOLATION":
+                raise ToolBridgeResponseError(
+                    "trusted Artifact Registry rejected a tool response"
+                ) from exc
+            raise ToolBridgeTransportError(
+                "DEPENDENCY_FAILED",
+                "trusted Artifact Registry response validation failed",
+                retryable=bool(getattr(exc, "retryable", False)),
+            ) from exc
 
     def build_arguments(
         self, tool_name: str, request: Mapping[str, Any]
@@ -409,6 +498,14 @@ class McpToolExecutor:
                 "legacy request case_id does not match the bound AgentState"
             )
         principal = self._principal(case_id, binding)
+        if not principal.permits(
+            tool_name=tool_name,
+            case_id=case_id,
+            caller=principal.subject,
+        ):
+            raise ToolBridgeContextError(
+                "authenticated principal is not allowed to invoke this tool for the case"
+            )
         body = self._map_request(tool_name, request, binding)
         request_digest = _canonical_digest(body)
         ordinal = self._logical_call_ordinal(
@@ -1716,5 +1813,6 @@ __all__ = [
     "ToolBridgeResponseError",
     "ToolBridgeTransportError",
     "ToolBridgePolicy",
+    "ToolArtifactValidator",
     "ToolCaller",
 ]
