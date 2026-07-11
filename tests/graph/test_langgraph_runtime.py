@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Lock
+from threading import Barrier, Event, Lock
 import json
 from math import ceil
 import os
@@ -335,6 +335,12 @@ class ProductionLangGraphRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(AgentStatus.AWAITING_INPUT, missing_case.status)
         self.assertEqual([], missing_case.tool_calls)
+        self.assertEqual(1, missing_case.visited_nodes.count("parse_request"))
+        self.assertEqual(
+            1,
+            missing_case.visited_nodes.count("request_missing_data"),
+        )
+        self.assertNotIn("planning_safety_subgraph", missing_case.visited_nodes)
 
         missing_target = runtime.run(
             AgentState(
@@ -345,6 +351,16 @@ class ProductionLangGraphRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(AgentStatus.AWAITING_INPUT, missing_target.status)
         self.assertEqual([], missing_target.tool_calls)
+        self.assertEqual(
+            1,
+            missing_target.visited_nodes.count(
+                "planning_safety_subgraph.ensure_required_artifacts"
+            ),
+        )
+        self.assertNotIn(
+            "planning_safety_subgraph.generate_candidate_paths",
+            missing_target.visited_nodes,
+        )
 
     def test_no_feasible_path_is_a_valid_terminal_outcome(self) -> None:
         state = build_runtime().run(
@@ -861,10 +877,367 @@ class RealLangGraphSmokeTests(unittest.TestCase):
             )
         )
         self.assertEqual(AgentStatus.SUCCEEDED, state.status)
+        self.assertEqual(VerificationStatus.PASS, state.verification_status)
+        self.assertEqual(
+            [
+                "generate_candidate_paths",
+                "evaluate_path_safety",
+                "evaluate_intraoperative_risk",
+                "verify_skin_penetration",
+            ],
+            [call["tool_name"] for call in state.tool_calls],
+        )
         self.assertEqual(
             state.to_dict(),
             runtime.checkpoint_state(thread_id=state.session_id).to_dict(),
         )
+
+    def test_real_stategraph_contract_and_failure_matrix(self) -> None:
+        runtime = LangGraphRuntime(
+            PROJECT_ROOT / "graph" / "main_graph.json",
+            build_mock_handlers(),
+        )
+
+        data_success = runtime.run(
+            AgentState(
+                user_query="检查 Case-821 的 MCS 标签和分割模型结果",
+                session_id="real-matrix-data-success",
+            )
+        )
+        self.assertEqual(AgentStatus.SUCCEEDED, data_success.status)
+        self.assertEqual(
+            [
+                "inspect_case_metadata",
+                "convert_mcs_to_nifti",
+                "validate_label_schema",
+                "run_segmentation",
+                "validate_segmentation_result",
+                "extract_skin_surface",
+            ],
+            [call["tool_name"] for call in data_success.tool_calls],
+        )
+
+        missing_case = runtime.run(
+            AgentState(
+                user_query="执行路径规划和安全评估",
+                session_id="real-matrix-missing-case",
+            )
+        )
+        self.assertEqual(AgentStatus.AWAITING_INPUT, missing_case.status)
+        self.assertEqual([], missing_case.tool_calls)
+
+        missing_target = runtime.run(
+            AgentState(
+                user_query="对 Case-822 做路径规划",
+                session_id="real-matrix-missing-target",
+                metadata={"missing_required_artifacts": ["target"]},
+            )
+        )
+        self.assertEqual(AgentStatus.AWAITING_INPUT, missing_target.status)
+        self.assertEqual([], missing_target.tool_calls)
+
+        geometry_failure = runtime.run(
+            AgentState(
+                user_query="检查 Case-823 的 MCS 标签和分割",
+                session_id="real-matrix-geometry-failure",
+                metadata={"force_geometry_mismatch": True},
+            )
+        )
+        self.assertEqual(AgentStatus.MANUAL_REVIEW, geometry_failure.status)
+        self.assertEqual(
+            ["inspect_case_metadata"],
+            [call["tool_name"] for call in geometry_failure.tool_calls],
+        )
+        self.assertEqual(
+            1,
+            geometry_failure.visited_nodes.count(
+                "data_model_subgraph.validate_geometry"
+            ),
+        )
+        self.assertNotIn(
+            "data_model_subgraph.convert_mcs_to_nifti",
+            geometry_failure.visited_nodes,
+        )
+
+        label_failure = runtime.run(
+            AgentState(
+                user_query="检查 Case-824 的 MCS 标签和分割",
+                session_id="real-matrix-label-failure",
+                metadata={"force_label_schema_error": True},
+            )
+        )
+        self.assertEqual(AgentStatus.MANUAL_REVIEW, label_failure.status)
+        self.assertEqual(
+            [
+                "inspect_case_metadata",
+                "convert_mcs_to_nifti",
+                "validate_label_schema",
+            ],
+            [call["tool_name"] for call in label_failure.tool_calls],
+        )
+        self.assertEqual(
+            1,
+            label_failure.visited_nodes.count(
+                "data_model_subgraph.validate_label_schema"
+            ),
+        )
+        self.assertNotIn(
+            "data_model_subgraph.run_segmentation",
+            label_failure.visited_nodes,
+        )
+
+        no_feasible = runtime.run(
+            AgentState(
+                user_query="对 Case-825 做路径规划",
+                session_id="real-matrix-no-feasible",
+                metadata={"force_no_feasible_path": True},
+            )
+        )
+        self.assertEqual(AgentStatus.COMPLETED_WITH_NO_RESULT, no_feasible.status)
+        self.assertEqual(
+            VerificationStatus.NO_FEASIBLE_PATH,
+            no_feasible.verification_status,
+        )
+        self.assertEqual([], no_feasible.tool_calls)
+        self.assertEqual(
+            1,
+            no_feasible.visited_nodes.count(
+                "planning_safety_subgraph.generate_candidate_paths"
+            ),
+        )
+        self.assertNotIn(
+            "planning_safety_subgraph.evaluate_path_safety",
+            no_feasible.visited_nodes,
+        )
+
+        retry_once = runtime.run(
+            AgentState(
+                user_query="对 Case-826 做路径规划",
+                session_id="real-matrix-retry-once",
+                metadata={"fail_tool_once": ["generate_candidate_paths"]},
+            )
+        )
+        self.assertEqual(AgentStatus.SUCCEEDED, retry_once.status)
+        self.assertEqual(1, retry_once.retry_count)
+        self.assertEqual(
+            [
+                "generate_candidate_paths",
+                "generate_candidate_paths",
+                "evaluate_path_safety",
+                "evaluate_intraoperative_risk",
+                "verify_skin_penetration",
+            ],
+            [call["tool_name"] for call in retry_once.tool_calls],
+        )
+        self.assertEqual(
+            ["FAILED", "SUCCESS"],
+            [
+                call["status"]
+                for call in retry_once.tool_calls
+                if call["tool_name"] == "generate_candidate_paths"
+            ],
+        )
+        self.assertEqual(
+            2,
+            retry_once.visited_nodes.count(
+                "planning_safety_subgraph.generate_candidate_paths"
+            ),
+        )
+
+        retry_exhausted = runtime.run(
+            AgentState(
+                user_query="对 Case-827 做路径规划",
+                session_id="real-matrix-retry-exhausted",
+                metadata={"fail_tool_always": ["generate_candidate_paths"]},
+            )
+        )
+        self.assertEqual(AgentStatus.MANUAL_REVIEW, retry_exhausted.status)
+        self.assertEqual(1, retry_exhausted.retry_count)
+        self.assertEqual(
+            ["generate_candidate_paths", "generate_candidate_paths"],
+            [call["tool_name"] for call in retry_exhausted.tool_calls],
+        )
+        self.assertEqual(
+            ["FAILED", "FAILED"],
+            [call["status"] for call in retry_exhausted.tool_calls],
+        )
+        self.assertEqual(
+            2,
+            retry_exhausted.visited_nodes.count(
+                "planning_safety_subgraph.generate_candidate_paths"
+            ),
+        )
+        self.assertNotIn(
+            "planning_safety_subgraph.evaluate_path_safety",
+            retry_exhausted.visited_nodes,
+        )
+
+        non_retryable = runtime.run(
+            AgentState(
+                user_query="对 Case-828 做路径规划",
+                session_id="real-matrix-non-retryable",
+                metadata={
+                    "fail_tool_non_retryable": ["generate_candidate_paths"]
+                },
+            )
+        )
+        self.assertEqual(AgentStatus.MANUAL_REVIEW, non_retryable.status)
+        self.assertEqual(0, non_retryable.retry_count)
+        self.assertEqual(
+            ["generate_candidate_paths"],
+            [call["tool_name"] for call in non_retryable.tool_calls],
+        )
+        self.assertEqual("FAILED", non_retryable.tool_calls[0]["status"])
+        self.assertEqual(
+            1,
+            non_retryable.visited_nodes.count(
+                "planning_safety_subgraph.generate_candidate_paths"
+            ),
+        )
+        self.assertNotIn(
+            "planning_safety_subgraph.evaluate_path_safety",
+            non_retryable.visited_nodes,
+        )
+
+        model_executor = TransportFaultExecutor()
+        production_runtime = LangGraphRuntime(
+            PROJECT_ROOT / "graph" / "main_graph.json",
+            build_production_handlers(
+                tool_executor=model_executor,
+                model_gateway=MockQwenGateway(),
+                rag_service=MockRagService.from_default_fixture(),
+                access_scope_provider=lambda _: ("public",),
+                allow_test_controls=True,
+            ),
+        )
+        malformed_model = production_runtime.run(
+            AgentState(
+                user_query="请为 Case-829 做路径规划",
+                session_id="real-matrix-malformed-model",
+                metadata={
+                    "model_gateway_metadata": {
+                        "mock_structured_output": {
+                            "task_type": TaskType.PLANNING_SAFETY
+                        }
+                    }
+                },
+            )
+        )
+        self.assertEqual(AgentStatus.AWAITING_INPUT, malformed_model.status)
+        self.assertEqual(
+            "MODEL_STRUCTURED_OUTPUT_INVALID",
+            malformed_model.errors[0]["code"],
+        )
+        self.assertEqual([], malformed_model.tool_calls)
+        self.assertEqual([], model_executor.calls)
+        self.assertEqual(1, malformed_model.visited_nodes.count("parse_request"))
+        self.assertNotIn(
+            "planning_safety_subgraph",
+            malformed_model.visited_nodes,
+        )
+
+        for state in (
+            data_success,
+            missing_case,
+            missing_target,
+            geometry_failure,
+            label_failure,
+            no_feasible,
+            retry_once,
+            retry_exhausted,
+            non_retryable,
+        ):
+            with self.subTest(checkpoint=state.session_id):
+                self.assertEqual(
+                    state.to_dict(),
+                    runtime.checkpoint_state(
+                        thread_id=state.session_id
+                    ).to_dict(),
+                )
+        self.assertEqual(
+            malformed_model.to_dict(),
+            production_runtime.checkpoint_state(
+                thread_id=malformed_model.session_id
+            ).to_dict(),
+        )
+
+    def test_real_stategraph_twenty_concurrent_sessions_are_isolated(self) -> None:
+        handlers = dict(build_mock_handlers())
+        original_parse = handlers["parse_request"]
+        rendezvous = Barrier(20)
+        entered = 0
+        entered_lock = Lock()
+
+        def synchronized_parse(state, context):
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+            rendezvous.wait(timeout=20.0)
+            return original_parse(state, context)
+
+        handlers["parse_request"] = synchronized_parse
+        runtime = LangGraphRuntime(
+            PROJECT_ROOT / "graph" / "main_graph.json",
+            handlers,
+        )
+
+        def execute(index: int) -> AgentState:
+            case_id = f"Case-{9000 + index}"
+            if index % 2:
+                query = f"检查 {case_id} 的 MCS 标签和分割模型结果"
+            else:
+                query = f"对 {case_id} 做路径规划"
+            return runtime.run(
+                AgentState(
+                    user_query=query,
+                    session_id=f"real-isolated-session-{index}",
+                )
+            )
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            states = list(pool.map(execute, range(20)))
+
+        self.assertEqual(20, entered)
+        self.assertEqual(20, len({state.session_id for state in states}))
+        self.assertEqual(20, len({state.case_id for state in states}))
+        for index, state in enumerate(states):
+            with self.subTest(session=state.session_id):
+                expected_case = f"Case-{9000 + index}"
+                expected_tools = (
+                    [
+                        "inspect_case_metadata",
+                        "convert_mcs_to_nifti",
+                        "validate_label_schema",
+                        "run_segmentation",
+                        "validate_segmentation_result",
+                        "extract_skin_surface",
+                    ]
+                    if index % 2
+                    else [
+                        "generate_candidate_paths",
+                        "evaluate_path_safety",
+                        "evaluate_intraoperative_risk",
+                        "verify_skin_penetration",
+                    ]
+                )
+                self.assertEqual(AgentStatus.SUCCEEDED, state.status)
+                self.assertEqual(expected_case, state.case_id)
+                self.assertEqual(
+                    expected_tools,
+                    [call["tool_name"] for call in state.tool_calls],
+                )
+                self.assertTrue(
+                    all(
+                        call["request"]["case_id"] == expected_case
+                        for call in state.tool_calls
+                    )
+                )
+                self.assertEqual(
+                    state.to_dict(),
+                    runtime.checkpoint_state(
+                        thread_id=state.session_id
+                    ).to_dict(),
+                )
 
     def test_real_stategraph_graph_only_p95_records_engineering_gate(self) -> None:
         runtime = LangGraphRuntime(
