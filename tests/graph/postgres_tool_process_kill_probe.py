@@ -11,6 +11,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -28,6 +29,7 @@ from contracts.geometry import VolumeGeometry  # noqa: E402
 from puncture_agent.agent import (  # noqa: E402
     AgentState,
     AgentStatus,
+    LangGraphConcurrencyError,
     LangGraphRuntime,
     PostgresAdvisoryThreadExecutionLeaseManager,
     build_mock_handlers,
@@ -401,7 +403,17 @@ def recover_worker() -> int:
                 ),
                 "target tool call was checkpointed despite the process kill",
             )
-            resumed = runtime.resume(thread_id=thread_id)
+            resume_attempts = 0
+            retry_deadline = time.monotonic() + 10.0
+            while True:
+                resume_attempts += 1
+                try:
+                    resumed = runtime.resume(thread_id=thread_id)
+                    break
+                except LangGraphConcurrencyError:
+                    if time.monotonic() >= retry_deadline:
+                        raise
+                    time.sleep(0.1)
             terminal = runtime.checkpoint_state(thread_id=thread_id)
         finally:
             ledger.close()
@@ -427,6 +439,7 @@ def recover_worker() -> int:
             "phase": "recover",
             "pid": os.getpid(),
             "pre_resume_state_sha256": value_sha256(pre_resume.to_dict()),
+            "resume_attempts": resume_attempts,
             "schema_version": "1",
             "status": resumed.status,
             "thread_id": thread_id,
