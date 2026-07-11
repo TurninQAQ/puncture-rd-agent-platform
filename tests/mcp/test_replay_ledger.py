@@ -524,6 +524,14 @@ class ReplayLedgerTests(unittest.TestCase):
                         "2026-07-11T00:00:00+00:00"
                     ),
                 )
+                bridge.execute(
+                    "inspect_case_metadata",
+                    {
+                        "case_id": "case-001",
+                        "ct_artifact_id": frozen_request.reference_ct_artifact.artifact_id,
+                        "input_format": "NIFTI",
+                    },
+                )
                 first = bridge.execute("convert_mcs_to_nifti", legacy_request)
 
             # Simulate losing every AgentState mutation after the MCP response:

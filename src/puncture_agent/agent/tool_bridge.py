@@ -484,6 +484,13 @@ class McpToolExecutor:
         loose_request: Mapping[str, Any],
         request_digest: str,
     ) -> int:
+        if binding.state is None:
+            # The constructor-only convenience mode has no durable tool-call
+            # history.  A process-local sequence would reset after restart and
+            # change idempotency identity based on which earlier tools happened
+            # to run.  Tool name + semantic request digest already distinguish
+            # independent direct calls, so a stable ordinal of one is correct.
+            return 1
         node_id = _state_value(binding.state, "current_node")
         node_key = node_id if isinstance(node_id, str) else ""
         loose_digest = _canonical_digest(loose_request)
