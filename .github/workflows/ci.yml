@@ -97,6 +97,25 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(suite);
           ok = loaded == expected and result.testsRun == expected and result.wasSuccessful() and not result.skipped;
           sys.exit(0 if ok else 1)"
+      - name: SSE replay and streaming (skips forbidden)
+        env:
+          PYTHONPATH: .:src
+        run: >-
+          python -c
+          "import sys, unittest;
+          names = [
+              'tests.api.test_fastapi_app.SseCoreTests',
+              'tests.api.test_fastapi_app.FastApiSseTests',
+          ];
+          suite = unittest.TestSuite(
+              unittest.defaultTestLoader.loadTestsFromName(name)
+              for name in names
+          );
+          expected = 8;
+          loaded = suite.countTestCases();
+          result = unittest.TextTestRunner(verbosity=2).run(suite);
+          ok = loaded == expected and result.testsRun == expected and result.wasSuccessful() and not result.skipped;
+          sys.exit(0 if ok else 1)"
       - name: PostgreSQL Run repository (skips forbidden)
         if: ${{ always() }}
         timeout-minutes: 5

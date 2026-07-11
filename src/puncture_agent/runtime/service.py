@@ -28,6 +28,7 @@ from .json_boundary import RuntimeJsonBoundaryError, copy_json_mapping
 from .repository import (
     InMemoryRunRepository,
     RunEventDraft,
+    RunEventPage,
     RunRepository,
     VersionedRun,
 )
@@ -234,6 +235,51 @@ class InMemoryRunService:
                 run_id,
                 tenant_id=tenant_id,
                 after_sequence=after_sequence,
+            )
+        except RunRepositoryError as exc:
+            raise self._service_error(exc) from exc
+
+    def get_event_page(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        after_sequence: int = 0,
+        limit: int = 128,
+    ) -> RunEventPage:
+        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+            raise RunServiceError(
+                "INVALID_ARGUMENT",
+                "after_sequence must be an integer",
+            )
+        if after_sequence < 0:
+            raise RunServiceError(
+                "INVALID_ARGUMENT",
+                "after_sequence must be non-negative",
+            )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or limit > 512
+        ):
+            raise RunServiceError(
+                "INVALID_ARGUMENT",
+                "event page limit must be between 1 and 512",
+            )
+        pager = getattr(self.repository, "get_event_page", None)
+        if not callable(pager):
+            raise RunServiceError(
+                "EVENT_PAGING_UNAVAILABLE",
+                "run repository does not support event paging",
+                retryable=True,
+            )
+        try:
+            return pager(
+                run_id,
+                tenant_id=tenant_id,
+                after_sequence=after_sequence,
+                limit=limit,
             )
         except RunRepositoryError as exc:
             raise self._service_error(exc) from exc

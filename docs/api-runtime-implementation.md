@@ -108,6 +108,39 @@ durable PostgreSQL repository. Company algorithms, identity verification data,
 case/project indexes and artifact storage implementations remain injected
 interfaces, as required.
 
+The fifth production-facing boundary now provides:
+
+- representation negotiation on the existing event endpoint: bounded JSON by
+  default and explicit `text/event-stream` for SSE, with `406` for unsupported
+  media types and `Vary: Accept` on both successful representations;
+- strict exclusive reconnect cursors through `after_sequence` and
+  `Last-Event-ID`. Duplicate, conflicting, non-canonical, negative and oversized
+  values fail before stream startup;
+- a separate bounded `RunEventPage` repository/service port. The PostgreSQL
+  implementation captures a high-water sequence, then performs a lock-free
+  keyset query bounded by that high water so concurrent appends do not cause
+  gaps, duplicates or unbounded reads;
+- fixed `id`/`event`/compact-JSON `data` frames, comment-only heartbeats,
+  Bearer re-authentication plus resource re-authorization on every poll,
+  terminal high-water draining and normal EOF;
+- preflight authentication, authorization, first page read and serialization.
+  Once the 200 response starts, authorization, dependency and contract failures
+  close silently instead of exposing exception text in the stream;
+- idempotent cleanup across normal completion, cancellation, authorization
+  revocation and ASGI send failure, plus per-process global and tenant
+  connection limits;
+- low-cardinality SSE metrics for fixed cursor source, close outcome,
+  `EventType` and heartbeat count. No tenant, Run, case, principal, trace or
+  event ID becomes a label.
+
+The connection limiter is intentionally process-local, and polling is used
+instead of PostgreSQL notification. Those deployment tradeoffs are documented
+and do not implement a company identity or algorithm backend. The stream
+deadline wins over terminal draining; a client interrupted mid-tail resumes
+from its last event ID. Injected synchronous authentication/authorization ports
+must also enforce their own backend deadlines because Python cannot kill a
+company callback thread that ignores cancellation.
+
 ## Verification
 
 Local Python 3.10 results on 2026-07-11:
@@ -134,13 +167,19 @@ Ran 8 tests in 3.117s
 OK
 
 python3 run_tests.py (dependency-free final regression)
-Ran 623 tests in 10.116s
-OK (skipped=48)
+Ran 631 tests in 10.155s
+OK (skipped=56)
 
 PUNCTURE_TEST_POSTGRES_DSN=<private-test-dsn> \
 PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. python3 run_tests.py
-Ran 623 tests in 34.129s
+Ran 631 tests in 35.411s
 OK (skipped=6)
+
+PYTHONPATH=<FastAPI dependencies>:src:. python3 -m unittest \
+  tests.api.test_fastapi_app.SseCoreTests \
+  tests.api.test_fastapi_app.FastApiSseTests -v
+Ran 8 tests
+OK
 
 PUNCTURE_TEST_POSTGRES_DSN=<private-test-dsn> \
 PYTHONPATH=<FastAPI/LangGraph dependencies>:src:. python3 -m unittest \
@@ -153,10 +192,11 @@ OK
 The dependency-free run executes the pure-ASGI body-admission tests, the two
 framework-neutral privacy tests and repository contract tests while explicitly
 skipping implementation-backed transport/database cases. The dependency run
-executes all seven Pydantic tests and all thirteen FastAPI transport/body tests;
-the PostgreSQL environment adds the one HTTP composition test and eight Run
-repository tests. The Pydantic suite pins JSON-schema required fields, task
-enum, artifact count, extra-field rejection and JSON round-trip behavior.
+executes all seven Pydantic tests, all thirteen FastAPI transport/body tests and
+the dedicated eight-test SSE gate; the PostgreSQL environment adds the one HTTP
+composition test and eight Run repository tests. The Pydantic suite pins
+JSON-schema required fields, task enum, artifact count, extra-field rejection
+and JSON round-trip behavior.
 
 Remote evidence on 2026-07-11:
 
@@ -210,10 +250,13 @@ Remote evidence on 2026-07-11:
 The following remain `NOT_RUN`/not implemented and must not be inferred from the
 completed boundaries:
 
-- SSE event replay, `Last-Event-ID`, heartbeat, disconnect and backpressure;
 - an execution reclaim/heartbeat protocol for workers that die while a Run
   remains `RUNNING`;
 - process/SIGTERM restart recovery at the API Run layer;
 - a concrete OIDC/JWT verifier, company case/project authorizer, company
   artifact gateway and company algorithm executor (their ports are complete);
-- HTTP concurrency, 10,000-event replay and production performance baselines.
+- a production HTTP/PostgreSQL concurrency and performance baseline. The
+  in-memory bounded 10,000-event replay correctness test is complete, but it is
+  not a production throughput claim;
+- reverse-proxy slow-consumer/backpressure evidence and cluster-wide SSE
+  capacity control.

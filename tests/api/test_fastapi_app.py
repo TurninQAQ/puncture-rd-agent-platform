@@ -6,13 +6,26 @@ from contextlib import ExitStack
 import importlib.util
 import json
 import os
+from threading import Thread
+import time
 import unittest
 from uuid import uuid4
 
 from contracts.artifacts import ArtifactPublicView
 from contracts.enums import ArtifactStatus, ArtifactType
 from puncture_agent.api.body_admission import RawBodyAdmissionMiddleware
-from puncture_agent.runtime import InMemoryRunService, RunServiceError, ScenarioExecutor
+from puncture_agent.runtime import (
+    ApprovalDecision,
+    EventType,
+    InMemoryRunService,
+    RunEvent,
+    RunEventPage,
+    RunRequest,
+    RunServiceError,
+    RunSnapshot,
+    RunStatus,
+    ScenarioExecutor,
+)
 
 
 FASTAPI_AVAILABLE = all(
@@ -182,6 +195,14 @@ if FASTAPI_AVAILABLE:
         create_app,
     )
     from puncture_agent.api.http_contracts import AuthenticatedPrincipal
+    from puncture_agent.api.sse import (
+        SseConfig,
+        SseConnectionLimiter,
+        SseMetrics,
+        SseStreamingResponse,
+        encode_event_page,
+        stream_event_pages,
+    )
 
 
     class _Authenticator:
@@ -427,6 +448,40 @@ class FastApiTransportTests(unittest.TestCase):
                 }
             )
         self.assertNotIn("private-dsn", str(invalid_float.exception))
+        configured = PostgresApiSettings.from_env(
+            {
+                "PUNCTURE_API_POSTGRES_DSN": "postgresql://db/agent",
+                "PUNCTURE_API_SSE_PAGE_SIZE": "64",
+                "PUNCTURE_API_SSE_POLL_INTERVAL_SECONDS": "0.5",
+                "PUNCTURE_API_SSE_HEARTBEAT_SECONDS": "12",
+                "PUNCTURE_API_SSE_MAX_CONNECTION_SECONDS": "300",
+                "PUNCTURE_API_SSE_MAX_CONNECTIONS": "40",
+                "PUNCTURE_API_SSE_MAX_CONNECTIONS_PER_TENANT": "4",
+            }
+        )
+        self.assertEqual(64, configured.sse_page_size)
+        self.assertEqual(0.5, configured.sse_poll_interval_seconds)
+        self.assertEqual(12.0, configured.sse_heartbeat_seconds)
+        self.assertEqual(300.0, configured.sse_max_connection_seconds)
+        self.assertEqual(40, configured.sse_max_connections)
+        self.assertEqual(4, configured.sse_max_connections_per_tenant)
+        self.assertEqual(64, configured.to_sse_config().page_size)
+        with self.assertRaisesRegex(ValueError, "heartbeat"):
+            PostgresApiSettings.from_env(
+                {
+                    "PUNCTURE_API_POSTGRES_DSN": "postgresql://db/agent",
+                    "PUNCTURE_API_SSE_POLL_INTERVAL_SECONDS": "2",
+                    "PUNCTURE_API_SSE_HEARTBEAT_SECONDS": "1",
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "per-tenant"):
+            PostgresApiSettings.from_env(
+                {
+                    "PUNCTURE_API_POSTGRES_DSN": "postgresql://db/agent",
+                    "PUNCTURE_API_SSE_MAX_CONNECTIONS": "2",
+                    "PUNCTURE_API_SSE_MAX_CONNECTIONS_PER_TENANT": "3",
+                }
+            )
 
     def test_create_get_event_replay_artifact_metadata_and_metrics(self) -> None:
         created = self.client.post(
@@ -791,6 +846,753 @@ class FastApiTransportTests(unittest.TestCase):
         self.assertEqual(200, tenant_b[0])
         self.assertNotEqual(tenant_a[0][1], tenant_b[1])
         self.assertEqual(2, self.executor.execution_count)
+
+
+def _sse_ids(body: str) -> list[int]:
+    return [
+        int(line.removeprefix("id: "))
+        for line in body.splitlines()
+        if line.startswith("id: ")
+    ]
+
+
+def _stream_snapshot(
+    *,
+    run_id: str = "run-stream",
+    status: RunStatus = RunStatus.SUCCEEDED,
+) -> RunSnapshot:
+    request = RunRequest(
+        case_id="Case-001",
+        user_query="stream events",
+        task_type="DATA_MODEL_VALIDATION",
+        idempotency_key="stream-events",
+        tenant_id="tenant-a",
+        principal_id="principal-a",
+        metadata={"project_id": "project-tenant-a"},
+    )
+    return RunSnapshot(
+        run_id=run_id,
+        request=request,
+        status=status,
+        trace_id="trace-stream",
+        created_at="2026-07-11T00:00:00.000Z",
+        updated_at="2026-07-11T00:00:01.000Z",
+        final_report=({"ok": True} if status is RunStatus.SUCCEEDED else {}),
+        checkpoint={},
+        approval_id=None,
+        error=(
+            {"code": "FAILED", "message": "safe", "retryable": False}
+            if status is RunStatus.FAILED
+            else None
+        ),
+    )
+
+
+@unittest.skipUnless(FASTAPI_AVAILABLE, "FastAPI implementation dependencies are not installed")
+class SseCoreTests(unittest.TestCase):
+    def test_connection_limiter_releases_global_and_tenant_capacity(self) -> None:
+        limiter = SseConnectionLimiter(max_connections=1, max_per_tenant=1)
+        lease = limiter.try_acquire("tenant-a")
+
+        self.assertEqual(1, limiter.active)
+        with self.assertRaises(RunServiceError) as raised:
+            limiter.try_acquire("tenant-a")
+        self.assertTrue(raised.exception.retryable)
+        lease.release()
+        lease.release()
+        self.assertEqual(0, limiter.active)
+        replacement = limiter.try_acquire("tenant-a")
+        replacement.release()
+
+    def test_generator_heartbeat_close_releases_lease(self) -> None:
+        async def exercise() -> tuple[bytes, int, str]:
+            limiter = SseConnectionLimiter(max_connections=1, max_per_tenant=1)
+            lease = limiter.try_acquire("tenant-a")
+            metrics = SseMetrics()
+            page = RunEventPage((), 0, RunStatus.RUNNING)
+            reads = 0
+
+            def authorize() -> RunSnapshot:
+                return _stream_snapshot(status=RunStatus.RUNNING)
+
+            def read_page(cursor: int, limit: int) -> RunEventPage:
+                nonlocal reads
+                del cursor, limit
+                reads += 1
+                return page
+
+            stream = stream_event_pages(
+                run_id="run-stream",
+                initial_page=page,
+                initial_frames=(),
+                after_sequence=0,
+                authorize=authorize,
+                read_page=read_page,
+                config=SseConfig(
+                    page_size=8,
+                    poll_interval_seconds=0.01,
+                    heartbeat_seconds=0.02,
+                    max_connection_seconds=1.0,
+                    max_connections=1,
+                    max_connections_per_tenant=1,
+                ),
+                lease=lease,
+                metrics=metrics,
+                cursor_source="none",
+            )
+            heartbeat = await anext(stream)
+            await stream.aclose()
+            return heartbeat, reads, metrics.render()
+
+        heartbeat, reads, rendered = asyncio.run(exercise())
+        self.assertEqual(b": heartbeat\n\n", heartbeat)
+        self.assertGreaterEqual(reads, 1)
+        self.assertIn("puncture_api_sse_connections_current 0", rendered)
+        self.assertIn('outcome="disconnect"} 1', rendered)
+
+        async def exercise_send_failure() -> tuple[int, str]:
+            limiter = SseConnectionLimiter(max_connections=1, max_per_tenant=1)
+            metrics = SseMetrics()
+            event = RunEvent(
+                run_id="run-stream",
+                sequence=1,
+                event_type=EventType.RUN_CREATED,
+                node_name=None,
+                timestamp="2026-07-11T00:00:00.000Z",
+                payload={},
+                trace_id="trace-stream",
+            )
+            page = RunEventPage((event,), 1, RunStatus.SUCCEEDED)
+            lease = limiter.try_acquire("tenant-a")
+            stream = stream_event_pages(
+                run_id="run-stream",
+                initial_page=page,
+                initial_frames=encode_event_page(
+                    page,
+                    run_id="run-stream",
+                    after_sequence=0,
+                ),
+                after_sequence=0,
+                authorize=lambda: _stream_snapshot(status=RunStatus.SUCCEEDED),
+                read_page=lambda cursor, limit: RunEventPage(
+                    (),
+                    cursor,
+                    RunStatus.SUCCEEDED,
+                ),
+                config=SseConfig(
+                    page_size=8,
+                    poll_interval_seconds=0.01,
+                    heartbeat_seconds=0.02,
+                    max_connection_seconds=1.0,
+                    max_connections=1,
+                    max_connections_per_tenant=1,
+                ),
+                lease=lease,
+                metrics=metrics,
+                cursor_source="none",
+            )
+            response = SseStreamingResponse(stream, lease=lease, headers={})
+
+            async def receive() -> dict:
+                return {"type": "http.disconnect"}
+
+            async def fail_on_body(message: dict) -> None:
+                if message["type"] == "http.response.body":
+                    raise RuntimeError("client disconnected")
+
+            with self.assertRaises(RuntimeError):
+                await response(
+                    {"type": "http", "asgi": {"spec_version": "2.4"}},
+                    receive,
+                    fail_on_body,
+                )
+            return limiter.active, metrics.render()
+
+        active, send_failure_metrics = asyncio.run(exercise_send_failure())
+        self.assertEqual(0, active)
+        self.assertIn("puncture_api_sse_connections_current 0", send_failure_metrics)
+
+        async def exercise_start_failure() -> int:
+            limiter = SseConnectionLimiter(max_connections=1, max_per_tenant=1)
+            lease = limiter.try_acquire("tenant-a")
+
+            async def content():
+                yield b"unused"
+
+            response = SseStreamingResponse(content(), lease=lease, headers={})
+
+            async def receive() -> dict:
+                return {"type": "http.disconnect"}
+
+            async def fail_on_start(message: dict) -> None:
+                del message
+                raise RuntimeError("response start failed")
+
+            with self.assertRaises(RuntimeError):
+                await response(
+                    {"type": "http", "asgi": {"spec_version": "2.4"}},
+                    receive,
+                    fail_on_start,
+                )
+            return limiter.active
+
+        self.assertEqual(0, asyncio.run(exercise_start_failure()))
+
+        async def exercise_revocation() -> tuple[list[bytes], int, str]:
+            limiter = SseConnectionLimiter(max_connections=1, max_per_tenant=1)
+            metrics = SseMetrics()
+            lease = limiter.try_acquire("tenant-a")
+
+            def revoke() -> RunSnapshot:
+                raise RunServiceError("FORBIDDEN", "authorization was revoked")
+
+            stream = stream_event_pages(
+                run_id="run-stream",
+                initial_page=RunEventPage((), 0, RunStatus.RUNNING),
+                initial_frames=(),
+                after_sequence=0,
+                authorize=revoke,
+                read_page=lambda cursor, limit: RunEventPage(
+                    (),
+                    cursor,
+                    RunStatus.RUNNING,
+                ),
+                config=SseConfig(
+                    page_size=8,
+                    poll_interval_seconds=0.01,
+                    heartbeat_seconds=0.02,
+                    max_connection_seconds=1.0,
+                    max_connections=1,
+                    max_connections_per_tenant=1,
+                ),
+                lease=lease,
+                metrics=metrics,
+                cursor_source="none",
+            )
+            chunks = [chunk async for chunk in stream]
+            return chunks, limiter.active, metrics.render()
+
+        revoked_chunks, revoked_active, revoked_metrics = asyncio.run(
+            exercise_revocation()
+        )
+        self.assertEqual([], revoked_chunks)
+        self.assertEqual(0, revoked_active)
+        self.assertIn('outcome="revoked"} 1', revoked_metrics)
+
+        async def exercise_deadline() -> tuple[list[bytes], str]:
+            limiter = SseConnectionLimiter(max_connections=1, max_per_tenant=1)
+            metrics = SseMetrics()
+            event = RunEvent(
+                run_id="run-stream",
+                sequence=1,
+                event_type=EventType.RUN_CREATED,
+                node_name=None,
+                timestamp="2026-07-11T00:00:00.000Z",
+                payload={},
+                trace_id="trace-stream",
+            )
+
+            def slow_page(cursor: int, limit: int) -> RunEventPage:
+                del cursor, limit
+                time.sleep(0.06)
+                return RunEventPage((event,), 1, RunStatus.SUCCEEDED)
+
+            stream = stream_event_pages(
+                run_id="run-stream",
+                initial_page=RunEventPage((), 0, RunStatus.RUNNING),
+                initial_frames=(),
+                after_sequence=0,
+                authorize=lambda: _stream_snapshot(status=RunStatus.RUNNING),
+                read_page=slow_page,
+                config=SseConfig(
+                    page_size=8,
+                    poll_interval_seconds=0.01,
+                    heartbeat_seconds=0.02,
+                    max_connection_seconds=0.05,
+                    max_connections=1,
+                    max_connections_per_tenant=1,
+                ),
+                lease=limiter.try_acquire("tenant-a"),
+                metrics=metrics,
+                cursor_source="none",
+            )
+            chunks = [chunk async for chunk in stream]
+            return chunks, metrics.render()
+
+        deadline_chunks, deadline_metrics = asyncio.run(exercise_deadline())
+        self.assertEqual([], deadline_chunks)
+        self.assertIn('outcome="timeout"} 1', deadline_metrics)
+
+    def test_ten_thousand_events_are_drained_in_bounded_pages(self) -> None:
+        events = tuple(
+            RunEvent(
+                run_id="run-stream",
+                sequence=sequence,
+                event_type=EventType.NODE_COMPLETED,
+                node_name="batch_node",
+                timestamp="2026-07-11T00:00:01.000Z",
+                payload={"sequence": sequence},
+                trace_id="trace-stream",
+            )
+            for sequence in range(1, 10_001)
+        )
+
+        async def exercise() -> tuple[list[int], list[int], str]:
+            page_size = 127
+            initial_page = RunEventPage(
+                events[:page_size],
+                len(events),
+                RunStatus.SUCCEEDED,
+            )
+            initial_frames = encode_event_page(
+                initial_page,
+                run_id="run-stream",
+                after_sequence=0,
+            )
+            page_lengths = [len(initial_page.events)]
+            limiter = SseConnectionLimiter(max_connections=1, max_per_tenant=1)
+            metrics = SseMetrics()
+
+            def authorize() -> RunSnapshot:
+                return _stream_snapshot()
+
+            def read_page(cursor: int, limit: int) -> RunEventPage:
+                page_events = events[cursor : cursor + limit]
+                page_lengths.append(len(page_events))
+                return RunEventPage(
+                    page_events,
+                    len(events),
+                    RunStatus.SUCCEEDED,
+                )
+
+            stream = stream_event_pages(
+                run_id="run-stream",
+                initial_page=initial_page,
+                initial_frames=initial_frames,
+                after_sequence=0,
+                authorize=authorize,
+                read_page=read_page,
+                config=SseConfig(
+                    page_size=page_size,
+                    poll_interval_seconds=0.01,
+                    heartbeat_seconds=0.02,
+                    max_connection_seconds=10.0,
+                    max_connections=1,
+                    max_connections_per_tenant=1,
+                ),
+                lease=limiter.try_acquire("tenant-a"),
+                metrics=metrics,
+                cursor_source="none",
+            )
+            ids: list[int] = []
+            async for frame in stream:
+                ids.append(int(frame.split(b"\n", 1)[0].removeprefix(b"id: ")))
+            return ids, page_lengths, metrics.render()
+
+        ids, page_lengths, rendered = asyncio.run(exercise())
+        self.assertEqual(list(range(1, 10_001)), ids)
+        self.assertLessEqual(max(page_lengths), 127)
+        self.assertEqual(79, len(page_lengths))
+        self.assertIn('outcome="terminal"} 1', rendered)
+        self.assertNotIn("run-stream", rendered)
+
+
+@unittest.skipUnless(FASTAPI_AVAILABLE, "FastAPI implementation dependencies are not installed")
+class FastApiSseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.executor = ScenarioExecutor()
+        self.service = InMemoryRunService(self.executor)
+        self.authenticator = _Authenticator()
+        self.authorizer = _Authorizer()
+        self.artifacts = _ArtifactGateway()
+        self.stack = ExitStack()
+        self.client = self._client()
+
+    def tearDown(self) -> None:
+        self.stack.close()
+
+    def _client(
+        self,
+        *,
+        run_service=None,
+        sse_config=None,
+        authenticator=None,
+    ) -> "TestClient":
+        app = create_app(
+            run_service or self.service,
+            authenticator=authenticator or self.authenticator,
+            authorizer=self.authorizer,
+            artifact_gateway=self.artifacts,
+            allow_test_controls=True,
+            sse_config=sse_config,
+        )
+        return self.stack.enter_context(
+            TestClient(app, raise_server_exceptions=False)
+        )
+
+    @staticmethod
+    def _headers(**extra: str) -> dict[str, str]:
+        return {
+            "Authorization": "Bearer token-a",
+            **extra,
+        }
+
+    def _create(self, *, key: str = "sse-create", metadata=None) -> dict:
+        response = self.client.post(
+            "/api/v1/runs",
+            headers=self._headers(),
+            json=FastApiTransportTests._body(
+                key=key,
+                metadata=metadata,
+                artifacts=False,
+            ),
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        return response.json()
+
+    def test_terminal_sse_frames_headers_and_openapi_content(self) -> None:
+        snapshot = self._create()
+        response = self.client.get(
+            f"/api/v1/runs/{snapshot['run_id']}/events",
+            headers=self._headers(Accept="text/event-stream"),
+        )
+        json_response = self.client.get(
+            f"/api/v1/runs/{snapshot['run_id']}/events",
+            headers=self._headers(Accept="application/json"),
+        )
+        json_events = json_response.json()
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
+        self.assertEqual("no", response.headers["x-accel-buffering"])
+        self.assertIn("no-transform", response.headers["cache-control"])
+        self.assertEqual("Accept", response.headers["vary"])
+        self.assertEqual("Accept", json_response.headers["vary"])
+        self.assertNotIn("content-length", response.headers)
+        self.assertEqual(
+            [event["sequence"] for event in json_events],
+            _sse_ids(response.text),
+        )
+        for frame in response.text.split("\n\n"):
+            if not frame.startswith("id: "):
+                continue
+            data_line = next(
+                line for line in frame.splitlines() if line.startswith("data: ")
+            )
+            data = json.loads(data_line.removeprefix("data: "))
+            self.assertNotIn("internal_uri", json.dumps(data))
+
+        operation = self.client.get("/openapi.json").json()["paths"][
+            "/api/v1/runs/{run_id}/events"
+        ]["get"]
+        content = operation["responses"]["200"]["content"]
+        self.assertIn("application/json", content)
+        self.assertIn("text/event-stream", content)
+
+    def test_sse_cursor_reconnect_conflict_and_canonical_validation(self) -> None:
+        snapshot = self._create(key="sse-cursor")
+        path = f"/api/v1/runs/{snapshot['run_id']}/events"
+        tail = self.client.get(
+            path,
+            headers=self._headers(
+                Accept="text/event-stream",
+                **{"Last-Event-ID": "2"},
+            ),
+        )
+        same = self.client.get(
+            path + "?after_sequence=2",
+            headers=self._headers(
+                Accept="text/event-stream",
+                **{"Last-Event-ID": "2"},
+            ),
+        )
+        conflict = self.client.get(
+            path + "?after_sequence=3",
+            headers=self._headers(
+                Accept="text/event-stream",
+                **{"Last-Event-ID": "2"},
+            ),
+        )
+        invalid = self.client.get(
+            path,
+            headers=self._headers(
+                Accept="text/event-stream",
+                **{"Last-Event-ID": "01"},
+            ),
+        )
+        duplicate = self.client.get(
+            path,
+            headers=[
+                ("Authorization", "Bearer token-a"),
+                ("Accept", "text/event-stream"),
+                ("Last-Event-ID", "2"),
+                ("Last-Event-ID", "2"),
+            ],
+        )
+        json_header = self.client.get(
+            path,
+            headers=self._headers(
+                Accept="application/json",
+                **{"Last-Event-ID": "2"},
+            ),
+        )
+        encoded_query = self.client.get(
+            path + "?after_sequence=%32",
+            headers=self._headers(Accept="text/event-stream"),
+        )
+
+        self.assertTrue(all(item > 2 for item in _sse_ids(tail.text)))
+        self.assertEqual(_sse_ids(tail.text), _sse_ids(same.text))
+        for response in (
+            conflict,
+            invalid,
+            duplicate,
+            json_header,
+            encoded_query,
+        ):
+            self.assertEqual(400, response.status_code, response.text)
+            self.assertEqual("INVALID_ARGUMENT", response.json()["error"]["code"])
+
+    def test_accept_negotiation_prefers_quality_and_rejects_unsupported(self) -> None:
+        snapshot = self._create(key="sse-accept")
+        path = f"/api/v1/runs/{snapshot['run_id']}/events"
+        json_response = self.client.get(
+            path,
+            headers=self._headers(
+                Accept="text/event-stream;q=0.5, application/json;q=1"
+            ),
+        )
+        disabled_sse = self.client.get(
+            path,
+            headers=self._headers(
+                Accept="text/event-stream;q=0, application/json"
+            ),
+        )
+        unsupported = self.client.get(
+            path,
+            headers=self._headers(Accept="application/xml"),
+        )
+        duplicate_quality = self.client.get(
+            path,
+            headers=self._headers(
+                Accept="text/event-stream;q=1;q=0.5, application/json;q=0"
+            ),
+        )
+        unsupported_parameter = self.client.get(
+            path,
+            headers=self._headers(Accept="text/event-stream;charset=iso-8859-1"),
+        )
+        wildcard = self.client.get(
+            path,
+            headers=self._headers(Accept="*/*"),
+        )
+        text_wildcard = self.client.get(
+            path,
+            headers=self._headers(Accept="text/*"),
+        )
+        excluded_json = self.client.get(
+            path,
+            headers=self._headers(Accept="application/json;q=0, */*;q=1"),
+        )
+        excluded_sse = self.client.get(
+            path,
+            headers=self._headers(Accept="text/event-stream;q=0, */*;q=1"),
+        )
+
+        self.assertTrue(json_response.headers["content-type"].startswith("application/json"))
+        self.assertTrue(disabled_sse.headers["content-type"].startswith("application/json"))
+        self.assertEqual(406, unsupported.status_code)
+        self.assertEqual("INVALID_ARGUMENT", unsupported.json()["error"]["code"])
+        self.assertEqual(406, duplicate_quality.status_code)
+        self.assertEqual(
+            "INVALID_ARGUMENT",
+            duplicate_quality.json()["error"]["code"],
+        )
+        self.assertEqual(406, unsupported_parameter.status_code)
+        self.assertTrue(wildcard.headers["content-type"].startswith("application/json"))
+        self.assertTrue(text_wildcard.headers["content-type"].startswith("text/event-stream"))
+        self.assertTrue(excluded_json.headers["content-type"].startswith("text/event-stream"))
+        self.assertTrue(excluded_sse.headers["content-type"].startswith("application/json"))
+
+    def test_waiting_stream_heartbeats_then_delivers_terminal_tail(self) -> None:
+        authentication_calls_before = len(self.authenticator.tokens)
+        stream_client = self._client(
+            sse_config=SseConfig(
+                page_size=8,
+                poll_interval_seconds=0.01,
+                heartbeat_seconds=0.02,
+                max_connection_seconds=2.0,
+                max_connections=4,
+                max_connections_per_tenant=2,
+            )
+        )
+        waiting = stream_client.post(
+            "/api/v1/runs",
+            headers=self._headers(),
+            json=FastApiTransportTests._body(
+                key="sse-waiting",
+                metadata={"requires_approval": True, "approval_id": "approval-sse"},
+                artifacts=False,
+            ),
+        ).json()
+        failures: list[BaseException] = []
+
+        def approve_later() -> None:
+            try:
+                time.sleep(0.08)
+                self.service.approve(
+                    waiting["run_id"],
+                    ApprovalDecision("approval-sse", True, "principal-a"),
+                    tenant_id="tenant-a",
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        thread = Thread(target=approve_later)
+        thread.start()
+        response = stream_client.get(
+            f"/api/v1/runs/{waiting['run_id']}/events",
+            headers=self._headers(Accept="text/event-stream"),
+        )
+        thread.join(timeout=5)
+
+        self.assertEqual([], failures)
+        self.assertFalse(thread.is_alive())
+        self.assertIn(": heartbeat\n\n", response.text)
+        ids = _sse_ids(response.text)
+        self.assertEqual(list(range(1, len(ids) + 1)), ids)
+        self.assertIn("event: RUN_COMPLETED", response.text)
+        self.assertGreater(
+            len(self.authenticator.tokens),
+            authentication_calls_before + 2,
+        )
+        metrics = stream_client.get("/metrics").text
+        self.assertIn("puncture_api_sse_heartbeats_total", metrics)
+        self.assertNotIn(waiting["run_id"], metrics)
+
+        class RevokingAuthenticator(_Authenticator):
+            def __init__(inner_self) -> None:
+                super().__init__()
+                inner_self.call_count = 0
+
+            def authenticate(
+                inner_self,
+                bearer_token: str,
+            ) -> AuthenticatedPrincipal:
+                inner_self.call_count += 1
+                if inner_self.call_count >= 3:
+                    raise RunServiceError("FORBIDDEN", "token was revoked")
+                return super().authenticate(bearer_token)
+
+        revoking_authenticator = RevokingAuthenticator()
+        revoking_service = InMemoryRunService(ScenarioExecutor())
+        revoking_client = self._client(
+            run_service=revoking_service,
+            authenticator=revoking_authenticator,
+            sse_config=SseConfig(
+                page_size=8,
+                poll_interval_seconds=0.01,
+                heartbeat_seconds=0.02,
+                max_connection_seconds=1.0,
+                max_connections=2,
+                max_connections_per_tenant=1,
+            ),
+        )
+        revoked_run = revoking_client.post(
+            "/api/v1/runs",
+            headers=self._headers(),
+            json=FastApiTransportTests._body(
+                key="sse-revoked-token",
+                metadata={"requires_approval": True},
+                artifacts=False,
+            ),
+        ).json()
+        revoked_stream = revoking_client.get(
+            f"/api/v1/runs/{revoked_run['run_id']}/events",
+            headers=self._headers(Accept="text/event-stream"),
+        )
+        self.assertEqual(200, revoked_stream.status_code)
+        self.assertGreaterEqual(revoking_authenticator.call_count, 3)
+        self.assertEqual(0, revoking_client.app.state.puncture_sse_limiter.active)
+        self.assertIn(
+            'outcome="revoked"} 1',
+            revoking_client.get("/metrics").text,
+        )
+
+    def test_sse_preflight_failures_remain_structured_json(self) -> None:
+        snapshot = self._create(key="sse-preflight")
+
+        class FailingPageService:
+            def get_run(inner_self, run_id, *, tenant_id):
+                return self.service.get_run(run_id, tenant_id=tenant_id)
+
+            def get_event_page(inner_self, *args, **kwargs):
+                del args, kwargs
+                raise RunServiceError(
+                    "PAGE_UNAVAILABLE",
+                    "postgresql://user:secret@db/private",
+                    retryable=True,
+                )
+
+        failing = self._client(run_service=FailingPageService()).get(
+            f"/api/v1/runs/{snapshot['run_id']}/events",
+            headers=self._headers(Accept="text/event-stream"),
+        )
+        self.assertEqual(503, failing.status_code)
+        self.assertTrue(failing.headers["content-type"].startswith("application/json"))
+        self.assertNotIn("secret", failing.text)
+
+        class WrongPageService(FailingPageService):
+            def get_event_page(inner_self, *args, **kwargs):
+                del args, kwargs
+                event = RunEvent(
+                    run_id="run-other",
+                    sequence=1,
+                    event_type=EventType.RUN_CREATED,
+                    node_name=None,
+                    timestamp="2026-07-11T00:00:00.000Z",
+                    payload={},
+                    trace_id="trace-other",
+                )
+                return RunEventPage((event,), 1, RunStatus.SUCCEEDED)
+
+        wrong = self._client(run_service=WrongPageService()).get(
+            f"/api/v1/runs/{snapshot['run_id']}/events",
+            headers=self._headers(Accept="text/event-stream"),
+        )
+        self.assertEqual(500, wrong.status_code)
+        self.assertEqual("INTERNAL_ERROR", wrong.json()["error"]["code"])
+
+        class EmptyGapPageService(FailingPageService):
+            def get_event_page(inner_self, *args, **kwargs):
+                del args, kwargs
+                return RunEventPage((), 1, RunStatus.RUNNING)
+
+        empty_gap = self._client(run_service=EmptyGapPageService()).get(
+            f"/api/v1/runs/{snapshot['run_id']}/events",
+            headers=self._headers(Accept="text/event-stream"),
+        )
+        self.assertEqual(500, empty_gap.status_code)
+        self.assertEqual("INTERNAL_ERROR", empty_gap.json()["error"]["code"])
+
+        capacity_client = self._client(
+            sse_config=SseConfig(
+                max_connections=1,
+                max_connections_per_tenant=1,
+            )
+        )
+        capacity_lease = capacity_client.app.state.puncture_sse_limiter.try_acquire(
+            "tenant-a"
+        )
+        try:
+            capacity = capacity_client.get(
+                f"/api/v1/runs/{snapshot['run_id']}/events",
+                headers=self._headers(Accept="text/event-stream"),
+            )
+        finally:
+            capacity_lease.release()
+        self.assertEqual(503, capacity.status_code)
+        self.assertEqual("SERVICE_UNAVAILABLE", capacity.json()["error"]["code"])
 
 
 def _psycopg_available() -> bool:

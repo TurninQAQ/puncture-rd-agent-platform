@@ -106,7 +106,36 @@ class RunServiceTests(unittest.TestCase):
         snapshot = service.create_run(request())
         events = service.get_events(snapshot.run_id, tenant_id="tenant-a")
         tail = service.get_events(snapshot.run_id, tenant_id="tenant-a", after_sequence=2)
+        first_page = service.get_event_page(
+            snapshot.run_id,
+            tenant_id="tenant-a",
+            limit=2,
+        )
+        second_page = service.get_event_page(
+            snapshot.run_id,
+            tenant_id="tenant-a",
+            after_sequence=2,
+            limit=2,
+        )
+        final_page = service.get_event_page(
+            snapshot.run_id,
+            tenant_id="tenant-a",
+            after_sequence=max(0, len(events) - 2),
+            limit=2,
+        )
         self.assertEqual(events[2:], tail)
+        self.assertEqual(events[:2], first_page.events)
+        self.assertEqual(events[2:4], second_page.events)
+        self.assertEqual(len(events), first_page.high_water_sequence)
+        self.assertTrue(first_page.has_more)
+        self.assertEqual(events[-2:], final_page.events)
+        self.assertFalse(final_page.has_more)
+        with self.assertRaises(RunServiceError):
+            service.get_event_page(
+                snapshot.run_id,
+                tenant_id="tenant-a",
+                limit=513,
+            )
 
     def test_cross_tenant_lookup_does_not_disclose_run(self) -> None:
         service = InMemoryRunService()

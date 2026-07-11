@@ -14,6 +14,8 @@ from .repository import (
     CreateRunResult,
     InMemoryRunRepository,
     RunEventDraft,
+    RunEventPage,
+    RunEventPager,
     RunRepository,
     VersionedRun,
 )
@@ -35,6 +37,8 @@ __all__ = [
     "PostgresRunRepository",
     "RunEvent",
     "RunEventDraft",
+    "RunEventPage",
+    "RunEventPager",
     "RunRepository",
     "RunRequest",
     "RunServiceError",

@@ -112,6 +112,62 @@ class CreateRunResult:
     created: bool
 
 
+@dataclass(frozen=True, slots=True)
+class RunEventPage:
+    events: tuple[RunEvent, ...]
+    high_water_sequence: int
+    status: RunStatus
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.high_water_sequence, bool)
+            or not isinstance(self.high_water_sequence, int)
+            or self.high_water_sequence < 0
+        ):
+            raise ValueError("high_water_sequence must be non-negative")
+        if not isinstance(self.status, RunStatus):
+            raise TypeError("status must be a RunStatus")
+        events = tuple(self.events)
+        if any(not isinstance(event, RunEvent) for event in events):
+            raise TypeError("events must contain RunEvent values")
+        if events and events[-1].sequence > self.high_water_sequence:
+            raise ValueError("event page exceeds its high-water sequence")
+        object.__setattr__(self, "events", events)
+
+    @property
+    def has_more(self) -> bool:
+        return bool(
+            self.events
+            and self.events[-1].sequence < self.high_water_sequence
+        )
+
+
+def _validate_event_page_request(after_sequence: int, limit: int) -> None:
+    if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+        raise ValueError("after_sequence must be an integer")
+    if after_sequence < 0:
+        raise ValueError("after_sequence must be non-negative")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit < 1
+        or limit > 512
+    ):
+        raise ValueError("event page limit must be between 1 and 512")
+
+
+@runtime_checkable
+class RunEventPager(Protocol):
+    def get_event_page(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        after_sequence: int = 0,
+        limit: int = 128,
+    ) -> RunEventPage: ...
+
+
 @dataclass(slots=True)
 class _StoredEventClaim:
     execution_version: int
@@ -385,6 +441,29 @@ class InMemoryRunRepository:
                 deepcopy(event)
                 for event in stored.events
                 if event.sequence > after_sequence
+            )
+
+    def get_event_page(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        after_sequence: int = 0,
+        limit: int = 128,
+    ) -> RunEventPage:
+        _validate_event_page_request(after_sequence, limit)
+        with self._lock:
+            stored = self._require(run_id, tenant_id)
+            high_water = len(stored.events)
+            start = min(after_sequence, high_water)
+            events = tuple(
+                deepcopy(event)
+                for event in stored.events[start : start + limit]
+            )
+            return RunEventPage(
+                events=events,
+                high_water_sequence=high_water,
+                status=stored.snapshot.status,
             )
 
     def assert_running(
@@ -676,6 +755,8 @@ __all__ = [
     "CreateRunResult",
     "InMemoryRunRepository",
     "RunEventDraft",
+    "RunEventPage",
+    "RunEventPager",
     "RunRepository",
     "VersionedRun",
 ]

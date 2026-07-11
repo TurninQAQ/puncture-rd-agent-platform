@@ -425,6 +425,17 @@ class PostgresRunRepositoryTests(unittest.TestCase):
             tenant_id=run_request.tenant_id,
             after_sequence=node_event.sequence,
         )
+        first_page = restarted.get_event_page(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            limit=2,
+        )
+        second_page = restarted.get_event_page(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            after_sequence=2,
+            limit=2,
+        )
 
         self.assertEqual(succeeded, replayed_cas)
         self.assertEqual(succeeded, restored)
@@ -432,6 +443,12 @@ class PostgresRunRepositoryTests(unittest.TestCase):
         self.assertEqual("2026-07-11T12:00:01.456Z", restored.snapshot.updated_at)
         self.assertEqual(list(range(1, 5)), [event.sequence for event in events])
         self.assertEqual([EventType.RUN_COMPLETED], [event.event_type for event in tail])
+        self.assertEqual(events[:2], first_page.events)
+        self.assertEqual(events[2:], second_page.events)
+        self.assertEqual(4, first_page.high_water_sequence)
+        self.assertEqual(RunStatus.SUCCEEDED, second_page.status)
+        self.assertTrue(first_page.has_more)
+        self.assertFalse(second_page.has_more)
         numeric_values = (
             restored.snapshot.request.metadata["marker"],
             restored.snapshot.checkpoint["numeric"],

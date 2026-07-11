@@ -21,6 +21,7 @@ from .fastapi_app import (
     create_app,
 )
 from .http_metrics import HttpMetrics
+from .sse import SseConfig
 
 
 def _parse_positive_int(name: str, value: str) -> int:
@@ -57,6 +58,12 @@ class PostgresApiSettings:
     lock_timeout_ms: int = 1_000
     max_request_body_bytes: int = 1024 * 1024
     migrate_on_startup: bool = False
+    sse_page_size: int = 128
+    sse_poll_interval_seconds: float = 1.0
+    sse_heartbeat_seconds: float = 15.0
+    sse_max_connection_seconds: float = 600.0
+    sse_max_connections: int = 200
+    sse_max_connections_per_tenant: int = 20
 
     def __post_init__(self) -> None:
         if (
@@ -75,6 +82,17 @@ class PostgresApiSettings:
             )
         if not isinstance(self.migrate_on_startup, bool):
             raise TypeError("migrate_on_startup must be a boolean")
+        self.to_sse_config()
+
+    def to_sse_config(self) -> SseConfig:
+        return SseConfig(
+            page_size=self.sse_page_size,
+            poll_interval_seconds=self.sse_poll_interval_seconds,
+            heartbeat_seconds=self.sse_heartbeat_seconds,
+            max_connection_seconds=self.sse_max_connection_seconds,
+            max_connections=self.sse_max_connections,
+            max_connections_per_tenant=self.sse_max_connections_per_tenant,
+        )
 
     @classmethod
     def from_env(
@@ -108,6 +126,33 @@ class PostgresApiSettings:
             migrate_on_startup=_parse_bool(
                 "PUNCTURE_API_MIGRATE_ON_STARTUP",
                 source.get("PUNCTURE_API_MIGRATE_ON_STARTUP", "false"),
+            ),
+            sse_page_size=_parse_positive_int(
+                "PUNCTURE_API_SSE_PAGE_SIZE",
+                source.get("PUNCTURE_API_SSE_PAGE_SIZE", "128"),
+            ),
+            sse_poll_interval_seconds=_parse_positive_float(
+                "PUNCTURE_API_SSE_POLL_INTERVAL_SECONDS",
+                source.get("PUNCTURE_API_SSE_POLL_INTERVAL_SECONDS", "1"),
+            ),
+            sse_heartbeat_seconds=_parse_positive_float(
+                "PUNCTURE_API_SSE_HEARTBEAT_SECONDS",
+                source.get("PUNCTURE_API_SSE_HEARTBEAT_SECONDS", "15"),
+            ),
+            sse_max_connection_seconds=_parse_positive_float(
+                "PUNCTURE_API_SSE_MAX_CONNECTION_SECONDS",
+                source.get("PUNCTURE_API_SSE_MAX_CONNECTION_SECONDS", "600"),
+            ),
+            sse_max_connections=_parse_positive_int(
+                "PUNCTURE_API_SSE_MAX_CONNECTIONS",
+                source.get("PUNCTURE_API_SSE_MAX_CONNECTIONS", "200"),
+            ),
+            sse_max_connections_per_tenant=_parse_positive_int(
+                "PUNCTURE_API_SSE_MAX_CONNECTIONS_PER_TENANT",
+                source.get(
+                    "PUNCTURE_API_SSE_MAX_CONNECTIONS_PER_TENANT",
+                    "20",
+                ),
             ),
         )
 
@@ -178,6 +223,7 @@ def create_postgres_app(
             artifact_gateway_configured=artifact_gateway is not None,
         ),
         metrics=metrics,
+        sse_config=settings.to_sse_config(),
         max_request_body_bytes=settings.max_request_body_bytes,
         startup_hooks=(repository.migrate,) if settings.migrate_on_startup else (),
     )

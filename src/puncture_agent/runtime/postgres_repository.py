@@ -28,6 +28,7 @@ from .repository import (
     CreateRunResult,
     InMemoryRunRepository,
     RunEventDraft,
+    RunEventPage,
     VersionedRun,
     _RUNNING_STREAM_EVENTS,
     _canonical_json,
@@ -37,6 +38,7 @@ from .repository import (
     _request_fingerprint,
     _snapshot_fingerprint,
     _transition_fingerprint,
+    _validate_event_page_request,
 )
 
 
@@ -603,6 +605,94 @@ class PostgresRunRepository:
                 raise RunRepositoryIntegrityError()
             connection.commit()
             return events
+        except RunRepositoryError:
+            self._rollback(connection)
+            raise
+        except Exception as exc:
+            self._rollback(connection)
+            raise self._map_exception(exc) from exc
+        finally:
+            self._close(connection)
+
+    def get_event_page(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        after_sequence: int = 0,
+        limit: int = 128,
+    ) -> RunEventPage:
+        _validate_event_page_request(after_sequence, limit)
+        connection: Any | None = None
+        try:
+            connection = self._connect()
+            run_row = self._fetchone(
+                connection,
+                f"""
+                SELECT last_event_sequence, trace_id, status
+                FROM {self._runs}
+                WHERE run_id = %s AND tenant_id = %s
+                """,
+                (run_id, tenant_id),
+            )
+            if run_row is None:
+                raise RunRepositoryNotFound()
+            last_sequence, trace_id, status_value = run_row
+            if (
+                isinstance(last_sequence, bool)
+                or not isinstance(last_sequence, int)
+                or last_sequence < 2
+                or not isinstance(trace_id, str)
+            ):
+                raise RunRepositoryIntegrityError()
+            try:
+                status = RunStatus(status_value)
+            except (TypeError, ValueError) as exc:
+                raise RunRepositoryIntegrityError() from exc
+            page_end = min(last_sequence, after_sequence + limit)
+            if page_end <= after_sequence:
+                rows: list[tuple[Any, ...]] = []
+            else:
+                rows = self._fetchall(
+                    connection,
+                    self._event_select
+                    + f"""
+                      FROM {self._events}
+                      WHERE run_id = %s
+                        AND tenant_id = %s
+                        AND sequence > %s
+                        AND sequence <= %s
+                      ORDER BY sequence ASC
+                      LIMIT %s
+                    """,
+                    (
+                        run_id,
+                        tenant_id,
+                        after_sequence,
+                        page_end,
+                        limit,
+                    ),
+                )
+            events = tuple(self._decode_event(row)[0] for row in rows)
+            expected_count = max(0, page_end - after_sequence)
+            if len(events) != expected_count:
+                raise RunRepositoryIntegrityError()
+            if events and events[0].sequence != after_sequence + 1:
+                raise RunRepositoryIntegrityError()
+            if any(
+                event.sequence != after_sequence + index
+                for index, event in enumerate(events, start=1)
+            ):
+                raise RunRepositoryIntegrityError()
+            if any(event.trace_id != trace_id for event in events):
+                raise RunRepositoryIntegrityError()
+            page = RunEventPage(
+                events=events,
+                high_water_sequence=last_sequence,
+                status=status,
+            )
+            connection.commit()
+            return page
         except RunRepositoryError:
             self._rollback(connection)
             raise

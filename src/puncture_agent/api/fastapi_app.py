@@ -13,7 +13,7 @@ from enum import Enum
 import re
 from typing import Any, Callable, Literal, Protocol, Sequence
 
-from fastapi import Depends, FastAPI, Path, Query, Request, Security
+from fastapi import Depends, FastAPI, Path, Query, Request, Response, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -23,7 +23,13 @@ from starlette.exceptions import HTTPException as StarletteHttpException
 from contracts.artifacts import ArtifactPublicView
 from contracts.enums import ArtifactStatus
 from puncture_agent.artifacts.registry import ArtifactRegistryError
-from puncture_agent.runtime import ApprovalDecision, RunEvent, RunRequest, RunSnapshot
+from puncture_agent.runtime import (
+    ApprovalDecision,
+    RunEvent,
+    RunEventPage,
+    RunRequest,
+    RunSnapshot,
+)
 from puncture_agent.runtime.errors import RunServiceError
 
 from .body_admission import RawBodyAdmissionMiddleware
@@ -43,6 +49,17 @@ from .http_contracts import (
 )
 from .http_metrics import HttpMetrics, HttpMetricsMiddleware
 from .privacy import PublicValueValidationError
+from .sse import (
+    SseConfig,
+    SseConnectionLimiter,
+    SseMetrics,
+    SseNegotiationError,
+    SseStreamingResponse,
+    encode_event_page,
+    negotiate_event_representation,
+    resolve_event_cursor,
+    stream_event_pages,
+)
 
 
 _RESOURCE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$"
@@ -148,6 +165,15 @@ class RunService(Protocol):
         after_sequence: int = 0,
     ) -> tuple[RunEvent, ...]: ...
 
+    def get_event_page(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        after_sequence: int = 0,
+        limit: int = 128,
+    ) -> RunEventPage: ...
+
     def approve(
         self,
         run_id: str,
@@ -230,6 +256,25 @@ def _error_responses() -> dict[int | str, dict[str, Any]]:
     }
 
 
+def _event_responses() -> dict[int | str, dict[str, Any]]:
+    responses = _error_responses()
+    responses[406] = {"model": ApiErrorResponse}
+    responses[200] = {
+        "description": "Ordered JSON page or Server-Sent Events stream.",
+        "content": {
+            "text/event-stream": {
+                "schema": {"type": "string"},
+                "example": (
+                    "id: 3\n"
+                    "event: NODE_STARTED\n"
+                    'data: {"run_id":"run-1","sequence":3}\n\n'
+                ),
+            }
+        },
+    }
+    return responses
+
+
 def _json_error(mapping: HttpErrorMapping) -> JSONResponse:
     return JSONResponse(
         status_code=mapping.status_code,
@@ -299,6 +344,12 @@ def _map_artifact_error(exc: ArtifactRegistryError) -> HttpErrorMapping:
 
 
 def _map_transport_exception(exc: Exception) -> HttpErrorMapping:
+    if isinstance(exc, SseNegotiationError):
+        return _fixed_error(
+            status_code=406,
+            code="INVALID_ARGUMENT",
+            message="requested response representation is not acceptable",
+        )
     if isinstance(exc, ArtifactRegistryError):
         return _map_artifact_error(exc)
     if isinstance(
@@ -447,6 +498,8 @@ def create_app(
     artifact_gateway: ArtifactAccessGateway | None = None,
     health_probe: HealthProbe | None = None,
     metrics: HttpMetrics | None = None,
+    sse_config: SseConfig | None = None,
+    sse_metrics: SseMetrics | None = None,
     max_request_body_bytes: int = 1024 * 1024,
     allow_test_controls: bool = False,
     startup_hooks: Sequence[Callable[[], None]] = (),
@@ -459,6 +512,10 @@ def create_app(
         raise TypeError("authenticator is required")
     if authorizer is None:
         raise TypeError("authorizer is required")
+    if sse_config is not None and not isinstance(sse_config, SseConfig):
+        raise TypeError("sse_config must be an SseConfig")
+    if sse_metrics is not None and not isinstance(sse_metrics, SseMetrics):
+        raise TypeError("sse_metrics must be an SseMetrics")
     if not isinstance(allow_test_controls, bool):
         raise TypeError("allow_test_controls must be a boolean")
     hooks = tuple(startup_hooks)
@@ -485,6 +542,12 @@ def create_app(
         allow_test_controls=allow_test_controls,
     )
     metric_store = metrics if metrics is not None else HttpMetrics()
+    event_stream_config = sse_config if sse_config is not None else SseConfig()
+    event_stream_metrics = sse_metrics if sse_metrics is not None else SseMetrics()
+    event_stream_limiter = SseConnectionLimiter(
+        max_connections=event_stream_config.max_connections,
+        max_per_tenant=event_stream_config.max_connections_per_tenant,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -501,6 +564,8 @@ def create_app(
     )
     app.state.puncture_dependencies = dependencies
     app.state.puncture_metrics = metric_store
+    app.state.puncture_sse_metrics = event_stream_metrics
+    app.state.puncture_sse_limiter = event_stream_limiter
     app.add_middleware(
         RawBodyAdmissionMiddleware,
         max_body_bytes=max_request_body_bytes,
@@ -681,25 +746,125 @@ def create_app(
         "/api/v1/runs/{run_id}/events",
         operation_id="listRunEvents",
         response_model=list[RunEventResponse],
-        responses=_error_responses(),
+        responses=_event_responses(),
+        description=(
+            "Returns a bounded JSON page by default. Send "
+            "Accept: text/event-stream for SSE; Last-Event-ID and "
+            "after_sequence are exclusive cursors and must agree when both "
+            "are present."
+        ),
         tags=["runs"],
     )
-    def list_run_events(
+    async def list_run_events(
+        request: Request,
+        response: Response,
         run_id: str = Path(
             min_length=1,
             max_length=255,
             pattern=_RESOURCE_ID_PATTERN,
         ),
-        after_sequence: int = Query(default=0, ge=0, le=2**63 - 1),
+        after_sequence: int | None = Query(
+            default=None,
+            ge=0,
+            le=2**63 - 1,
+        ),
+        limit: int = Query(default=512, ge=1, le=512),
         principal: AuthenticatedPrincipal = Depends(current_principal),
-    ) -> list[RunEventResponse]:
-        authorized_run(run_id, principal, ApiPermission.RUN_EVENTS_READ)
-        events = dependencies.run_service.get_events(
+    ) -> Any:
+        representation = negotiate_event_representation(request.scope)
+        cursor = resolve_event_cursor(
+            request.scope,
+            after_sequence=after_sequence,
+            representation=representation,
+        )
+        await run_in_threadpool(
+            authorized_run,
+            run_id,
+            principal,
+            ApiPermission.RUN_EVENTS_READ,
+        )
+        page_limit = limit if representation == "json" else event_stream_config.page_size
+        page = await run_in_threadpool(
+            dependencies.run_service.get_event_page,
             run_id,
             tenant_id=principal.tenant_id,
-            after_sequence=after_sequence,
+            after_sequence=cursor.cursor,
+            limit=page_limit,
         )
-        return [RunEventResponse.from_runtime(event) for event in events]
+        frames = encode_event_page(
+            page,
+            run_id=run_id,
+            after_sequence=cursor.cursor,
+        )
+        if representation == "json":
+            response.headers["Vary"] = "Accept"
+            return [
+                RunEventResponse.from_runtime(event)
+                for event, _ in frames
+            ]
+
+        stream_bearer_token = _extract_bearer_token(request.scope)
+        lease = event_stream_limiter.try_acquire(principal.tenant_id)
+
+        def authorize_stream() -> RunSnapshot:
+            refreshed_principal = dependencies.authenticator.authenticate(
+                stream_bearer_token
+            )
+            if not isinstance(refreshed_principal, AuthenticatedPrincipal):
+                raise RunServiceError(
+                    "AUTHENTICATION_CONFIGURATION_ERROR",
+                    "authenticator returned an invalid principal",
+                )
+            if (
+                refreshed_principal.tenant_id != principal.tenant_id
+                or refreshed_principal.principal_id != principal.principal_id
+            ):
+                raise RunServiceError("FORBIDDEN", "stream identity changed")
+            return authorized_run(
+                run_id,
+                refreshed_principal,
+                ApiPermission.RUN_EVENTS_READ,
+            )
+
+        def read_stream_page(
+            page_cursor: int,
+            page_size: int,
+        ) -> RunEventPage:
+            return dependencies.run_service.get_event_page(
+                run_id,
+                tenant_id=principal.tenant_id,
+                after_sequence=page_cursor,
+                limit=page_size,
+            )
+
+        try:
+            stream = stream_event_pages(
+                run_id=run_id,
+                initial_page=page,
+                initial_frames=frames,
+                after_sequence=cursor.cursor,
+                authorize=authorize_stream,
+                read_page=read_stream_page,
+                config=event_stream_config,
+                lease=lease,
+                metrics=event_stream_metrics,
+                cursor_source=cursor.source,
+            )
+            return SseStreamingResponse(
+                stream,
+                lease=lease,
+                headers={
+                    "Cache-Control": (
+                        "no-cache, no-store, must-revalidate, no-transform"
+                    ),
+                    "X-Accel-Buffering": "no",
+                    "X-Content-Type-Options": "nosniff",
+                    "Vary": "Accept",
+                },
+            )
+        except BaseException:
+            lease.release()
+            raise
 
     @app.post(
         "/api/v1/runs/{run_id}/approvals/{approval_id}",
@@ -838,7 +1003,7 @@ def create_app(
     )
     def get_metrics() -> PlainTextResponse:
         return PlainTextResponse(
-            metric_store.render(),
+            metric_store.render() + event_stream_metrics.render(),
             media_type="text/plain; version=0.0.4",
             headers={"Cache-Control": "no-store"},
         )
