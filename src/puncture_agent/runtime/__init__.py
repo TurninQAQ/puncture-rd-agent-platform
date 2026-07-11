@@ -17,6 +17,10 @@ from .repository import (
     RunRepository,
     VersionedRun,
 )
+from .postgres_repository import (
+    PostgresRunRepository,
+    migrate_postgres_run_repository,
+)
 from .service import InMemoryRunService, ScenarioExecutor
 from .graph_executor import IntegratedMockExecutor
 
@@ -28,6 +32,7 @@ __all__ = [
     "InMemoryRunService",
     "InMemoryRunRepository",
     "IntegratedMockExecutor",
+    "PostgresRunRepository",
     "RunEvent",
     "RunEventDraft",
     "RunRepository",
@@ -37,4 +42,5 @@ __all__ = [
     "RunStatus",
     "ScenarioExecutor",
     "VersionedRun",
+    "migrate_postgres_run_repository",
 ]

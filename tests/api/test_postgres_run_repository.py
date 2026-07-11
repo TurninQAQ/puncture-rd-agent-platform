@@ -1,0 +1,1099 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import math
+import os
+import sys
+from threading import Barrier, Event, Lock
+import time
+import unittest
+from unittest import mock
+from uuid import uuid4
+
+from puncture_agent.runtime import (
+    EventType,
+    PostgresRunRepository,
+    RunEventDraft,
+    RunRequest,
+    RunSnapshot,
+    RunStatus,
+)
+from puncture_agent.runtime.errors import (
+    ExecutionSuperseded,
+    RunRepositoryConfigurationError,
+    RunRepositoryIdempotencyConflict,
+    RunRepositoryIntegrityError,
+    RunRepositoryNotFound,
+    RunRepositoryUnavailable,
+    RunRepositoryVersionConflict,
+)
+
+
+POSTGRES_DSN = os.environ.get("PUNCTURE_TEST_POSTGRES_DSN", "")
+
+
+class _CommitAcknowledgementLoss:
+    def __init__(self, *, pause_after_commit: bool = False) -> None:
+        self._lock = Lock()
+        self._armed = True
+        self.raised_count = 0
+        self.committed = Event()
+        self.release = Event()
+        if not pause_after_commit:
+            self.release.set()
+
+    def raise_once_after_commit(self) -> None:
+        with self._lock:
+            if not self._armed:
+                return
+            self._armed = False
+            self.raised_count += 1
+        self.committed.set()
+        if not self.release.wait(timeout=30):
+            raise RuntimeError("test did not release the post-commit fault")
+        raise OSError("simulated commit acknowledgement loss")
+
+
+class _CommitAcknowledgementLossConnection:
+    def __init__(self, delegate, fault: _CommitAcknowledgementLoss) -> None:
+        self._delegate = delegate
+        self._fault = fault
+
+    @property
+    def autocommit(self):
+        return self._delegate.autocommit
+
+    @autocommit.setter
+    def autocommit(self, value) -> None:
+        self._delegate.autocommit = value
+
+    @property
+    def closed(self):
+        return self._delegate.closed
+
+    def commit(self):
+        result = self._delegate.commit()
+        self._fault.raise_once_after_commit()
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+
+def _commit_acknowledgement_loss_factory(
+    fault: _CommitAcknowledgementLoss,
+):
+    import psycopg
+
+    def connect(dsn, **kwargs):
+        return _CommitAcknowledgementLossConnection(
+            psycopg.connect(dsn, **kwargs),
+            fault,
+        )
+
+    return connect
+
+
+def _psycopg_available() -> bool:
+    try:
+        import psycopg  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return True
+
+
+def request(
+    *,
+    case_id: str = "case-postgres",
+    tenant_id: str = "tenant-postgres",
+    idempotency_key: str = "key-postgres",
+    marker: object = "default",
+) -> RunRequest:
+    return RunRequest(
+        case_id=case_id,
+        user_query="validate the PostgreSQL run repository",
+        task_type="DATA_MODEL_VALIDATION",
+        idempotency_key=idempotency_key,
+        tenant_id=tenant_id,
+        principal_id="postgres-test",
+        metadata={"marker": marker},
+    )
+
+
+def started_snapshot(
+    run_request: RunRequest,
+    *,
+    run_id: str | None = None,
+) -> RunSnapshot:
+    suffix = run_id or f"run-{uuid4().hex}"
+    return RunSnapshot(
+        run_id=suffix,
+        request=run_request,
+        status=RunStatus.RUNNING,
+        trace_id=f"trace-{suffix}",
+        created_at="2026-07-11T12:00:00.000Z",
+        updated_at="2026-07-11T12:00:00.000Z",
+        final_report={},
+        checkpoint={},
+        approval_id=None,
+        error=None,
+    )
+
+
+def initial_events() -> tuple[RunEventDraft, ...]:
+    return (
+        RunEventDraft(EventType.RUN_CREATED, None, {"source": "postgres-test"}),
+        RunEventDraft(EventType.RUN_STARTED, None, {}),
+    )
+
+
+class PostgresRunRepositoryContractTests(unittest.TestCase):
+    def test_constructor_rejects_unsafe_connection_configuration(self) -> None:
+        with self.assertRaises(ValueError):
+            PostgresRunRepository("https://database.example.test/agent")
+        with self.assertRaises(ValueError):
+            PostgresRunRepository(
+                "postgresql://database.example.test/agent",
+                schema="unsafe-schema",
+            )
+        with self.assertRaises(ValueError):
+            PostgresRunRepository(
+                "postgresql://database.example.test/agent",
+                statement_timeout_ms=0,
+            )
+        with self.assertRaises(ValueError):
+            PostgresRunRepository(
+                "postgresql://database.example.test/agent",
+                application_name="x" * 64,
+            )
+        with self.assertRaises(TypeError):
+            PostgresRunRepository(
+                "postgresql://database.example.test/agent",
+                connection_factory="not-callable",
+            )
+
+    def test_dependency_and_connection_failures_are_sanitized(self) -> None:
+        repository = PostgresRunRepository(
+            "postgresql://user:secret@database.example.test/agent"
+        )
+        with mock.patch.dict(sys.modules, {"psycopg": None}):
+            with self.assertRaises(RunRepositoryConfigurationError) as missing:
+                repository.get("run-1", tenant_id="tenant-1")
+        self.assertNotIn("secret", str(missing.exception))
+
+        calls = []
+
+        def failing_factory(dsn, **kwargs):
+            calls.append((dsn, kwargs))
+            raise OSError("network path exposed")
+
+        unavailable_repository = PostgresRunRepository(
+            "postgresql://user:secret@database.example.test/agent",
+            connection_factory=failing_factory,
+        )
+        with self.assertRaises(RunRepositoryUnavailable) as unavailable:
+            unavailable_repository.get("run-1", tenant_id="tenant-1")
+        self.assertTrue(unavailable.exception.retryable)
+        self.assertNotIn("secret", str(unavailable.exception))
+        self.assertEqual(1, len(calls))
+        self.assertEqual(False, calls[0][1]["autocommit"])
+        self.assertEqual(5, calls[0][1]["connect_timeout"])
+
+
+@unittest.skipUnless(
+    POSTGRES_DSN and _psycopg_available(),
+    "PostgreSQL Run repository environment is not configured",
+)
+class PostgresRunRepositoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.schema = f"run_repo_{uuid4().hex[:20]}"
+        self.application_name = f"run-repo-{uuid4().hex[:20]}"
+        self.repository = self._repository()
+        self.repository.migrate()
+
+    def tearDown(self) -> None:
+        import psycopg
+
+        with psycopg.connect(POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute("SET lock_timeout = '5s'")
+            connection.execute("SET statement_timeout = '10s'")
+            connection.execute(f'DROP SCHEMA IF EXISTS "{self.schema}" CASCADE')
+
+    def _repository(
+        self,
+        *,
+        application_name: str | None = None,
+        connection_factory=None,
+    ):
+        return PostgresRunRepository(
+            POSTGRES_DSN,
+            schema=self.schema,
+            connect_timeout_seconds=5,
+            statement_timeout_ms=10_000,
+            lock_timeout_ms=5_000,
+            application_name=application_name or self.application_name,
+            connection_factory=connection_factory,
+        )
+
+    def _execute_sql(self, statement: str, parameters=()):
+        import psycopg
+
+        with psycopg.connect(POSTGRES_DSN, autocommit=True) as connection:
+            cursor = connection.execute(statement, parameters)
+            return cursor.fetchall() if cursor.description is not None else []
+
+    def _install_reject_trigger(self, *, event_type: EventType) -> None:
+        self._execute_sql(
+            f"""
+            CREATE OR REPLACE FUNCTION "{self.schema}".reject_event()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.event_type = '{event_type.value}' THEN
+                    RAISE EXCEPTION 'test event rejection';
+                END IF;
+                RETURN NEW;
+            END
+            $$
+            """
+        )
+        self._execute_sql(
+            f"""
+            CREATE TRIGGER reject_event
+            BEFORE INSERT ON "{self.schema}".run_events
+            FOR EACH ROW EXECUTE FUNCTION "{self.schema}".reject_event()
+            """
+        )
+
+    def _drop_reject_trigger(self) -> None:
+        self._execute_sql(
+            f'DROP TRIGGER IF EXISTS reject_event ON "{self.schema}".run_events'
+        )
+        self._execute_sql(
+            f'DROP FUNCTION IF EXISTS "{self.schema}".reject_event()'
+        )
+
+    def test_pg_run_01_persists_across_instances_and_cursor(self) -> None:
+        self.repository.migrate()
+        numeric = {
+            "negative_zero": -0.0,
+            "large_float": 1e20,
+            "unit_float": 1.0,
+        }
+        run_request = request(
+            idempotency_key=f"persist-{uuid4().hex}",
+            marker=numeric,
+        )
+        initial_snapshot = replace(
+            started_snapshot(run_request),
+            created_at="2026-07-11T12:00:00.123Z",
+            updated_at="2026-07-11T12:00:00.123Z",
+            checkpoint={"numeric": numeric},
+        )
+        created = self.repository.create_or_get_started(
+            initial_snapshot,
+            (
+                RunEventDraft(
+                    EventType.RUN_CREATED,
+                    None,
+                    {"numeric": numeric},
+                ),
+                RunEventDraft(EventType.RUN_STARTED, None, {}),
+            ),
+        )
+        node_event = self.repository.append_if_running(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            expected_version=1,
+            event=RunEventDraft(
+                EventType.NODE_STARTED,
+                "postgres-node",
+                {"typed": True, "numeric": numeric},
+                event_key="execution-v1:postgres-node-started",
+            ),
+        )
+        succeeded_snapshot = replace(
+            created.run.snapshot,
+            status=RunStatus.SUCCEEDED,
+            updated_at="2026-07-11T12:00:01.456Z",
+            final_report={"stored": True, "numeric": numeric},
+            checkpoint={"numeric": numeric, "stage": "complete"},
+        )
+        succeeded = self.repository.compare_and_swap(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            expected_version=1,
+            snapshot=succeeded_snapshot,
+            events=(
+                RunEventDraft(
+                    EventType.RUN_COMPLETED,
+                    None,
+                    {"numeric": numeric},
+                ),
+            ),
+        )
+        replayed_cas = self.repository.compare_and_swap(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            expected_version=1,
+            snapshot=succeeded_snapshot,
+            events=(
+                RunEventDraft(
+                    EventType.RUN_COMPLETED,
+                    None,
+                    {"numeric": numeric},
+                ),
+            ),
+        )
+
+        restarted = self._repository()
+        restored = restarted.get(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+        )
+        events = restarted.get_events(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+        )
+        tail = restarted.get_events(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            after_sequence=node_event.sequence,
+        )
+
+        self.assertEqual(succeeded, replayed_cas)
+        self.assertEqual(succeeded, restored)
+        self.assertEqual("2026-07-11T12:00:00.123Z", restored.snapshot.created_at)
+        self.assertEqual("2026-07-11T12:00:01.456Z", restored.snapshot.updated_at)
+        self.assertEqual(list(range(1, 5)), [event.sequence for event in events])
+        self.assertEqual([EventType.RUN_COMPLETED], [event.event_type for event in tail])
+        numeric_values = (
+            restored.snapshot.request.metadata["marker"],
+            restored.snapshot.checkpoint["numeric"],
+            restored.snapshot.final_report["numeric"],
+            events[0].payload["numeric"],
+            events[2].payload["numeric"],
+            events[3].payload["numeric"],
+        )
+        for restored_numeric in numeric_values:
+            self.assertIs(type(restored_numeric["large_float"]), float)
+            self.assertIs(type(restored_numeric["unit_float"]), float)
+            self.assertEqual(1e20, restored_numeric["large_float"])
+            self.assertEqual(
+                -1.0,
+                math.copysign(1.0, restored_numeric["negative_zero"]),
+            )
+
+        rows = self._execute_sql(
+            f'SELECT checksum_sha256 FROM "{self.schema}".schema_migrations '
+            "WHERE version = 1"
+        )
+        checksum = rows[0][0]
+        self._execute_sql(
+            f'UPDATE "{self.schema}".schema_migrations '
+            "SET checksum_sha256 = %s WHERE version = 1",
+            ("0" * 64,),
+        )
+        with self.assertRaises(RunRepositoryConfigurationError):
+            restarted.migrate()
+        self._execute_sql(
+            f'UPDATE "{self.schema}".schema_migrations '
+            "SET checksum_sha256 = %s WHERE version = 1",
+            (checksum,),
+        )
+
+    def test_pg_run_02_concurrent_idempotent_create_has_one_winner(self) -> None:
+        workers = 20
+        barrier = Barrier(workers)
+        run_request = request(idempotency_key=f"concurrent-{uuid4().hex}")
+
+        def create(index: int):
+            repository = self._repository()
+            snapshot = started_snapshot(run_request, run_id=f"run-{index}-{uuid4().hex}")
+            barrier.wait(timeout=30)
+            return repository.create_or_get_started(snapshot, initial_events())
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(create, range(workers)))
+
+        self.assertEqual(1, sum(result.created for result in results))
+        self.assertEqual(1, len({result.run.snapshot.run_id for result in results}))
+        canonical = results[0].run.snapshot.run_id
+        events = self.repository.get_events(
+            canonical,
+            tenant_id=run_request.tenant_id,
+        )
+        self.assertEqual(
+            [EventType.RUN_CREATED, EventType.RUN_STARTED],
+            [event.event_type for event in events],
+        )
+
+        with self.assertRaises(RunRepositoryIdempotencyConflict):
+            self.repository.create_or_get_started(
+                started_snapshot(
+                    request(
+                        case_id="different-case",
+                        idempotency_key=run_request.idempotency_key,
+                    )
+                ),
+                initial_events(),
+            )
+
+    def test_pg_run_03_tenant_scope_and_not_found_isolation(self) -> None:
+        idempotency_key = f"tenant-scope-{uuid4().hex}"
+        request_a = request(
+            tenant_id="tenant-a",
+            idempotency_key=idempotency_key,
+        )
+        request_b = request(
+            tenant_id="tenant-b",
+            idempotency_key=idempotency_key,
+        )
+        run_a = self.repository.create_or_get_started(
+            started_snapshot(request_a),
+            initial_events(),
+        ).run
+        run_b = self.repository.create_or_get_started(
+            started_snapshot(request_b),
+            initial_events(),
+        ).run
+        self.assertNotEqual(run_a.snapshot.run_id, run_b.snapshot.run_id)
+
+        with self.assertRaises(RunRepositoryNotFound):
+            self.repository.get(run_a.snapshot.run_id, tenant_id="tenant-b")
+        with self.assertRaises(RunRepositoryNotFound):
+            self.repository.get_events(run_a.snapshot.run_id, tenant_id="tenant-b")
+        with self.assertRaises(RunRepositoryNotFound):
+            self.repository.assert_running(
+                run_a.snapshot.run_id,
+                tenant_id="tenant-b",
+                expected_version=1,
+            )
+        with self.assertRaises(RunRepositoryNotFound):
+            self.repository.append_if_running(
+                run_a.snapshot.run_id,
+                tenant_id="tenant-b",
+                expected_version=1,
+                event=RunEventDraft(
+                    EventType.NODE_STARTED,
+                    "hidden",
+                    {},
+                    event_key="execution-v1:hidden",
+                ),
+            )
+        with self.assertRaises(RunRepositoryNotFound):
+            self.repository.compare_and_swap(
+                run_a.snapshot.run_id,
+                tenant_id="tenant-b",
+                expected_version=1,
+                snapshot=replace(
+                    run_a.snapshot,
+                    status=RunStatus.CANCELLED,
+                    updated_at="2026-07-11T12:00:01.000Z",
+                ),
+                events=(RunEventDraft(EventType.RUN_CANCELLED, None, {}),),
+            )
+
+        restored_a = self.repository.get(run_a.snapshot.run_id, tenant_id="tenant-a")
+        self.assertEqual(RunStatus.RUNNING, restored_a.snapshot.status)
+        self.assertEqual(1, restored_a.version)
+
+    def test_pg_run_04_concurrent_events_are_contiguous_across_instances(self) -> None:
+        run_request = request(idempotency_key=f"events-{uuid4().hex}")
+        created = self.repository.create_or_get_started(
+            started_snapshot(run_request),
+            initial_events(),
+        )
+        workers = 20
+        barrier = Barrier(workers)
+
+        def append(index: int) -> None:
+            if index < workers:
+                barrier.wait(timeout=30)
+            self._repository().append_if_running(
+                created.run.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+                expected_version=1,
+                event=RunEventDraft(
+                    EventType.NODE_STARTED,
+                    f"node-{index}",
+                    {"index": index},
+                    event_key=f"execution-v1:node-{index}",
+                ),
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(append, range(100)))
+
+        events = self.repository.get_events(
+            created.run.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+        )
+        self.assertEqual(list(range(1, 103)), [event.sequence for event in events])
+        self.assertEqual(set(range(100)), {event.payload["index"] for event in events[2:]})
+        self.assertEqual(
+            1,
+            self.repository.get(
+                created.run.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+            ).version,
+        )
+
+    def test_pg_run_05_cas_has_one_winner_and_fences_old_version(self) -> None:
+        run_request = request(idempotency_key=f"cas-{uuid4().hex}")
+        created = self.repository.create_or_get_started(
+            started_snapshot(run_request),
+            initial_events(),
+        ).run
+        stream_event = RunEventDraft(
+            EventType.TOOL_CALLED,
+            "tool-a",
+            {"call_id": "call-1"},
+            event_key="execution-v1:call-1",
+        )
+        first_event = self.repository.append_if_running(
+            created.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            expected_version=1,
+            event=stream_event,
+        )
+        barrier = Barrier(2)
+
+        def cancel():
+            barrier.wait(timeout=30)
+            return self._repository().compare_and_swap(
+                created.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+                expected_version=1,
+                snapshot=replace(
+                    created.snapshot,
+                    status=RunStatus.CANCELLED,
+                    updated_at="2026-07-11T12:00:01.000Z",
+                ),
+                events=(RunEventDraft(EventType.RUN_CANCELLED, None, {}),),
+            )
+
+        def fail():
+            barrier.wait(timeout=30)
+            return self._repository().compare_and_swap(
+                created.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+                expected_version=1,
+                snapshot=replace(
+                    created.snapshot,
+                    status=RunStatus.FAILED,
+                    updated_at="2026-07-11T12:00:02.000Z",
+                    error={"code": "FAILED", "retryable": False},
+                ),
+                events=(RunEventDraft(EventType.RUN_FAILED, None, {}),),
+            )
+
+        outcomes = []
+        errors = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = (pool.submit(cancel), pool.submit(fail))
+            for future in futures:
+                try:
+                    outcomes.append(future.result(timeout=30))
+                except BaseException as exc:
+                    errors.append(exc)
+
+        self.assertEqual(1, len(outcomes))
+        self.assertEqual(1, len(errors))
+        self.assertIsInstance(errors[0], RunRepositoryVersionConflict)
+        final = self.repository.get(
+            created.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+        )
+        self.assertEqual(2, final.version)
+        replayed_event = self.repository.append_if_running(
+            created.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            expected_version=1,
+            event=stream_event,
+        )
+        self.assertEqual(first_event, replayed_event)
+        with self.assertRaises(ExecutionSuperseded):
+            self.repository.append_if_running(
+                created.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+                expected_version=1,
+                event=RunEventDraft(
+                    EventType.TOOL_RESULT,
+                    "tool-a",
+                    {"call_id": "call-2"},
+                    event_key="execution-v1:call-2",
+                ),
+            )
+        events = self.repository.get_events(
+            created.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+        )
+        terminal = [
+            event
+            for event in events
+            if event.event_type in {EventType.RUN_CANCELLED, EventType.RUN_FAILED}
+        ]
+        self.assertEqual(1, len(terminal))
+
+        history_request = request(
+            idempotency_key=f"cas-history-{uuid4().hex}"
+        )
+        history_created = self.repository.create_or_get_started(
+            started_snapshot(history_request),
+            initial_events(),
+        ).run
+        waiting_snapshot = replace(
+            history_created.snapshot,
+            status=RunStatus.WAITING_APPROVAL,
+            updated_at="2026-07-11T12:00:01.000Z",
+            checkpoint={"stage": "approval"},
+            approval_id="approval-history",
+        )
+        waiting_events = (
+            RunEventDraft(
+                EventType.APPROVAL_REQUESTED,
+                None,
+                {"approval_id": "approval-history"},
+            ),
+        )
+        waiting = self.repository.compare_and_swap(
+            history_created.snapshot.run_id,
+            tenant_id=history_request.tenant_id,
+            expected_version=history_created.version,
+            snapshot=waiting_snapshot,
+            events=waiting_events,
+        )
+        resumed_snapshot = replace(
+            waiting.snapshot,
+            status=RunStatus.RUNNING,
+            updated_at="2026-07-11T12:00:02.000Z",
+            checkpoint={"stage": "resumed"},
+            approval_id=None,
+        )
+        resumed = self.repository.compare_and_swap(
+            history_created.snapshot.run_id,
+            tenant_id=history_request.tenant_id,
+            expected_version=waiting.version,
+            snapshot=resumed_snapshot,
+        )
+        replayed_waiting = self._repository().compare_and_swap(
+            history_created.snapshot.run_id,
+            tenant_id=history_request.tenant_id,
+            expected_version=history_created.version,
+            snapshot=waiting_snapshot,
+            events=waiting_events,
+        )
+
+        self.assertEqual(waiting, replayed_waiting)
+        self.assertEqual(
+            resumed,
+            self.repository.get(
+                history_created.snapshot.run_id,
+                tenant_id=history_request.tenant_id,
+            ),
+        )
+        history_events = self.repository.get_events(
+            history_created.snapshot.run_id,
+            tenant_id=history_request.tenant_id,
+        )
+        self.assertEqual(
+            1,
+            sum(
+                event.event_type is EventType.APPROVAL_REQUESTED
+                for event in history_events
+            ),
+        )
+        mutation_rows = self._execute_sql(
+            f'SELECT target_version FROM "{self.schema}".run_mutations '
+            "WHERE tenant_id = %s AND run_id = %s ORDER BY target_version",
+            (history_request.tenant_id, history_created.snapshot.run_id),
+        )
+        self.assertEqual([(2,), (3,)], mutation_rows)
+
+    def test_pg_run_06_create_transaction_rolls_back_claim_and_events(self) -> None:
+        self._install_reject_trigger(event_type=EventType.RUN_STARTED)
+        run_request = request(idempotency_key=f"create-rollback-{uuid4().hex}")
+        snapshot = started_snapshot(run_request)
+        try:
+            with self.assertRaises(RunRepositoryIntegrityError):
+                self.repository.create_or_get_started(snapshot, initial_events())
+
+            rows = self._execute_sql(
+                f'SELECT count(*) FROM "{self.schema}".runs '
+                "WHERE tenant_id = %s AND idempotency_key = %s",
+                (run_request.tenant_id, run_request.idempotency_key),
+            )
+            self.assertEqual(0, rows[0][0])
+        finally:
+            self._drop_reject_trigger()
+        retried = self.repository.create_or_get_started(snapshot, initial_events())
+        self.assertTrue(retried.created)
+
+    def test_pg_run_07_terminal_event_failure_rolls_back_version_and_state(self) -> None:
+        run_request = request(idempotency_key=f"terminal-rollback-{uuid4().hex}")
+        created = self.repository.create_or_get_started(
+            started_snapshot(run_request),
+            initial_events(),
+        ).run
+        self._install_reject_trigger(event_type=EventType.RUN_CANCELLED)
+        cancelled_snapshot = replace(
+            created.snapshot,
+            status=RunStatus.CANCELLED,
+            updated_at="2026-07-11T12:00:01.000Z",
+        )
+        try:
+            with self.assertRaises(RunRepositoryIntegrityError):
+                self.repository.compare_and_swap(
+                    created.snapshot.run_id,
+                    tenant_id=run_request.tenant_id,
+                    expected_version=1,
+                    snapshot=cancelled_snapshot,
+                    events=(RunEventDraft(EventType.RUN_CANCELLED, None, {}),),
+                )
+
+            restored = self.repository.get(
+                created.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+            )
+            self.assertEqual(RunStatus.RUNNING, restored.snapshot.status)
+            self.assertEqual(1, restored.version)
+            self.assertEqual(
+                2,
+                len(
+                    self.repository.get_events(
+                        created.snapshot.run_id,
+                        tenant_id=run_request.tenant_id,
+                    )
+                ),
+            )
+        finally:
+            self._drop_reject_trigger()
+        cancelled = self.repository.compare_and_swap(
+            created.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            expected_version=1,
+            snapshot=cancelled_snapshot,
+            events=(RunEventDraft(EventType.RUN_CANCELLED, None, {}),),
+        )
+        self.assertEqual(RunStatus.CANCELLED, cancelled.snapshot.status)
+
+    def test_pg_run_08_transient_failures_reconcile_or_roll_back(self) -> None:
+        self._execute_sql(
+            f"""
+            CREATE OR REPLACE FUNCTION "{self.schema}".block_event()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.payload ->> 'block_backend' = 'true' THEN
+                    PERFORM pg_sleep(30);
+                END IF;
+                RETURN NEW;
+            END
+            $$
+            """
+        )
+        self._execute_sql(
+            f"""
+            CREATE TRIGGER block_event
+            BEFORE INSERT ON "{self.schema}".run_events
+            FOR EACH ROW EXECUTE FUNCTION "{self.schema}".block_event()
+            """
+        )
+        run_request = request(idempotency_key=f"terminate-{uuid4().hex}")
+        created = self.repository.create_or_get_started(
+            started_snapshot(run_request),
+            initial_events(),
+        ).run
+        application_name = f"terminate-{uuid4().hex[:20]}"
+        repository = self._repository(application_name=application_name)
+        event = RunEventDraft(
+            EventType.NODE_STARTED,
+            "blocked-node",
+            {"block_backend": True},
+            event_key="execution-v1:blocked-node",
+        )
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    repository.append_if_running,
+                    created.snapshot.run_id,
+                    tenant_id=run_request.tenant_id,
+                    expected_version=1,
+                    event=event,
+                )
+                deadline = time.monotonic() + 20
+                backend_pid = None
+                while time.monotonic() < deadline and backend_pid is None:
+                    rows = self._execute_sql(
+                        """
+                        SELECT pid
+                        FROM pg_stat_activity
+                        WHERE application_name = %s
+                          AND state = 'active'
+                          AND query LIKE '%%INSERT INTO%%run_events%%'
+                        """,
+                        (application_name,),
+                    )
+                    if rows:
+                        backend_pid = rows[0][0]
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(
+                    backend_pid,
+                    "blocked repository backend not found",
+                )
+                terminated = self._execute_sql(
+                    "SELECT pg_terminate_backend(%s::integer, %s::bigint)",
+                    (backend_pid, 5_000),
+                )
+                self.assertEqual([(True,)], terminated)
+                with self.assertRaises(RunRepositoryUnavailable) as raised:
+                    future.result(timeout=30)
+
+            self.assertTrue(raised.exception.retryable)
+            self.assertNotIn("postgresql://", str(raised.exception))
+            restored = self.repository.get(
+                created.snapshot.run_id,
+                tenant_id=run_request.tenant_id,
+            )
+            self.assertEqual(1, restored.version)
+            self.assertEqual(
+                2,
+                len(
+                    self.repository.get_events(
+                        created.snapshot.run_id,
+                        tenant_id=run_request.tenant_id,
+                    )
+                ),
+            )
+        finally:
+            self._execute_sql(
+                f'DROP TRIGGER IF EXISTS block_event ON "{self.schema}".run_events'
+            )
+            self._execute_sql(
+                f'DROP FUNCTION IF EXISTS "{self.schema}".block_event()'
+            )
+        retried = self.repository.append_if_running(
+            created.snapshot.run_id,
+            tenant_id=run_request.tenant_id,
+            expected_version=1,
+            event=event,
+        )
+        self.assertEqual(3, retried.sequence)
+
+        with self.subTest(failure="create commit acknowledgement loss"):
+            create_fault = _CommitAcknowledgementLoss()
+            create_repository = self._repository(
+                connection_factory=_commit_acknowledgement_loss_factory(
+                    create_fault
+                )
+            )
+            create_request = request(
+                idempotency_key=f"ack-create-{uuid4().hex}"
+            )
+            create_snapshot = started_snapshot(create_request)
+            create_result = create_repository.create_or_get_started(
+                create_snapshot,
+                initial_events(),
+            )
+            self.assertEqual(1, create_fault.raised_count)
+            self.assertTrue(create_result.created)
+            self.assertEqual(
+                create_result.run,
+                self.repository.get(
+                    create_snapshot.run_id,
+                    tenant_id=create_request.tenant_id,
+                ),
+            )
+            create_events = self.repository.get_events(
+                create_snapshot.run_id,
+                tenant_id=create_request.tenant_id,
+            )
+            self.assertEqual([1, 2], [item.sequence for item in create_events])
+            duplicate = self.repository.create_or_get_started(
+                create_snapshot,
+                initial_events(),
+            )
+            self.assertFalse(duplicate.created)
+            self.assertEqual(create_result.run, duplicate.run)
+
+        with self.subTest(failure="append commit acknowledgement loss"):
+            append_request = request(
+                idempotency_key=f"ack-append-{uuid4().hex}"
+            )
+            append_created = self.repository.create_or_get_started(
+                started_snapshot(append_request),
+                initial_events(),
+            ).run
+            append_fault = _CommitAcknowledgementLoss()
+            append_repository = self._repository(
+                connection_factory=_commit_acknowledgement_loss_factory(
+                    append_fault
+                )
+            )
+            append_draft = RunEventDraft(
+                EventType.NODE_STARTED,
+                "ack-node",
+                {"step": 1},
+                event_key="execution-v1:ack-node",
+            )
+            appended = append_repository.append_if_running(
+                append_created.snapshot.run_id,
+                tenant_id=append_request.tenant_id,
+                expected_version=append_created.version,
+                event=append_draft,
+            )
+            replayed_append = append_repository.append_if_running(
+                append_created.snapshot.run_id,
+                tenant_id=append_request.tenant_id,
+                expected_version=append_created.version,
+                event=append_draft,
+            )
+            self.assertEqual(1, append_fault.raised_count)
+            self.assertEqual(appended, replayed_append)
+            self.assertEqual(3, appended.sequence)
+            append_rows = self._execute_sql(
+                f'SELECT count(*) FROM "{self.schema}".run_events '
+                "WHERE tenant_id = %s AND run_id = %s AND event_key = %s",
+                (
+                    append_request.tenant_id,
+                    append_created.snapshot.run_id,
+                    append_draft.event_key,
+                ),
+            )
+            self.assertEqual(1, append_rows[0][0])
+
+        with self.subTest(failure="CAS commit acknowledgement loss"):
+            cas_request = request(idempotency_key=f"ack-cas-{uuid4().hex}")
+            cas_created = self.repository.create_or_get_started(
+                started_snapshot(cas_request),
+                initial_events(),
+            ).run
+            cas_target = replace(
+                cas_created.snapshot,
+                status=RunStatus.CANCELLED,
+                updated_at="2026-07-11T12:00:01.000Z",
+            )
+            cas_events = (RunEventDraft(EventType.RUN_CANCELLED, None, {}),)
+            cas_fault = _CommitAcknowledgementLoss()
+            cas_repository = self._repository(
+                connection_factory=_commit_acknowledgement_loss_factory(cas_fault)
+            )
+            committed = cas_repository.compare_and_swap(
+                cas_created.snapshot.run_id,
+                tenant_id=cas_request.tenant_id,
+                expected_version=cas_created.version,
+                snapshot=cas_target,
+                events=cas_events,
+            )
+            replayed_cas = self.repository.compare_and_swap(
+                cas_created.snapshot.run_id,
+                tenant_id=cas_request.tenant_id,
+                expected_version=cas_created.version,
+                snapshot=cas_target,
+                events=cas_events,
+            )
+            self.assertEqual(1, cas_fault.raised_count)
+            self.assertEqual(committed, replayed_cas)
+            self.assertEqual(2, committed.version)
+            terminal_events = self.repository.get_events(
+                cas_created.snapshot.run_id,
+                tenant_id=cas_request.tenant_id,
+            )
+            self.assertEqual(
+                1,
+                sum(
+                    item.event_type is EventType.RUN_CANCELLED
+                    for item in terminal_events
+                ),
+            )
+            mutation_rows = self._execute_sql(
+                f'SELECT count(*) FROM "{self.schema}".run_mutations '
+                "WHERE tenant_id = %s AND run_id = %s",
+                (cas_request.tenant_id, cas_created.snapshot.run_id),
+            )
+            self.assertEqual(1, mutation_rows[0][0])
+
+        with self.subTest(
+            failure="CAS acknowledgement loss after later state progression"
+        ):
+            progressed_request = request(
+                idempotency_key=f"ack-cas-progressed-{uuid4().hex}"
+            )
+            progressed_created = self.repository.create_or_get_started(
+                started_snapshot(progressed_request),
+                initial_events(),
+            ).run
+            failed_target = replace(
+                progressed_created.snapshot,
+                status=RunStatus.FAILED,
+                updated_at="2026-07-11T12:00:01.000Z",
+                checkpoint={"recoverable": True, "stage": "failed"},
+                error={"code": "TRANSIENT", "retryable": True},
+            )
+            failed_events = (RunEventDraft(EventType.RUN_FAILED, None, {}),)
+            progressed_fault = _CommitAcknowledgementLoss(
+                pause_after_commit=True
+            )
+            progressed_repository = self._repository(
+                connection_factory=_commit_acknowledgement_loss_factory(
+                    progressed_fault
+                )
+            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    progressed_repository.compare_and_swap,
+                    progressed_created.snapshot.run_id,
+                    tenant_id=progressed_request.tenant_id,
+                    expected_version=progressed_created.version,
+                    snapshot=failed_target,
+                    events=failed_events,
+                )
+                self.assertTrue(
+                    progressed_fault.committed.wait(timeout=30),
+                    "faulted CAS did not commit",
+                )
+                try:
+                    resumed_target = replace(
+                        failed_target,
+                        status=RunStatus.RUNNING,
+                        updated_at="2026-07-11T12:00:02.000Z",
+                        checkpoint={"stage": "resumed"},
+                        error=None,
+                    )
+                    resumed = self.repository.compare_and_swap(
+                        progressed_created.snapshot.run_id,
+                        tenant_id=progressed_request.tenant_id,
+                        expected_version=2,
+                        snapshot=resumed_target,
+                    )
+                finally:
+                    progressed_fault.release.set()
+                reconciled_failed = future.result(timeout=30)
+
+            self.assertEqual(1, progressed_fault.raised_count)
+            self.assertEqual(2, reconciled_failed.version)
+            self.assertEqual(failed_target, reconciled_failed.snapshot)
+            self.assertEqual(
+                resumed,
+                self.repository.get(
+                    progressed_created.snapshot.run_id,
+                    tenant_id=progressed_request.tenant_id,
+                ),
+            )
+            progressed_events = self.repository.get_events(
+                progressed_created.snapshot.run_id,
+                tenant_id=progressed_request.tenant_id,
+            )
+            self.assertEqual(
+                1,
+                sum(
+                    item.event_type is EventType.RUN_FAILED
+                    for item in progressed_events
+                ),
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

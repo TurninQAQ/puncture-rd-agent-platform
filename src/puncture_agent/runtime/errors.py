@@ -48,6 +48,31 @@ class RunRepositoryTransitionError(RunRepositoryError):
         super().__init__("CONFLICT", message)
 
 
+class RunRepositoryUnavailable(RunRepositoryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "REPOSITORY_UNAVAILABLE",
+            "run repository is temporarily unavailable",
+            retryable=True,
+        )
+
+
+class RunRepositoryIntegrityError(RunRepositoryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "REPOSITORY_INTEGRITY_ERROR",
+            "run repository integrity validation failed",
+        )
+
+
+class RunRepositoryConfigurationError(RunRepositoryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "REPOSITORY_CONFIGURATION_ERROR",
+            "run repository is not configured correctly",
+        )
+
+
 class ExecutionSuperseded(RuntimeError):
     """The execution version no longer owns the Run and must stop publishing."""
 
@@ -58,7 +83,10 @@ __all__ = [
     "RunRepositoryEventConflict",
     "RunRepositoryIdempotencyConflict",
     "RunRepositoryNotFound",
+    "RunRepositoryConfigurationError",
+    "RunRepositoryIntegrityError",
     "RunRepositoryTransitionError",
+    "RunRepositoryUnavailable",
     "RunRepositoryVersionConflict",
     "RunServiceError",
 ]

@@ -187,6 +187,14 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
             events=(RunEventDraft(EventType.RUN_CANCELLED, None, {}),),
         )
         self.assertEqual(2, cancelled.version)
+        replayed_cancel = repository.compare_and_swap(
+            "run-001",
+            tenant_id="tenant-a",
+            expected_version=1,
+            snapshot=cancelled_snapshot,
+            events=(RunEventDraft(EventType.RUN_CANCELLED, None, {}),),
+        )
+        self.assertEqual(cancelled, replayed_cancel)
 
         with self.assertRaises(ExecutionSuperseded):
             repository.append_if_running(
@@ -235,6 +243,81 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
         self.assertEqual(list(range(1, 5)), [event.sequence for event in events])
         self.assertEqual(EventType.RUN_CANCELLED, events[-1].event_type)
 
+    def test_cas_replay_uses_mutation_history_after_later_progress(self) -> None:
+        repository = InMemoryRunRepository(clock=lambda: FIXED_TIME)
+        created = repository.create_or_get_started(
+            started_snapshot(request()),
+            initial_events(),
+        ).run
+        waiting_snapshot = replace(
+            created.snapshot,
+            status=RunStatus.WAITING_APPROVAL,
+            updated_at="2026-07-11T12:00:01.000Z",
+            checkpoint={"stage": "approval"},
+            approval_id="approval-1",
+        )
+        waiting_events = (
+            RunEventDraft(
+                EventType.APPROVAL_REQUESTED,
+                None,
+                {"approval_id": "approval-1"},
+            ),
+        )
+        waiting = repository.compare_and_swap(
+            created.snapshot.run_id,
+            tenant_id=created.snapshot.request.tenant_id,
+            expected_version=created.version,
+            snapshot=waiting_snapshot,
+            events=waiting_events,
+        )
+        resumed_snapshot = replace(
+            waiting.snapshot,
+            status=RunStatus.RUNNING,
+            updated_at="2026-07-11T12:00:02.000Z",
+            checkpoint={"stage": "resumed"},
+            approval_id=None,
+        )
+        resumed = repository.compare_and_swap(
+            created.snapshot.run_id,
+            tenant_id=created.snapshot.request.tenant_id,
+            expected_version=waiting.version,
+            snapshot=resumed_snapshot,
+        )
+
+        replayed_waiting = repository.compare_and_swap(
+            created.snapshot.run_id,
+            tenant_id=created.snapshot.request.tenant_id,
+            expected_version=created.version,
+            snapshot=waiting_snapshot,
+            events=waiting_events,
+        )
+        replayed_resume = repository.compare_and_swap(
+            created.snapshot.run_id,
+            tenant_id=created.snapshot.request.tenant_id,
+            expected_version=waiting.version,
+            snapshot=resumed_snapshot,
+        )
+
+        self.assertEqual(waiting, replayed_waiting)
+        self.assertEqual(resumed, replayed_resume)
+        self.assertEqual(
+            resumed,
+            repository.get(
+                created.snapshot.run_id,
+                tenant_id=created.snapshot.request.tenant_id,
+            ),
+        )
+        self.assertEqual(
+            1,
+            sum(
+                event.event_type is EventType.APPROVAL_REQUESTED
+                for event in repository.get_events(
+                    created.snapshot.run_id,
+                    tenant_id=created.snapshot.request.tenant_id,
+                )
+            ),
+        )
+
     def test_state_events_cannot_bypass_atomic_transition(self) -> None:
         repository = InMemoryRunRepository(clock=lambda: FIXED_TIME)
         created = repository.create_or_get_started(
@@ -272,6 +355,41 @@ class InMemoryRunRepositoryTests(unittest.TestCase):
             )
         with self.assertRaises(RunRepositoryNotFound):
             repository.get("run-001", tenant_id="tenant-a")
+
+        for invalid_timestamp in (
+            "now",
+            "2026-07-11T12:00:00Z",
+            "2026-07-11T12:00:00.000000Z",
+            "2026-07-11T12:00:00.000+00:00",
+            "2026-02-30T12:00:00.000Z",
+        ):
+            with self.subTest(invalid_timestamp=invalid_timestamp):
+                with self.assertRaises(ValueError):
+                    repository.create_or_get_started(
+                        replace(
+                            started_snapshot(request()),
+                            created_at=invalid_timestamp,
+                            updated_at=invalid_timestamp,
+                        ),
+                        initial_events(),
+                    )
+        with self.assertRaisesRegex(ValueError, "precede"):
+            repository.create_or_get_started(
+                replace(
+                    started_snapshot(request()),
+                    created_at="2026-07-11T12:00:01.000Z",
+                    updated_at="2026-07-11T12:00:00.000Z",
+                ),
+                initial_events(),
+            )
+        invalid_clock_repository = InMemoryRunRepository(clock=lambda: "now")
+        with self.assertRaises(ValueError):
+            invalid_clock_repository.create_or_get_started(
+                started_snapshot(request()),
+                initial_events(),
+            )
+        with self.assertRaises(RunRepositoryNotFound):
+            invalid_clock_repository.get("run-001", tenant_id="tenant-a")
 
         with self.assertRaises(RuntimeJsonBoundaryError):
             RunEventDraft(EventType.NODE_STARTED, "bad-key", {1: "integer-key"})

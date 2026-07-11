@@ -72,6 +72,21 @@ jobs:
           suite = unittest.defaultTestLoader.loadTestsFromName('tests.api.test_http_contracts.PydanticHttpContractTests');
           result = unittest.TextTestRunner(verbosity=2).run(suite);
           sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)"
+      - name: PostgreSQL Run repository (skips forbidden)
+        if: ${{ always() }}
+        timeout-minutes: 5
+        env:
+          PUNCTURE_TEST_POSTGRES_DSN: postgresql://puncture_test:puncture_test@127.0.0.1:5432/puncture_agent_test?sslmode=disable
+          PYTHONPATH: .:src
+        run: >-
+          python -c
+          "import sys, unittest;
+          suite = unittest.defaultTestLoader.loadTestsFromName('tests.api.test_postgres_run_repository.PostgresRunRepositoryTests');
+          expected = 8;
+          loaded = suite.countTestCases();
+          result = unittest.TextTestRunner(verbosity=2).run(suite);
+          ok = loaded == expected and result.testsRun == expected and result.wasSuccessful() and not result.skipped;
+          sys.exit(0 if ok else 1)"
       - name: PostgreSQL/LangGraph integration (skips forbidden)
         if: ${{ always() }}
         env:

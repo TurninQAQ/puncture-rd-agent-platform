@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
+import re
 from threading import RLock
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
@@ -22,12 +23,31 @@ from .json_boundary import copy_json_mapping, copy_json_value
 from .models import EventType, RunEvent, RunRequest, RunSnapshot, RunStatus
 
 
+_UTC_MILLISECOND_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
+)
+
+
 def _utc_now() -> str:
     return (
         datetime.now(timezone.utc)
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z")
     )
+
+
+def _canonical_utc_millisecond(value: str, *, field_name: str) -> str:
+    if not isinstance(value, str) or not _UTC_MILLISECOND_TIMESTAMP.fullmatch(value):
+        raise ValueError(
+            f"{field_name} must use canonical UTC millisecond format"
+        )
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be a valid canonical UTC timestamp"
+        ) from exc
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,12 +120,19 @@ class _StoredEventClaim:
 
 
 @dataclass(slots=True)
+class _StoredMutationClaim:
+    snapshot_fingerprint: str
+    transition_fingerprint: str
+
+
+@dataclass(slots=True)
 class _StoredRun:
     snapshot: RunSnapshot
     request_fingerprint: str
     version: int
     events: list[RunEvent]
     event_claims: dict[str, _StoredEventClaim]
+    mutation_claims: dict[int, _StoredMutationClaim]
 
 
 _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
@@ -183,6 +210,40 @@ def _event_fingerprint(event: RunEventDraft, execution_version: int) -> str:
         "event_type": event.event_type.value,
         "node_name": event.node_name,
         "payload": event.payload,
+    }
+    return sha256(_canonical_json(document).encode("utf-8")).hexdigest()
+
+
+def _snapshot_fingerprint(snapshot: RunSnapshot) -> str:
+    document = {
+        "run_id": snapshot.run_id,
+        "request": _request_document(snapshot.request),
+        "status": snapshot.status.value,
+        "trace_id": snapshot.trace_id,
+        "created_at": snapshot.created_at,
+        "updated_at": snapshot.updated_at,
+        "final_report": snapshot.final_report,
+        "checkpoint": snapshot.checkpoint,
+        "approval_id": snapshot.approval_id,
+        "error": snapshot.error,
+    }
+    return sha256(_canonical_json(document).encode("utf-8")).hexdigest()
+
+
+def _transition_fingerprint(
+    events: tuple[RunEventDraft, ...],
+    expected_version: int,
+) -> str:
+    document = {
+        "expected_version": expected_version,
+        "events": [
+            {
+                "event_type": event.event_type.value,
+                "node_name": event.node_name,
+                "payload": event.payload,
+            }
+            for event in events
+        ],
     }
     return sha256(_canonical_json(document).encode("utf-8")).hexdigest()
 
@@ -288,6 +349,7 @@ class InMemoryRunRepository:
                 version=1,
                 events=[],
                 event_claims={},
+                mutation_claims={},
             )
             for event in normalized_events:
                 self._append_event_locked(stored, event)
@@ -388,28 +450,50 @@ class InMemoryRunRepository:
         self._validate_version(expected_version)
         normalized_snapshot = self._copy_snapshot(snapshot)
         normalized_events = tuple(self._copy_event(event) for event in events)
+        self._validate_snapshot_state(normalized_snapshot)
+        if any(event.event_key is not None for event in normalized_events):
+            raise RunRepositoryTransitionError(
+                "lifecycle transition events must not define event_key"
+            )
+        target_fingerprint = _snapshot_fingerprint(normalized_snapshot)
+        transition_fingerprint = _transition_fingerprint(
+            normalized_events,
+            expected_version,
+        )
         with self._lock:
             stored = self._require(run_id, tenant_id)
             if stored.version != expected_version:
+                claim = stored.mutation_claims.get(expected_version + 1)
+                if claim is not None and (
+                    claim.snapshot_fingerprint == target_fingerprint
+                    and claim.transition_fingerprint == transition_fingerprint
+                ):
+                    return VersionedRun(
+                        snapshot=deepcopy(normalized_snapshot),
+                        version=expected_version + 1,
+                    )
                 raise RunRepositoryVersionConflict()
             self._validate_replacement(stored.snapshot, normalized_snapshot)
             self._validate_transition_events(normalized_snapshot, normalized_events)
-            if any(event.event_key is not None for event in normalized_events):
-                raise RunRepositoryTransitionError(
-                    "lifecycle transition events must not define event_key"
-                )
             candidate = _StoredRun(
                 snapshot=normalized_snapshot,
                 request_fingerprint=stored.request_fingerprint,
                 version=stored.version + 1,
                 events=deepcopy(stored.events),
                 event_claims=deepcopy(stored.event_claims),
+                mutation_claims=deepcopy(stored.mutation_claims),
             )
             for event in normalized_events:
                 self._append_event_locked(candidate, event)
+            candidate.mutation_claims[candidate.version] = _StoredMutationClaim(
+                snapshot_fingerprint=target_fingerprint,
+                transition_fingerprint=transition_fingerprint,
+            )
             stored.snapshot = candidate.snapshot
             stored.version = candidate.version
             stored.events = candidate.events
+            stored.event_claims = candidate.event_claims
+            stored.mutation_claims = candidate.mutation_claims
             return self._view(stored)
 
     def _require(self, run_id: str, tenant_id: str) -> _StoredRun:
@@ -428,7 +512,10 @@ class InMemoryRunRepository:
             sequence=len(stored.events) + 1,
             event_type=draft.event_type,
             node_name=draft.node_name,
-            timestamp=self._clock(),
+            timestamp=_canonical_utc_millisecond(
+                self._clock(),
+                field_name="event timestamp",
+            ),
             payload=copy_json_mapping(draft.payload),
             trace_id=stored.snapshot.trace_id,
         )
@@ -539,9 +626,27 @@ class InMemoryRunRepository:
             snapshot.request,
             metadata=copy_json_mapping(snapshot.request.metadata),
         )
+        created_at = _canonical_utc_millisecond(
+            snapshot.created_at,
+            field_name="created_at",
+        )
+        updated_at = _canonical_utc_millisecond(
+            snapshot.updated_at,
+            field_name="updated_at",
+        )
+        if datetime.strptime(
+            updated_at,
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+        ) < datetime.strptime(
+            created_at,
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+        ):
+            raise ValueError("updated_at must not precede created_at")
         normalized = replace(
             snapshot,
             request=request,
+            created_at=created_at,
+            updated_at=updated_at,
             final_report=copy_json_mapping(snapshot.final_report),
             checkpoint=copy_json_mapping(snapshot.checkpoint),
             error=(
