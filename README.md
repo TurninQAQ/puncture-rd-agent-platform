@@ -54,6 +54,8 @@ python3 examples/local_mcp_demo.py
 
 [commit `9958756` 的有界 SSE 事件回放](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29157341457) 在同一事件路径增加 JSON/SSE 协商、严格 `Last-Event-ID`/query cursor、PostgreSQL high-water keyset page、Bearer 重验证、heartbeat、终态 tail、硬 deadline、断连清理和 per-process 全局/tenant 配额。Python 3.10/3.11/3.12 均通过完整测试及精确 8 项 SSE 零跳过门，10,000 事件有界回放、流中 token 撤销、response-start/body-send 失败和隐私指标均已覆盖；restart、process-kill 与 benchmark 继续全绿。该节点仍不代表 worker reclaim、API SIGTERM 恢复、集群级 SSE 配额或生产代理/数据库性能基线已经完成。
 
+[commit `d306038` 的 durable API execution recovery](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29159768707) 新增 PostgreSQL v2 execution job/intent、generation/owner/DB-clock lease、后台 worker heartbeat/reclaim、claim-fenced event/CAS、FastAPI lifespan shutdown 和双进程 SIGTERM 恢复。Python 3.10/3.11/3.12 完整矩阵及精确 14 项 transport、9 项 worker、8 项 Run Repository、4 项 execution-job、1 项 composition 门全部成功；独立 PostgreSQL 16 recovery job 证明进程 A 超过 grace 后不提前释放租约，进程 B 以 generation 2 恢复同一 Run，稳定 `call_id` 的测试端口副作用总计 1 次、事件连续且只有一个 RUN_COMPLETED。公司算法、公司侧幂等/outbox、GPU callback 取消和宿主机/网络/WAL 故障仍是外部接入与现场验证边界。
+
 ## Reading order
 
 1. `docs/architecture.md`

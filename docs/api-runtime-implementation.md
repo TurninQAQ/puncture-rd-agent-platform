@@ -345,6 +345,19 @@ Remote evidence on 2026-07-11:
   low-cardinality privacy metrics;
 - PostgreSQL restart recovery, real process-kill replay protection and the
   hosted checkpoint benchmark also remained successful.
+- commit `d30603850b18ccff46709de799a1fca6eae08883` completed
+  [GitHub Actions run 29159768707](https://github.com/TurninQAQ/puncture-rd-agent-platform/actions/runs/29159768707)
+  successfully;
+- each Python 3.10, 3.11 and 3.12 matrix job passed the complete 653-test suite
+  plus exact zero-skip gates for fourteen FastAPI/body tests, nine worker
+  tests, eight PostgreSQL Run Repository tests, four PostgreSQL execution-job
+  tests and one FastAPI/PostgreSQL composition test;
+- the independent PostgreSQL 16 API SIGTERM job exported evidence for the same
+  Run moving from generation 1 to 2, five contiguous events, one terminal
+  `RUN_COMPLETED`, one stable-call side effect and stopped workers in both
+  processes;
+- PostgreSQL restart, graph process-kill replay protection and checkpoint
+  benchmark jobs also remained green.
 
 ## Still not implemented
 
