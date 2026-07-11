@@ -139,7 +139,10 @@ in-memory saver for a production process that must survive restart.
 - This boundary protects completed graph nodes. It cannot by itself make an
   external side effect exactly-once if a process dies after the tool returns but
   before the following graph checkpoint; the tool service needs a persistent
-  idempotency ledger for that crash window.
+  idempotency ledger for that crash window. `SQLiteToolReplayLedger` now records
+  a terminal MCP response before returning it, and the checked-in bridge restart
+  test proves that losing subsequent AgentState mutations does not call the
+  handler twice on one shared host.
 - Dynamic interrupt values cross the same JSON/raw-byte/size boundary before
   LangGraph can persist them. Invalid values become a durable terminal
   `STATE_BOUNDARY_ERROR` instead of leaving an unreadable interrupted thread.
@@ -153,16 +156,16 @@ Local Python 3.10.12 results on 2026-07-11:
 
 ```text
 python3 run_tests.py
-Ran 498 tests in 9.614s
+Ran 513 tests in 9.533s
 OK (skipped=16)
 
 PYTHONPATH=/tmp/lginstall3:src:. python3 run_tests.py
-Ran 498 tests in 22.442s
+Ran 513 tests in 22.837s
 OK (skipped=8)
 ```
 
-- 482 tests pass in the dependency-free environment;
-- 490 tests pass with real LangGraph 1.2.9 available;
+- 497 tests pass in the dependency-free environment;
+- 505 tests pass with real LangGraph 1.2.9 available;
 - the graph suite with real dependencies available runs 87 tests: 84 pass and
   only two PostgreSQL tests plus the inverse missing-dependency guard are skipped;
 - eight tests execute the actual `StateGraph` (seven graph integration/smoke/
@@ -173,6 +176,8 @@ OK (skipped=8)
 - 20 concurrent isolated sessions complete without cross-session state leakage
   on the deterministic Fake API; the equivalent real-LangGraph matrix is `NOT_RUN`;
 - all ten legacy node request shapes decode as their frozen request dataclasses;
+- 15 durable replay tests prove one handler execution across bridge/runtime/
+  ledger reconstruction, plus fail-closed authorization and uncertainty paths;
 - real LangGraph child nodes and four local MCP planning calls share one trace ID;
 - a real dynamic interrupt resumes across a new runtime from the child checkpoint
   without replaying the already completed candidate-generation node;
@@ -211,12 +216,10 @@ The following remain `NOT_RUN`, not implicitly complete:
   automated CI-gated tests and PostgreSQL 16 service wiring are present, but no
   successful remote workflow result was available during this implementation);
 - forced process termination after a side-effecting tool returns but before the
-  graph checkpoint, proving backend execution count remains one; an injected
-  complete saver outage in a manual, non-checked-in fault-injection experiment
-  reproduced a duplicate tool call after a new runtime resumed from the older
-  checkpoint;
-- a persistent tool-side idempotency ledger or external run registry that closes
-  that reproduced crash window;
+  graph checkpoint. Deterministic state-loss/restart tests now prove SQLite
+  replay count remains one, but an actual process-kill harness is still `NOT_RUN`;
+- a shared PostgreSQL/dedicated replay ledger for multi-host MCP servers and
+  atomic coordination between the tool's internal side effect and ledger commit;
 - distributed single-flight for two workers/runtimes executing the same thread;
   the current guard is process/runtime-instance local;
 - blocking real-saver proof that no API node event is acknowledged before a sync

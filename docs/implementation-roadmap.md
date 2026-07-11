@@ -39,8 +39,9 @@ Registry 校验和 API 接线仍待完成，详见
 
 ## Phase 5: runtime and evaluation
 
-完成 PostgreSQL 运行证据与持久幂等账本，并接入 FastAPI、SSE、OpenTelemetry
-和生产回归 Harness。
+SQLite 工具回放账本及本机重启/并发/不确定状态证据已完成。下一步完成共享
+PostgreSQL 账本与 checkpoint 运行证据、跨 worker 租约，并接入 FastAPI、SSE、
+OpenTelemetry 和生产回归 Harness。
 
 ## Change policy
 

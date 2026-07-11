@@ -154,6 +154,18 @@ verifies:
 - stderr remains empty;
 - stdout contains only JSON-RPC responses.
 
+### 2.8 Durable replay-ledger tests
+
+File: `tests/mcp/test_replay_ledger.py`
+
+The 15 tests cover SQLite restart replay, bridge reconstruction after simulated
+Agent checkpoint loss, three logical servers sharing one ledger, semantic
+idempotency conflicts, concurrent claims, terminal and retryable failures,
+request/output permission revocation, expired/timed-out write uncertainty,
+failed ledger completion, response integrity corruption, full-sync mode,
+bounded response size and lease configuration. The core invariant is an exact
+handler count of one after a completed response has been durably recorded.
+
 ## 3. Manual stdio check
 
 Start a server:

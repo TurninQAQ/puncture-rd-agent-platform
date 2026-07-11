@@ -16,6 +16,9 @@ Semantic Versioning while it is below 1.0.
 - Explicit Qwen structured-request and enterprise RAG node adapters.
 - Ten-tool Agent-to-MCP contract bridge with opaque Artifact handles, principal
   propagation, versioned replay identity and frozen policy defaults.
+- SQLite MCP replay ledger with full-sync commits, response integrity hashes,
+  restart-safe terminal replay, authorization rechecks and explicit
+  `PENDING`/`COMPLETED`/`UNCERTAIN` state transitions.
 
 ### Changed
 
@@ -31,9 +34,9 @@ Semantic Versioning while it is below 1.0.
 
 ### Verification
 
-- Local Python 3.10 standard environment: 498 tests run, 482 passed and 16
+- Local Python 3.10 standard environment: 513 tests run, 497 passed and 16
   explicitly gated dependency/private-service tests skipped.
-- Isolated LangGraph 1.2.9 run: 498 tests run, 490 passed and 8 gated tests
+- Isolated LangGraph 1.2.9 run: 513 tests run, 505 passed and 8 gated tests
   skipped. Eight tests execute the real `StateGraph`; the larger deterministic
   branch matrix remains on the Fake API. Real coverage includes local MCP trace
   propagation, dynamic interrupt/resume, durable state/interrupt boundary
@@ -46,6 +49,10 @@ Semantic Versioning while it is below 1.0.
 - The real-LangGraph <=100 ms P95 threshold is retained but is not a normal CI
   hard gate because repeated shared-host runs showed threshold-crossing jitter;
   controlled runners can enforce it with `PUNCTURE_ENFORCE_PERFORMANCE_GATES=1`.
+- Fifteen replay-ledger tests prove bridge/runtime reconstruction without a
+  second handler call, terminal-error replay, retryable failure re-execution,
+  concurrent claim exclusion, request/output permission revocation, corruption
+  detection and fail-closed uncertain writes across all three logical MCP servers.
 
 ## [0.5.0] - 2026-07-11
 

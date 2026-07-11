@@ -37,6 +37,7 @@ McpToolRuntime
   - case/tool allowlist
   - deadline calculation
   - ArtifactHandle resolution
+  - durable replay authorization + SQLite ledger
   - response identity/version verification
         |
         v
@@ -267,6 +268,54 @@ Every request includes an idempotency key.  Write-like adapters cache or commit
 against a scope containing tool, case, caller and idempotency identity.  A
 replay with an identical semantic fingerprint returns the same artifact/result;
 reuse with changed arguments is a non-retryable contract error.
+
+`SQLiteToolReplayLedger` closes the graph-side crash window after a tool server
+has produced a terminal response but before the Agent commits its next
+checkpoint. The runtime atomically claims a scope, executes the handler, commits
+MCP-safe structured content with `PRAGMA synchronous=FULL`, and only then returns
+to the graph. A rebuilt bridge/runtime rebinds the current request/trace identity
+and returns the stored response without calling the handler again.
+
+The durable state machine is:
+
+```text
+absent -> PENDING -> COMPLETED
+                  -> deleted     (retryable failure only)
+                  -> UNCERTAIN   (write may have advanced without a durable response)
+```
+
+Successful, partial and non-retryable failed business terminals are replayed.
+Retryable failures delete their claim so a bounded retry can execute again.
+Expired read-only claims may be reclaimed; expired write claims become
+`UNCERTAIN` and require manual reconciliation. The configured claim TTL must be
+longer than every tool timeout on the logical server.
+
+Every call, including replay, runs an explicitly injected current-request
+authorizer. A replay hit additionally runs a response validator over the stored
+public result before it can be returned. Deployments must connect both callbacks
+to their live case/artifact ACL and Registry source; a durable ledger cannot be
+enabled without them. All three logical servers may share one SQLite database
+on a single host:
+
+```python
+from puncture_agent.mcp import McpToolRuntime, SQLiteToolReplayLedger
+
+with SQLiteToolReplayLedger("/var/lib/puncture-agent/tool-replay.sqlite3") as ledger:
+    case_data_runtime = McpToolRuntime(
+        registry,
+        artifact_resolver,
+        server_name="case-data",
+        replay_ledger=ledger,
+        replay_authorizer=current_acl_allows,
+        replay_response_validator=stored_artifacts_are_currently_authorized,
+    )
+```
+
+SQLite proves same-host/shared-file restart behavior. Multi-host MCP servers need
+a PostgreSQL or dedicated shared-ledger implementation with the same protocol.
+The tool backend must still make its own side effect and ledger completion
+atomic, or use an artifact/operation idempotency record, for the narrower crash
+window inside the tool service itself.
 
 Deadlines are enforced at two layers:
 
