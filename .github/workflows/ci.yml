@@ -70,8 +70,72 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(suite);
           sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)"
 
+  postgres-restart-recovery:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: puncture_test
+          POSTGRES_PASSWORD: puncture_test
+          POSTGRES_DB: puncture_agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U puncture_test -d puncture_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install production runtime dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          httpx==0.28.1
+          'langgraph==1.2.9'
+          'langgraph-checkpoint-postgres==3.1.0'
+          'psycopg[binary]>=3.2,<4'
+      - name: Prepare interrupted checkpoint in process A
+        env:
+          PUNCTURE_TEST_POSTGRES_DSN: postgresql://puncture_test:puncture_test@127.0.0.1:5432/puncture_agent_test?sslmode=disable
+          PUNCTURE_POSTGRES_RESTART_EVIDENCE_DIR: ${{ runner.temp }}/puncture-postgres-restart-evidence
+        run: python -m tests.graph.postgres_service_restart_probe prepare
+      - name: Restart the PostgreSQL 16 service container
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -Eeuo pipefail
+          test -n "${POSTGRES_CONTAINER_ID}"
+          docker restart --time 10 "${POSTGRES_CONTAINER_ID}"
+          for attempt in $(seq 1 60); do
+            status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${POSTGRES_CONTAINER_ID}")"
+            if test "${status}" = "healthy"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker inspect "${POSTGRES_CONTAINER_ID}"
+          docker logs "${POSTGRES_CONTAINER_ID}"
+          exit 1
+      - name: Recover checkpoint in process B
+        env:
+          PUNCTURE_TEST_POSTGRES_DSN: postgresql://puncture_test:puncture_test@127.0.0.1:5432/puncture_agent_test?sslmode=disable
+          PUNCTURE_POSTGRES_RESTART_EVIDENCE_DIR: ${{ runner.temp }}/puncture-postgres-restart-evidence
+        run: python -m tests.graph.postgres_service_restart_probe recover
+      - name: Upload PostgreSQL restart evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-restart-recovery-${{ github.sha }}
+          path: ${{ runner.temp }}/puncture-postgres-restart-evidence
+          if-no-files-found: error
+          retention-days: 30
+
   release-tag:
-    needs: standard-library-tests
+    needs: [standard-library-tests, postgres-restart-recovery]
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
