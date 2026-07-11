@@ -754,6 +754,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
         f"threshold_pass={result['thresholds']['passed']} "
         f"gate_mode={result['gate']['mode']}"
     )
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(
+            "::notice title=PostgreSQL checkpoint benchmark::"
+            f"save P50/P95 {save['p50']:.3f}/{save['p95']:.3f} ms; "
+            f"resume P50/P95 {resume['p50']:.3f}/{resume['p95']:.3f} ms; "
+            f"threshold_pass={result['thresholds']['passed']}; "
+            f"gate_mode={result['gate']['mode']}"
+        )
     if not result["thresholds"]["passed"]:
         message = (
             f"observed save/resume P95 {save['p95']:.3f}/{resume['p95']:.3f} ms "

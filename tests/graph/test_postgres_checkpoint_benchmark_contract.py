@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 import os
@@ -175,6 +175,39 @@ class PostgresCheckpointBenchmarkContractTests(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertIn(benchmark.DSN_ENV, stderr.getvalue())
             self.assertFalse(missing_output.exists())
+
+            successful_result = {
+                "gate": {"mode": "record", "passed": True},
+                "measurements": {
+                    "checkpoint_save_ms": {"p50": 1.25, "p95": 2.5},
+                    "resume_end_to_end_ms": {"p50": 10.0, "p95": 20.0},
+                },
+                "thresholds": {"passed": True},
+            }
+            notice_output = Path(temporary_directory) / "notice.json"
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        benchmark.DSN_ENV: "postgresql://redacted",
+                        "GITHUB_ACTIONS": "true",
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(
+                    benchmark,
+                    "build_result",
+                    return_value=successful_result,
+                ),
+                redirect_stdout(StringIO()) as stdout,
+            ):
+                exit_code = benchmark.main(["--output", str(notice_output)])
+            self.assertEqual(0, exit_code)
+            self.assertIn(
+                "::notice title=PostgreSQL checkpoint benchmark::",
+                stdout.getvalue(),
+            )
+            self.assertIn("save P50/P95 1.250/2.500 ms", stdout.getvalue())
 
 
 if __name__ == "__main__":
