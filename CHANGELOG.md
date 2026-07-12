@@ -7,52 +7,98 @@ Semantic Versioning while it is below 1.0.
 
 ### Added
 
-- Optional LangGraph 1.2 production runtime that compiles the locked JSON main
-  graph and both child graphs while retaining the dependency-free reference runner.
+- No additional unreleased feature work in the demo gate.
+
+## [0.8.0] - 2026-07-12
+
+### Added
+
+- OpenTelemetry-compatible tracing facade with graph/node/RAG/model/MCP/
+  verifier/checkpoint spans and privacy-safe attribute allowlist.
+- W3C `traceparent` plus HTTP/MCP/gRPC-style metadata propagation and
+  concurrent-session isolation tests.
+- Versioned Eval dataset loader (`eval-case-v1`), deterministic RAG/Agent
+  metrics (`metrics-v1`), per-case diagnostics and baseline regression reports.
+- Offline CLI `python -m puncture_agent.observability.eval_runner` with
+  `--traced` / compare / release-block gates.
+- Tracing overhead benchmark and CI zero-skip eval/tracing gates (46 tests).
+- Release record `docs/releases/v0.8.0.md` and implementation notes under
+  `docs/eval-and-tracing-implementation.md`.
+
+### Security
+
+- Denylist redaction of credentials, PHI-like fields, unrestricted prompts and
+  raw image attributes before export; unknown keys are dropped.
+
+### Verification
+
+- Local Python 3.10: 690 tests run, 629 passed, 61 gated skips.
+- Task 08 suite: 46/46 zero-skip.
+- Mock reference CLI: `passed=3/3`, `release_blocked=False`.
+- Live OTLP/Langfuse/Phoenix and internal Golden Set quality targets remain
+  `NOT_RUN` / field configuration.
+
+## [0.7.0] - 2026-07-11
+
+### Added
+
+- Pydantic v2 secure HTTP contract adapters with injected authority only.
+- Atomic in-memory and PostgreSQL Run/event repositories with version fence,
+  tenant-scoped idempotency, private event keys and COMMIT-unknown reconciliation.
+- FastAPI Run Gateway (9 REST/OpenAPI paths), pre-parse Bearer/body admission,
+  privacy-safe public views, health and low-cardinality HTTP metrics.
+- Bounded SSE event replay with strict cursors, heartbeat, token revalidation
+  and per-process quotas.
+- Durable execution jobs with worker heartbeat/reclaim and API SIGTERM recovery.
+- Release record `docs/releases/v0.7.0.md` and runtime docs under
+  `docs/api-runtime-implementation.md` / `docs/fastapi-runtime.md`.
+
+### Security
+
+- Reject body-forged tenant/principal/role/scope; recursive denial of raw image
+  fields, credentials, arbitrary URIs and JWT-like secrets.
+- Deep redaction of public snapshot/event/error views; fixed 500/503 messages.
+
+### Verification
+
+- CI matrices for Python 3.10/3.11/3.12 with PostgreSQL 16 no-skip repository,
+  FastAPI, SSE and durable recovery jobs (see README evidence links).
+- Company OIDC binding, cluster SSE quotas and GPU cancel remain external.
+
+## [0.6.0] - 2026-07-11
+
+### Added
+
+- Optional LangGraph 1.2 production runtime compiling the locked JSON main graph
+  and both child graphs while retaining the dependency-free reference runner.
 - Exact AgentState/TypedDict checkpoint conversion with raw-byte, JSON and 1 MiB
-  state guards, synchronous durability, isolated thread IDs and an API event stream.
-- Dynamic interrupt/resume, same-thread missing-input restart, trace continuation
-  across runtime instances, and conservative event buffering until sync streams drain.
+  state guards, synchronous durability, isolated thread IDs and event streams.
+- Dynamic interrupt/resume, same-thread missing-input restart, and conservative
+  event buffering until sync streams drain.
 - Explicit Qwen structured-request and enterprise RAG node adapters.
 - Ten-tool Agent-to-MCP contract bridge with opaque Artifact handles, principal
   propagation, versioned replay identity and frozen policy defaults.
 - SQLite MCP replay ledger with full-sync commits, response integrity hashes,
   restart-safe terminal replay, authorization rechecks and explicit
   `PENDING`/`COMPLETED`/`UNCERTAIN` state transitions.
+- PostgreSQL checkpointer, cross-runtime advisory locks, trusted Artifact
+  Registry validation, process-kill recovery window and real-LangGraph matrices.
+- Release record `docs/releases/v0.6.0.md` and
+  `docs/langgraph-runtime-implementation.md`.
 
 ### Changed
 
-- Production node normalization now accepts frozen MCP result fields and reports
+- Production node normalization accepts frozen MCP result fields and reports
   only candidates accepted by deterministic safety evaluation.
 - Remote MCP responses are validated recursively against frozen result types;
-  normalized contract values are retained, result Artifact identities are bound
-  to request/envelope identities, and storage URIs fail closed instead of being
-  accepted or silently rewritten. RAG must cover every task-required active
-  module before tools may run.
-- Retryable transport timeouts/dependency failures remain distinct from contract
-  violations, and safety candidate summary/assessment partitions fail closed.
+  storage URIs fail closed. RAG must cover every task-required active module
+  before tools may run.
 
 ### Verification
 
-- Local Python 3.10 standard environment: 513 tests run, 497 passed and 16
-  explicitly gated dependency/private-service tests skipped.
-- Isolated LangGraph 1.2.9 run: 513 tests run, 505 passed and 8 gated tests
-  skipped. Eight tests execute the real `StateGraph`; the larger deterministic
-  branch matrix remains on the Fake API. Real coverage includes local MCP trace
-  propagation, dynamic interrupt/resume, durable state/interrupt boundary
-  failures and cross-runtime in-memory recovery.
-- `langgraph-checkpoint-postgres` 3.1.0 and psycopg import locally; PostgreSQL 16
-  service wiring is present in CI but has not been observed running from this
-  worktree. Local PostgreSQL restart execution, distributed same-thread locking,
-  trusted output-Artifact registry validation and the post-tool/pre-checkpoint
-  process-kill window remain `NOT_RUN` without the required service/harness.
-- The real-LangGraph <=100 ms P95 threshold is retained but is not a normal CI
-  hard gate because repeated shared-host runs showed threshold-crossing jitter;
-  controlled runners can enforce it with `PUNCTURE_ENFORCE_PERFORMANCE_GATES=1`.
-- Fifteen replay-ledger tests prove bridge/runtime reconstruction without a
-  second handler call, terminal-error replay, retryable failure re-execution,
-  concurrent claim exclusion, request/output permission revocation, corruption
-  detection and fail-closed uncertain writes across all three logical MCP servers.
+- Real LangGraph 1.2.9 success/failure matrix and 20-way concurrent isolation.
+- PostgreSQL 16 CI persistence/restart/process-kill evidence linked from README.
+- Company algorithms and host/WAL crash classes remain external / `NOT_RUN`.
 
 ## [0.5.0] - 2026-07-11
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "puncture-rd-agent-platform"
-version = "0.5.0"
+version = "0.8.0"
 description = "Contract-first internal R&D agent with local Qwen, RAG and MCP adapters"
 requires-python = ">=3.10"
 dependencies = []
