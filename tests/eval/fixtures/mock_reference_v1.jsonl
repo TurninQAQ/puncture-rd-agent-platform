@@ -1,0 +1,3 @@
+# meta: {"schema_version": "eval-case-v1", "dataset_version": "mock-reference-v1-jsonl"}
+{"case_id": "planning-success-jsonl", "query": "对 Case-801 做路径规划", "expected_task_type": "PLANNING_SAFETY", "expected_terminal_status": "SUCCEEDED", "required_nodes": ["generate_candidate_paths"], "forbidden_nodes": ["convert_mcs_to_nifti"], "expected_tools": ["generate_candidate_paths"], "minimum_citations": 2}
+{"case_id": "data-success-jsonl", "query": "检查 Case-802 的 MCS 标签", "expected_task_type": "DATA_MODEL_VALIDATION", "expected_terminal_status": "SUCCEEDED", "required_nodes": ["convert_mcs_to_nifti"], "forbidden_nodes": ["generate_candidate_paths"], "expected_tools": ["convert_mcs_to_nifti"], "minimum_citations": 2}
