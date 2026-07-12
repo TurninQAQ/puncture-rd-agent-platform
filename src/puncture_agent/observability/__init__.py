@@ -1,8 +1,37 @@
 """Framework-neutral tracing and evaluation helpers."""
 
+from .attributes import (
+    ATTRIBUTE_ALLOWLIST,
+    REDACTED,
+    hash_query_text,
+    is_allowed_key,
+    is_denied_key,
+    sanitize_attributes,
+)
 from .eval_harness import AgentEvalHarness, EvalCase, EvalCaseResult, EvalReport
 from .metrics import ndcg_at_k, recall_at_k, reciprocal_rank
+from .propagation import (
+    TRACE_ID_HEADER,
+    TRACEPARENT_HEADER,
+    TraceContext,
+    extract_trace_context,
+    format_traceparent,
+    inject_trace_context,
+    new_trace_context,
+    parse_traceparent,
+)
 from .tracing import (
+    SPAN_AGENT_GRAPH,
+    SPAN_AGENT_NODE,
+    SPAN_CHECKPOINT,
+    SPAN_MCP_TOOL,
+    SPAN_MODEL_GENERATE,
+    SPAN_RAG_RERANK,
+    SPAN_RAG_RETRIEVE,
+    SPAN_RAG_REWRITE,
+    SPAN_VERIFIER,
+    CompositeTraceExporter,
+    InMemoryOtlpTraceExporter,
     InMemoryTraceExporter,
     JsonLinesTraceExporter,
     SpanRecord,
@@ -10,15 +39,40 @@ from .tracing import (
 )
 
 __all__ = [
+    "ATTRIBUTE_ALLOWLIST",
     "AgentEvalHarness",
+    "CompositeTraceExporter",
     "EvalCase",
     "EvalCaseResult",
     "EvalReport",
+    "InMemoryOtlpTraceExporter",
     "InMemoryTraceExporter",
     "JsonLinesTraceExporter",
+    "REDACTED",
+    "SPAN_AGENT_GRAPH",
+    "SPAN_AGENT_NODE",
+    "SPAN_CHECKPOINT",
+    "SPAN_MCP_TOOL",
+    "SPAN_MODEL_GENERATE",
+    "SPAN_RAG_RERANK",
+    "SPAN_RAG_RETRIEVE",
+    "SPAN_RAG_REWRITE",
+    "SPAN_VERIFIER",
     "SpanRecord",
+    "TRACEPARENT_HEADER",
+    "TRACE_ID_HEADER",
+    "TraceContext",
     "TraceRecorder",
+    "extract_trace_context",
+    "format_traceparent",
+    "hash_query_text",
+    "inject_trace_context",
+    "is_allowed_key",
+    "is_denied_key",
     "ndcg_at_k",
+    "new_trace_context",
+    "parse_traceparent",
     "recall_at_k",
     "reciprocal_rank",
+    "sanitize_attributes",
 ]
