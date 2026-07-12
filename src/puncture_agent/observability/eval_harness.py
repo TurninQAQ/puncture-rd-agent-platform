@@ -8,6 +8,7 @@ and baseline-vs-candidate regression reports.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from statistics import fmean
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -627,7 +628,7 @@ def compare_reports(
 def load_report(path: str) -> EvalReport:
     """Load a previously serialized aggregate report."""
 
-    payload = json.loads(open(path, encoding="utf-8").read())
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError("report root must be an object")
     cases = tuple(

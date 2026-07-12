@@ -128,6 +128,48 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(suite);
           ok = loaded == expected and result.testsRun == expected and result.wasSuccessful() and not result.skipped;
           sys.exit(0 if ok else 1)"
+      - name: Eval and tracing (skips forbidden)
+        env:
+          PYTHONPATH: .:src
+        run: >-
+          python -c
+          "import sys, unittest;
+          names = [
+              'tests.eval.test_tracing',
+              'tests.eval.test_metrics',
+              'tests.eval.test_eval_harness',
+              'tests.eval.test_otel_facade',
+              'tests.eval.test_dataset_and_regression',
+              'tests.eval.test_traced_eval_and_faults',
+          ];
+          suite = unittest.TestSuite(
+              unittest.defaultTestLoader.loadTestsFromName(name)
+              for name in names
+          );
+          expected = 46;
+          loaded = suite.countTestCases();
+          result = unittest.TextTestRunner(verbosity=2).run(suite);
+          ok = loaded == expected and result.testsRun == expected and result.wasSuccessful() and not result.skipped;
+          print(f'loaded={loaded} ran={result.testsRun} skipped={len(result.skipped)}');
+          sys.exit(0 if ok else 1)"
+      - name: Offline mock eval CLI
+        env:
+          PYTHONPATH: .:src
+        run: >-
+          python -m puncture_agent.observability.eval_runner run
+          --dataset tests/eval/fixtures/mock_reference_v1.json
+          --traced
+          --fail-on-release-block
+          --output ${{ runner.temp }}/mock-eval-report.json
+      - name: Tracing overhead benchmark (record)
+        env:
+          PYTHONPATH: .:src
+        run: >-
+          python benchmarks/tracing_overhead_benchmark.py
+          --warmups 3
+          --samples 30
+          --environment-label github-actions-ubuntu
+          --output ${{ runner.temp }}/tracing-overhead.json
       - name: PostgreSQL Run repository (skips forbidden)
         if: ${{ always() }}
         timeout-minutes: 5

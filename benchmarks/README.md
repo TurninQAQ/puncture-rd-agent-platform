@@ -75,3 +75,18 @@ Recorded GitHub-hosted baseline on 2026-07-11:
 This is a shared GitHub-runner engineering observation. Run with enforcement on
 the intended dedicated PostgreSQL/storage host before treating the limits as a
 release or production performance gate.
+
+
+## Tracing overhead (Task 08)
+
+```bash
+PYTHONPATH=src:. python3 benchmarks/tracing_overhead_benchmark.py   --warmups 5   --samples 50   --environment-label controlled-benchmark-host   --output benchmark-results/tracing-overhead.json
+```
+
+Compares mock graph-only latency with and without
+`TraceRecorder` + in-memory/OTLP test exporters. Default mode records P50/P95
+and the P95 overhead ratio. Enforcement (`--enforce` or
+`PUNCTURE_ENFORCE_PERFORMANCE_GATES=1`) applies the initial <= 5% P95 overhead
+gate only on controlled hosts. Sub-millisecond baseline paths can show a large
+relative ratio from ~1 ms absolute export cost; treat shared-runner numbers as
+engineering observations, not production SLAs.
