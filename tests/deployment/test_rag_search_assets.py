@@ -42,6 +42,7 @@ class FakeOpenSearchHandler(BaseHTTPRequestHandler):
     aliases: dict[str, str] = {}
     requests: list[tuple[str, str, dict[str, Any] | None]] = []
     search_payloads: list[dict[str, Any]] = []
+    fail_restore_after_creating_target = False
 
     def log_message(self, _format: str, *args: Any) -> None:
         return
@@ -53,6 +54,7 @@ class FakeOpenSearchHandler(BaseHTTPRequestHandler):
         cls.aliases = {}
         cls.requests = []
         cls.search_payloads = []
+        cls.fail_restore_after_creating_target = False
 
     def _authorized(self) -> bool:
         expected = base64.b64encode(f"admin:{self.password}".encode()).decode()
@@ -184,6 +186,29 @@ class FakeOpenSearchHandler(BaseHTTPRequestHandler):
                     body = action["add"]
                     self.aliases[body["alias"]] = body["index"]
             self._send_json({"acknowledged": True})
+            return
+        if path.startswith("/_snapshot/") and path.endswith("/_restore"):
+            source = payload.get("indices")
+            target = payload.get("rename_replacement")
+            if not isinstance(source, str) or not isinstance(target, str):
+                self._send_json({"error": "restore identity missing"}, status=400)
+                return
+            mapping = self.indices.get(source)
+            if mapping is None or target in self.indices:
+                self._send_json({"error": "restore source or target invalid"}, status=400)
+                return
+            self.indices[target] = copy.deepcopy(mapping)
+            if self.fail_restore_after_creating_target:
+                self._send_json({"error": "ambiguous restore failure"}, status=500)
+                return
+            self._send_json(
+                {
+                    "snapshot": {
+                        "indices": [target],
+                        "shards": {"total": 1, "successful": 1, "failed": 0},
+                    }
+                }
+            )
             return
         if path.endswith("/_search"):
             self.search_payloads.append(copy.deepcopy(payload))
@@ -317,6 +342,7 @@ class RagSearchDeploymentAssetTests(unittest.TestCase):
             "scripts/index_contract.py",
             "scripts/integration_test.py",
             "scripts/promote_index.py",
+            "scripts/restore_drill.py",
             "scripts/smoke_test.py",
             "scripts/snapshot_index.py",
         }
@@ -343,6 +369,7 @@ class RagSearchDeploymentAssetTests(unittest.TestCase):
             "RAG_VECTORS_NORMALIZED",
             "RAG_TOKENIZER_REVISION",
             "RAG_MAX_INPUT_TOKENS",
+            "path.repo: /mnt/snapshots",
             "no-new-privileges:true",
             "internal: true",
         ):
@@ -704,6 +731,76 @@ class RagSearchDeploymentAssetTests(unittest.TestCase):
         self.assertEqual("puncture-rag-v000001", requests[0]["indices"])
         self.assertIs(False, requests[0]["partial"])
         self.assertIs(False, requests[0]["include_global_state"])
+
+    def test_restore_drill_uses_isolated_target_verifies_and_cleans_up(self) -> None:
+        self._bootstrap_server_state()
+        restore_index = "puncture-rag-restore-offline-001"
+        with tempfile.TemporaryDirectory() as directory_name:
+            password_file = self._password_file(pathlib.Path(directory_name))
+            result = self._run(
+                "restore_drill.py",
+                self._environment(password_file),
+                "--repository",
+                "approved-rag-repository",
+                "--snapshot",
+                "puncture-rag-before-v000002-20260710t120000z",
+                "--restore-index",
+                restore_index,
+            )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("RESTORE_DRILL_PASS", result.stdout)
+        self.assertNotIn(restore_index, FakeOpenSearchHandler.indices)
+        restore_requests = [
+            body
+            for method, path, body in FakeOpenSearchHandler.requests
+            if method == "POST" and path.endswith("/_restore")
+        ]
+        self.assertEqual(1, len(restore_requests))
+        self.assertEqual("puncture-rag-v000001", restore_requests[0]["indices"])
+        self.assertIs(False, restore_requests[0]["include_aliases"])
+        self.assertEqual(restore_index, restore_requests[0]["rename_replacement"])
+        self.assertIn(
+            ("DELETE", f"/{restore_index}", None),
+            FakeOpenSearchHandler.requests,
+        )
+
+        delete_count = FakeOpenSearchHandler.requests.count(
+            ("DELETE", f"/{restore_index}", None)
+        )
+        FakeOpenSearchHandler.fail_restore_after_creating_target = True
+        with tempfile.TemporaryDirectory() as directory_name:
+            password_file = self._password_file(pathlib.Path(directory_name))
+            ambiguous = self._run(
+                "restore_drill.py",
+                self._environment(password_file),
+                "--repository",
+                "approved-rag-repository",
+                "--snapshot",
+                "puncture-rag-before-v000002-20260710t120000z",
+                "--restore-index",
+                restore_index,
+            )
+        self.assertNotEqual(0, ambiguous.returncode)
+        self.assertIn(restore_index, FakeOpenSearchHandler.indices)
+        self.assertEqual(
+            delete_count,
+            FakeOpenSearchHandler.requests.count(("DELETE", f"/{restore_index}", None)),
+        )
+
+    def test_restore_drill_refuses_nonisolated_target_before_connecting(self) -> None:
+        result = self._run(
+            "restore_drill.py",
+            os.environ.copy(),
+            "--repository",
+            "approved-rag-repository",
+            "--snapshot",
+            "puncture-rag-before-v000002-20260710t120000z",
+            "--restore-index",
+            "puncture-rag-v000001",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("isolated prefix", result.stderr)
+        self.assertEqual([], FakeOpenSearchHandler.requests)
 
     def test_live_integration_index_guard_refuses_production_names_before_connecting(self) -> None:
         for unsafe in (

@@ -5,9 +5,11 @@ an explicit BM25 + dense-vector index contract, atomic alias tools, and
 dependency-free verification scripts. It is infrastructure for the production
 RAG adapter; it does not implement embeddings, reranking, RRF, or Agent logic.
 
-The checked-in assets have offline tests. A real OpenSearch node, live document
-ingestion, retrieval quality, backup restore, latency, and ACL leak evaluation
-are **NOT_RUN** until an operator executes the runbook on approved infrastructure.
+The checked-in assets have offline tests. A 2026-07-15 workstation run also
+validated a real secured OpenSearch 3.7.0 node, synthetic ingestion, hybrid/ACL
+queries, restart persistence, and an isolated snapshot restore; see the
+[local evidence](evidence/local-opensearch-validation.md). Production corpus
+quality, load, HA, remote backup, and security approval remain **NOT_RUN**.
 
 ## Layout
 
@@ -26,6 +28,7 @@ deploy/rag-search/
     ├── index_contract.py
     ├── integration_test.py
     ├── promote_index.py
+    ├── restore_drill.py
     ├── smoke_test.py
     └── snapshot_index.py
 ```

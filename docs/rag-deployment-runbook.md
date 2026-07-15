@@ -8,15 +8,14 @@ adapter performs query normalization, two independent recalls, deterministic
 RRF, reranking, parent expansion, final authorization checks, citations, and
 trace emission; OpenSearch does not replace those application controls.
 
-Repository evidence currently covers JSON/shell/Python syntax, static mapping
-invariants, secret handling, redirect/proxy controls, fake-server bootstrap,
-atomic alias request shape, read-only smoke request shape, and destructive-test
-index refusal. The following are **NOT_RUN** in this environment:
+Repository evidence covers the offline controls below. A 2026-07-15 workstation
+run additionally covered an immutable OpenSearch 3.7.0 image, secured loopback
+startup, synthetic parent/child ingestion, live BM25/k-NN/ACL behavior, named
+volume restart persistence, and filesystem snapshot/isolated restore. See the
+[local evidence](../deploy/rag-search/evidence/local-opensearch-validation.md).
+The following remain **NOT_RUN** production gates:
 
-- a live OpenSearch container and real image digest verification;
-- actual document ingestion or embedding generation;
-- live BM25/k-NN correctness and filtered-recall behavior;
-- snapshot creation and restore rehearsal;
+- approved production embedding and reranker generation;
 - HA, node loss, disk pressure, upgrade, and rollback drills;
 - golden-set Recall@10/NDCG/MRR, ACL leak count, or P50/P95 latency.
 
@@ -335,6 +334,21 @@ At least once per release cycle, restore into a differently named isolated index
 verify mapping metadata, counts, checksums, BM25/vector queries, ACL negatives,
 and then delete only the isolated restore. A backup without a successful restore
 drill is not accepted evidence.
+
+The checked-in drill provides the safe mapping/count portion of that rehearsal:
+
+```bash
+python3 deploy/rag-search/scripts/restore_drill.py \
+  --repository approved-rag-repository \
+  --snapshot puncture-rag-before-v000002-20260710t120000z \
+  --restore-index puncture-rag-restore-v000001-release-check
+```
+
+It refuses targets outside `puncture-rag-restore-*`, refuses an existing target,
+sets `include_aliases=false` so production aliases cannot be attached to the
+restore, compares the full mapping and document count, and deletes only the
+isolated target. Run BM25/vector/ACL probes against the isolated target as an
+additional release gate when using real corpus snapshots.
 
 ## 12. Opt-in live integration test safety
 

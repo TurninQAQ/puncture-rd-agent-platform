@@ -59,6 +59,31 @@ python3 run_tests.py
 No environment variable is required. Ambient `HTTP_PROXY` and `HTTPS_PROXY` values are
 irrelevant because the demo creates no network client.
 
+## Opt-in live OpenSearch application demo
+
+After completing `docs/rag-deployment-runbook.md`, the second demo exercises the
+production search adapter against the secured local node. It deliberately writes
+only four synthetic parent/child records to the configured write alias:
+
+```bash
+RUN_RAG_INTEGRATION=1 \
+OPENSEARCH_ENDPOINT=https://127.0.0.1:9200 \
+OPENSEARCH_USERNAME=admin \
+OPENSEARCH_PASSWORD_FILE=/absolute/path/to/opensearch-client-password \
+OPENSEARCH_CA_FILE=/absolute/path/to/opensearch-root-ca.pem \
+OPENSEARCH_INSECURE=false \
+python3 examples/live_opensearch_rag_demo.py
+```
+
+The opt-in check happens before secret files or the network are touched. The demo
+reads the live mapping manifest, uses a matching deterministic embedding backend,
+then runs the real `OpenSearchSearchBackend`, BM25 and filtered k-NN recall,
+deterministic RRF/reranking, and final authorization checks. It requires an
+authorized result, zero restricted evidence under the wrong scope, and the
+restricted result under the correct scope. The exact 2026-07-15 workstation
+result is recorded in
+`deploy/rag-search/evidence/local-opensearch-validation.md`.
+
 ## What the demo executes
 
 The script performs this deterministic sequence:
@@ -135,7 +160,7 @@ processes, then requires byte-for-byte identical subprocess output.
 
 ## What this demo does not prove
 
-This local run does **not** prove:
+The dependency-free deterministic demo by itself does **not** prove:
 
 - OpenSearch mappings, TLS, credentials, snapshots, alias promotion, or live rollback;
 - production embedding or reranker model quality and availability;
@@ -145,3 +170,6 @@ This local run does **not** prove:
 
 Those require the separately documented environment-gated deployment, integration, and
 evaluation evidence. Do not report local deterministic scores as production metrics.
+The opt-in OpenSearch run now provides local evidence for startup, strict CA TLS,
+mapping/alias checks, synthetic hybrid retrieval, ACL-negative behavior, and one
+snapshot/restore drill. It still does not satisfy the production-quality gates above.

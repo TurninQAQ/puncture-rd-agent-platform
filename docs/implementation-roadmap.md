@@ -17,7 +17,11 @@ Qwen2.5-3B/vLLM 0.9.1 完成真实启动、四能力 smoke、5 项 live gateway 
 
 实现文档摄取、Hybrid Retrieval、Rerank、版本与 ACL、Citation；保持 `RetrievalRequest/Response` 不变。
 
-状态：本地 Python 3.10 Demo、离线 Eval、OpenSearch/Qwen provider 适配器与部署资产已完成；真实服务和内部 Golden Set 待执行。
+状态：本地确定性 Demo、离线 Eval、OpenSearch/Qwen provider 适配器与部署资产已完成；
+2026-07-15 又在真实 OpenSearch 3.7.0 上完成严格 TLS、合成数据摄取、Hybrid/ACL 查询、
+服务重建后的数据卷恢复以及 snapshot/隔离 restore 演练，详见
+[本机现场证据](../deploy/rag-search/evidence/local-opensearch-validation.md)。Embedding/Reranker
+仍为确定性开发实现；真实 Qwen provider、内部 Golden Set、受控性能与生产 HA 待执行。
 
 ## Phase 3: algorithm tools
 
