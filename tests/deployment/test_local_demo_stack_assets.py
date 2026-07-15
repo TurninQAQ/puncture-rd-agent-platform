@@ -194,6 +194,7 @@ class LocalDemoStackAssetTests(unittest.TestCase):
         )
         root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
         for name in (
+            "beginner-hands-on-tutorial.md",
             "learning-and-interview-guide.md",
             "project-status.md",
         ):
