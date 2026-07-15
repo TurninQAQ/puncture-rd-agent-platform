@@ -10,6 +10,7 @@ mkdir -p -- "${PROJECT_ROOT}/var/local-demo"
 log_file="${PROJECT_ROOT}/var/local-demo/api.log"
 
 cd -- "${PROJECT_ROOT}"
+"${PYTHON_BIN}" deploy/local-demo/doctor.py --quiet
 "${PYTHON_BIN}" examples/live_api_server.py >"${log_file}" 2>&1 &
 server_pid=$!
 

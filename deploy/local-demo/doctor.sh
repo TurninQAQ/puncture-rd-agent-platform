@@ -6,5 +6,4 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 load_local_demo_env
 
 cd -- "${PROJECT_ROOT}"
-"${PYTHON_BIN}" deploy/local-demo/doctor.py --quiet
-exec "${PYTHON_BIN}" examples/live_api_server.py
+exec "${PYTHON_BIN}" deploy/local-demo/doctor.py

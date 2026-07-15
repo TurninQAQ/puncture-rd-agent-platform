@@ -28,6 +28,17 @@ The one-command entry was:
 ./deploy/local-demo/run_demo.sh
 ```
 
+The secret-safe preflight was also executed directly:
+
+```bash
+./deploy/local-demo/doctor.sh
+```
+
+It reported Python dependencies, PostgreSQL, and Qwen/vLLM as `UP`, accepted
+the expected one-node OpenSearch `DEGRADED/yellow` state, and returned
+`ready=true`. The subsequent one-command round trip passed after the preflight
+was made mandatory in `run_demo.sh`.
+
 ## Observed gates
 
 - Uvicorn completed startup and shutdown without an application error.

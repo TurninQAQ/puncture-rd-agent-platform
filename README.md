@@ -45,6 +45,7 @@ python3 examples/local_mcp_demo.py
 cp deploy/local-demo/.env.example deploy/local-demo/.env
 chmod 600 deploy/local-demo/.env
 # 填写本机 PostgreSQL DSN、OpenSearch 密码/CA 文件路径并显式启用 opt-in
+./deploy/local-demo/doctor.sh
 ./deploy/local-demo/run_demo.sh
 ```
 

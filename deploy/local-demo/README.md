@@ -43,6 +43,16 @@ literally by an allowlist parser; the file is never sourced or evaluated, so do
 not add shell quotes or expansions. The file and generated token are ignored by
 Git.
 
+Check all prerequisites without changing PostgreSQL or OpenSearch:
+
+```bash
+./deploy/local-demo/doctor.sh
+```
+
+The JSON names the failing component with a fixed error code and never prints
+the PostgreSQL DSN, OpenSearch password, bearer token, or raw exception text.
+Single-node OpenSearch `DEGRADED/yellow` is accepted for this local profile.
+
 ## One-command round trip
 
 ```bash
@@ -52,7 +62,8 @@ Git.
 The command starts a temporary Uvicorn process, waits for health, rejects a bad
 bearer token, executes both fixed workflows, verifies PostgreSQL idempotency and
 JSON event replay, verifies terminal SSE replay, and then sends SIGTERM and
-waits for clean shutdown. Qwen, OpenSearch, and PostgreSQL remain running.
+waits for clean shutdown. It runs the same readiness doctor first. Qwen,
+OpenSearch, and PostgreSQL remain running.
 
 The expected JSON reports:
 

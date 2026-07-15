@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy" / "local-demo"
 SERVER = ROOT / "examples" / "live_api_server.py"
 CLIENT = ROOT / "examples" / "live_api_demo.py"
+DOCTOR = DEPLOY / "doctor.py"
 
 
 def _load(name: str, path: Path):
@@ -33,6 +34,7 @@ def _load(name: str, path: Path):
 
 server = _load("live_api_server_asset_test", SERVER)
 client = _load("live_api_demo_asset_test", CLIENT)
+doctor = _load("local_demo_doctor_asset_test", DOCTOR)
 
 
 class LocalDemoStackAssetTests(unittest.TestCase):
@@ -41,9 +43,15 @@ class LocalDemoStackAssetTests(unittest.TestCase):
         self.assertTrue(
             (DEPLOY / "evidence" / "local-full-stack-validation.md").is_file()
         )
-        for path in (SERVER, CLIENT):
+        for path in (SERVER, CLIENT, DOCTOR):
             py_compile.compile(str(path), doraise=True)
-        for name in ("common.sh", "serve.sh", "verify.sh", "run_demo.sh"):
+        for name in (
+            "common.sh",
+            "doctor.sh",
+            "serve.sh",
+            "verify.sh",
+            "run_demo.sh",
+        ):
             path = DEPLOY / name
             self.assertTrue(path.is_file())
             result = subprocess.run(
@@ -126,6 +134,12 @@ class LocalDemoStackAssetTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "RUN_FULL_STACK_DEMO=1"):
                     server.build_local_demo_app()
+                report = doctor.run_checks()
+                self.assertFalse(report["ready"])
+                self.assertEqual(
+                    "LOCAL_CONFIGURATION_INVALID",
+                    report["components"]["configuration"]["error_code"],
+                )
 
     def test_token_is_private_stable_and_rejects_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
@@ -166,6 +180,7 @@ class LocalDemoStackAssetTests(unittest.TestCase):
     def test_documentation_keeps_the_one_command_and_synthetic_boundary_explicit(self) -> None:
         text = (DEPLOY / "README.md").read_text(encoding="utf-8")
         for expected in (
+            "./deploy/local-demo/doctor.sh",
             "./deploy/local-demo/run_demo.sh",
             "deterministic synthetic tools",
             "worker_enabled=false",
@@ -173,6 +188,10 @@ class LocalDemoStackAssetTests(unittest.TestCase):
             "Never point the demo at a shared production schema",
         ):
             self.assertIn(expected, text)
+        self.assertIn(
+            "deploy/local-demo/doctor.py --quiet",
+            (DEPLOY / "run_demo.sh").read_text(encoding="utf-8"),
+        )
 
 
 if __name__ == "__main__":
