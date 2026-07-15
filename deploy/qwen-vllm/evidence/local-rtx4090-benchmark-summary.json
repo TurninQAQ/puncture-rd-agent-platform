@@ -1,0 +1,27 @@
+{
+  "concurrency_1": {
+    "completion_tokens_per_second": 107.809861,
+    "failed": 0,
+    "latency_ms_p50": 430.5939500336535,
+    "latency_ms_p95": 441.3894177181646,
+    "request_throughput_per_second": 2.409159,
+    "requests": 20,
+    "successful": 20,
+    "ttft_ms_p50": 32.36997651401907,
+    "ttft_ms_p95": 40.85305570624769
+  },
+  "concurrency_4": {
+    "completion_tokens_per_second": 374.294794,
+    "failed": 0,
+    "latency_ms_p50": 473.38880895404145,
+    "latency_ms_p95": 547.8381673281547,
+    "request_throughput_per_second": 8.689374,
+    "requests": 40,
+    "successful": 40,
+    "ttft_ms_p50": 37.78192651225254,
+    "ttft_ms_p95": 82.03523288248107
+  },
+  "highest_sampled_gpu_memory_mib": 14798,
+  "model": "qwen-enterprise-agent",
+  "schema_version": "qwen-local-benchmark-summary-v1"
+}

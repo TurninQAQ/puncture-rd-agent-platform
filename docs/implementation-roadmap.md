@@ -8,7 +8,10 @@
 
 用真实 Qwen/vLLM 替换 Mock；保持客户端和响应契约不变。
 
-状态：代码与部署资产已完成离线验收；目标 GPU 现场启动与性能证据待执行。
+状态：代码与部署资产已完成离线验收；2026-07-15 已在单张 RTX 4090 上用
+Qwen2.5-3B/vLLM 0.9.1 完成真实启动、四能力 smoke、5 项 live gateway 测试和并发
+1/4 基准。该[本机现场证据](../deploy/qwen-vllm/evidence/local-rtx4090-validation.md)
+不是默认 v0.25.0 镜像、目标生产 GPU/集群、长时 soak 或生产 SLA 的批准记录。
 
 ## Phase 2: RAG
 

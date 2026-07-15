@@ -90,10 +90,9 @@ class LiveVllmGatewayTests(unittest.TestCase):
                 messages=(
                     ChatMessage(
                         role="user",
-                        content=(
-                            "You must call lookup_component exactly once with "
-                            "component_id equal to CHIP-001. Do not answer in text."
-                        ),
+                        # This remains an autonomous tool-choice check: the
+                        # provider-specific request does not force a tool.
+                        content="Use the available function to look up component CHIP-001.",
                     ),
                 ),
                 tools=(tool,),

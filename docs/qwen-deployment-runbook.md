@@ -397,6 +397,12 @@ queue growth, schema-validity regression, and repeated model-protocol errors.
 
 Every row is required unless explicitly marked deployment-specific.
 
+The repository includes one explicitly non-production workstation record at
+[`deploy/qwen-vllm/evidence/local-rtx4090-validation.md`](../deploy/qwen-vllm/evidence/local-rtx4090-validation.md).
+It demonstrates the verification workflow against its exact image, model, and
+single-GPU configuration; it must not be reused as approval evidence for a
+different image, checkpoint, driver, host, or production traffic profile.
+
 | Layer | Test | Pass condition | Evidence |
 |---|---|---|---|
 | Offline | deployment asset unit tests | all pass without Docker/GPU/network | test log |
