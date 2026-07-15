@@ -277,6 +277,43 @@ class DeploymentAssetTests(unittest.TestCase):
             ):
                 self.assertIn(expected, arguments)
 
+    def test_entrypoint_omits_hugging_face_revision_for_local_model_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            capture_file = temporary / "arguments.json"
+            fake_vllm = temporary / "vllm"
+            fake_vllm.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "open(os.environ['CAPTURE_FILE'], 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            fake_vllm.chmod(0o755)
+            environment = self.clean_environment()
+            environment.update(
+                {
+                    "PATH": f"{temporary}:{environment['PATH']}",
+                    "CAPTURE_FILE": str(capture_file),
+                    "VLLM_MODEL_ID": "/models/huggingface/Qwen2.5-3B-Instruct",
+                    "VLLM_MODEL_REVISION": "local-snapshot-sha256",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(DEPLOY_DIR / "entrypoint.sh")],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            arguments = json.loads(capture_file.read_text(encoding="utf-8"))
+            self.assertIn("/models/huggingface/Qwen2.5-3B-Instruct", arguments)
+            self.assertNotIn("--revision", arguments)
+            self.assertIn("Using local model path; omitting Hugging Face --revision", result.stderr)
+            self.assertIn("identity=local-snapshot-sha256", result.stderr)
+
     def test_entrypoint_accepts_empty_bootstrap_secret_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)

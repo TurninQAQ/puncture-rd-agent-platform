@@ -147,6 +147,15 @@ Mandatory production changes:
 6. choose the structured-output flag style only after checking `serve --help`;
 7. inject API credentials outside Git.
 
+For a checkpoint copied into the mounted model cache, set `VLLM_MODEL_ID` to its
+absolute path inside the container (for example,
+`/models/huggingface/Qwen2.5-3B-Instruct`). The entrypoint deliberately omits the
+Hugging Face `--revision` flag for an absolute local path because no remote
+revision is resolved in that mode. `VLLM_MODEL_REVISION` remains mandatory as an
+operator-recorded identity: set it to the approved source revision or manifest
+hash and record checksums for every local weight file. A mutable directory named
+`main` is not an immutable production identity.
+
 For local bootstrap, `VLLM_API_KEY` may be exported in the shell:
 
 ```bash

@@ -47,7 +47,6 @@ args=(
   vllm serve "$VLLM_MODEL_ID"
   --host 0.0.0.0
   --port "$VLLM_CONTAINER_PORT"
-  --revision "$VLLM_MODEL_REVISION"
   --served-model-name "$VLLM_SERVED_MODEL_NAME"
   --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
   --max-model-len "$VLLM_MAX_MODEL_LEN"
@@ -61,6 +60,14 @@ args=(
   --cpu-offload-gb "${VLLM_CPU_OFFLOAD_GB:-0}"
   --uvicorn-log-level "${VLLM_UVICORN_LOG_LEVEL:-info}"
 )
+
+# Local absolute model directories do not use Hugging Face --revision.
+# Remote repo IDs keep the immutable revision pin.
+if [[ "$VLLM_MODEL_ID" != /* ]]; then
+  args+=(--revision "$VLLM_MODEL_REVISION")
+else
+  echo "Using local model path; omitting Hugging Face --revision (identity=${VLLM_MODEL_REVISION})" >&2
+fi
 
 if [[ -n "${VLLM_MAX_NUM_BATCHED_TOKENS:-}" ]]; then
   require_integer VLLM_MAX_NUM_BATCHED_TOKENS
