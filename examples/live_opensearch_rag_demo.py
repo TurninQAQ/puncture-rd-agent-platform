@@ -90,6 +90,66 @@ def build_seed_documents(
             "metadata": {"category": "approved", "language": "en"},
         },
         {
+            "document_id": "live-demo-path-planning-v1",
+            "chunk_id": "live-demo-path-planning-v1-chunk-0",
+            "parent_id": "live-demo-path-planning-v1-parent-0",
+            "title": "Synthetic Candidate Path Planning Rule",
+            "module": "path_planning",
+            "access_scopes": ["team-a"],
+            "section_path": ["Planning", "Candidate Paths"],
+            "text": (
+                "Candidate needle paths must preserve configured clearance and length "
+                "constraints before deterministic safety evaluation."
+            ),
+            "owner": "planning-platform-team",
+            "metadata": {"category": "approved", "language": "en"},
+        },
+        {
+            "document_id": "live-demo-safety-evaluation-v1",
+            "chunk_id": "live-demo-safety-evaluation-v1-chunk-0",
+            "parent_id": "live-demo-safety-evaluation-v1-parent-0",
+            "title": "Synthetic Path Safety Evaluation Rule",
+            "module": "safety_evaluation",
+            "access_scopes": ["team-a"],
+            "section_path": ["Safety", "Full Path"],
+            "text": (
+                "Full-path safety evaluation checks every candidate against the "
+                "configured danger masks; the language model cannot mark a path safe."
+            ),
+            "owner": "safety-platform-team",
+            "metadata": {"category": "approved", "language": "en"},
+        },
+        {
+            "document_id": "live-demo-data-validation-v1",
+            "chunk_id": "live-demo-data-validation-v1-chunk-0",
+            "parent_id": "live-demo-data-validation-v1-parent-0",
+            "title": "Synthetic MCS and NIfTI Validation Rule",
+            "module": "data_validation",
+            "access_scopes": ["team-a"],
+            "section_path": ["Data", "Geometry"],
+            "text": (
+                "MCS and NIfTI inputs must preserve spacing, origin, direction, label "
+                "schema, and geometry fingerprints before segmentation runs."
+            ),
+            "owner": "case-data-team",
+            "metadata": {"category": "approved", "language": "en"},
+        },
+        {
+            "document_id": "live-demo-segmentation-v1",
+            "chunk_id": "live-demo-segmentation-v1-chunk-0",
+            "parent_id": "live-demo-segmentation-v1-parent-0",
+            "title": "Synthetic Segmentation Quality Rule",
+            "module": "segmentation",
+            "access_scopes": ["team-a"],
+            "section_path": ["Segmentation", "Quality"],
+            "text": (
+                "Segmentation quality control verifies required labels, output geometry, "
+                "and non-empty masks before publishing a versioned artifact."
+            ),
+            "owner": "segmentation-platform-team",
+            "metadata": {"category": "approved", "language": "en"},
+        },
+        {
             "document_id": "live-demo-restricted-v1",
             "chunk_id": "live-demo-restricted-v1-chunk-0",
             "parent_id": "live-demo-restricted-v1-parent-0",

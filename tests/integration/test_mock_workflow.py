@@ -8,11 +8,20 @@ from puncture_agent.runtime import (
     RunRequest,
     RunStatus,
 )
+from puncture_agent.model_gateway import MockQwenGateway
+from puncture_agent.rag import MockRagService
 
 
 class IntegratedMockWorkflowTests(unittest.TestCase):
     def test_data_workflow_composes_model_rag_graph_tools_and_verifier(self) -> None:
-        executor = IntegratedMockExecutor()
+        model_gateway = MockQwenGateway()
+        rag_service = MockRagService.from_default_fixture()
+        executor = IntegratedMockExecutor(
+            model_gateway=model_gateway,
+            rag_service=rag_service,
+        )
+        self.assertIs(model_gateway, executor.model_gateway)
+        self.assertIs(rag_service, executor.rag_service)
         service = InMemoryRunService(executor)
         snapshot = service.create_run(
             RunRequest(

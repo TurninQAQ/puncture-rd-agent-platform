@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import os
-from typing import Mapping
+from typing import Callable, Mapping, Sequence
 from uuid import uuid4
 
 from fastapi import FastAPI
@@ -261,6 +261,8 @@ def create_postgres_app(
     artifact_gateway: ArtifactAccessGateway | None = None,
     optional_health_probe: HealthProbe | None = None,
     metrics: HttpMetrics | None = None,
+    additional_startup_hooks: Sequence[Callable[[], None]] = (),
+    additional_shutdown_hooks: Sequence[Callable[[], None]] = (),
 ) -> FastAPI:
     """Compose FastAPI with PostgreSQL Run persistence and injected execution.
 
@@ -302,8 +304,14 @@ def create_postgres_app(
     startup_hooks = []
     if settings.migrate_on_startup:
         startup_hooks.append(repository.migrate)
+    startup_hooks.extend(additional_startup_hooks)
     if worker is not None:
         startup_hooks.append(worker.start)
+    # ``create_app`` unwinds shutdown hooks in reverse order.  Keep dependent
+    # resources before the worker here so the worker stops before they close.
+    shutdown_hooks = list(additional_shutdown_hooks)
+    if worker is not None:
+        shutdown_hooks.append(worker.stop)
     app = create_app(
         service,
         authenticator=authenticator,
@@ -320,7 +328,7 @@ def create_postgres_app(
         additional_metrics=(worker.metrics,) if worker is not None else (),
         max_request_body_bytes=settings.max_request_body_bytes,
         startup_hooks=tuple(startup_hooks),
-        shutdown_hooks=(worker.stop,) if worker is not None else (),
+        shutdown_hooks=tuple(shutdown_hooks),
     )
     app.state.run_repository = repository
     app.state.run_service = service

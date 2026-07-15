@@ -1688,6 +1688,7 @@ class FastApiPostgresIntegrationTests(unittest.TestCase):
         authorizer = _Authorizer()
         artifacts = _ArtifactGateway()
         executor = ScenarioExecutor()
+        lifecycle_calls = []
         settings = PostgresApiSettings(
             connection_string=POSTGRES_DSN,
             schema=schema,
@@ -1712,9 +1713,12 @@ class FastApiPostgresIntegrationTests(unittest.TestCase):
             authenticator=authenticator,
             authorizer=authorizer,
             artifact_gateway=artifacts,
+            additional_startup_hooks=(lambda: lifecycle_calls.append("startup"),),
+            additional_shutdown_hooks=(lambda: lifecycle_calls.append("shutdown"),),
         )
         try:
             with TestClient(app, raise_server_exceptions=False) as client:
+                self.assertEqual(["startup"], lifecycle_calls)
                 body = FastApiTransportTests._body(key="postgres-http")
                 first = client.post(
                     "/api/v1/runs",
@@ -1767,6 +1771,7 @@ class FastApiPostgresIntegrationTests(unittest.TestCase):
                     {"status": "DOWN"},
                     client.get("/health").json(),
                 )
+            self.assertEqual(["startup", "shutdown"], lifecycle_calls)
             self.assertEqual(WorkerState.STOPPED, app.state.run_worker.status.state)
         finally:
             with psycopg.connect(POSTGRES_DSN, autocommit=True) as connection:

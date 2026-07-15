@@ -238,6 +238,31 @@ app = create_postgres_app(
 The example names are integration placeholders, not implementations shipped by
 this repository.
 
+## Runnable local full-stack composition
+
+`deploy/local-demo` is the explicit workstation composition for learning and
+integration verification. After PostgreSQL, Qwen/vLLM, and OpenSearch are up,
+copy its `.env.example`, keep the resulting file at mode 0600, review the
+synthetic boundary, and run:
+
+```bash
+./deploy/local-demo/run_demo.sh
+```
+
+The temporary loopback API uses the real PostgreSQL repository, vLLM gateway,
+OpenSearch adapter, JSON event API, and SSE replay. The integrated executor's
+model and RAG ports are injected with those live clients; its algorithm tools
+remain deterministic synthetic implementations. The script validates both
+fixed workflows, bad-token rejection, idempotent creation, event evidence, and
+clean SIGTERM shutdown. Exact setup and results are in
+`deploy/local-demo/README.md` and
+`deploy/local-demo/evidence/local-full-stack-validation.md`.
+
+This profile deliberately forces synchronous execution and has no Artifact
+Access Gateway, so `/health` is `DEGRADED`. It is not a substitute for the
+recovery-safe worker topology, OIDC/IAM, API TLS, company algorithms, or a
+production performance run.
+
 ## Privacy and operational behavior
 
 - API error handlers never return Pydantic input, exception text, tokens,

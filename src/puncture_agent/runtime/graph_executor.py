@@ -14,8 +14,13 @@ from puncture_agent.agent import (
     build_mock_handlers,
 )
 from puncture_agent.agent.runtime import NodeOutcome
-from puncture_agent.model_gateway import ChatMessage, MockQwenGateway, ModelRequest
-from puncture_agent.rag import MockRagService, RetrievalRequest
+from puncture_agent.model_gateway import (
+    ChatMessage,
+    MockQwenGateway,
+    ModelGateway,
+    ModelRequest,
+)
+from puncture_agent.rag import MockRagService, RagService, RetrievalRequest
 
 from .models import ApprovalDecision, EventType, ExecutionOutcome, RunRequest, RunStatus
 from .service import Emit
@@ -29,11 +34,16 @@ class IntegratedMockExecutor:
     contracts can be connected before each production module is implemented.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        model_gateway: ModelGateway | None = None,
+        rag_service: RagService | None = None,
+    ) -> None:
         project_root = Path(__file__).resolve().parents[3]
         self._graph_path = project_root / "graph" / "main_graph.json"
-        self.model_gateway = MockQwenGateway()
-        self.rag_service = MockRagService.from_default_fixture()
+        self.model_gateway = model_gateway or MockQwenGateway()
+        self.rag_service = rag_service or MockRagService.from_default_fixture()
         self.last_state: AgentState | None = None
         self.last_model_response: Any = None
         self.last_rag_response: Any = None

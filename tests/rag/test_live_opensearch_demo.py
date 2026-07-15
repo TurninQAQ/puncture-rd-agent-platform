@@ -29,12 +29,23 @@ class LiveOpenSearchRagDemoTests(unittest.TestCase):
         embedding = DeterministicEmbeddingBackend(dimension=64)
         documents = demo.build_seed_documents(embedding)
 
-        self.assertEqual(4, len(documents))
+        self.assertEqual(12, len(documents))
         children = [document for document in documents if document["doc_kind"] == "child"]
         parents = [document for document in documents if document["doc_kind"] == "parent"]
-        self.assertEqual(2, len(children))
-        self.assertEqual(2, len(parents))
-        self.assertEqual(2, len({document["chunk_id"] for document in children}))
+        self.assertEqual(6, len(children))
+        self.assertEqual(6, len(parents))
+        self.assertEqual(6, len({document["chunk_id"] for document in children}))
+        self.assertEqual(
+            {
+                "data_validation",
+                "path_planning",
+                "planning_safety",
+                "safety_evaluation",
+                "segmentation",
+                "yield_analysis",
+            },
+            {str(document["module"]) for document in children},
+        )
         for document in children:
             self.assertEqual("active", document["status"])
             self.assertEqual(64, len(document["embedding"]))

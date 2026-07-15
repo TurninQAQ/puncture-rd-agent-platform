@@ -39,7 +39,21 @@ python3 examples/local_rag_demo.py
 python3 examples/local_mcp_demo.py
 ```
 
-当前本地 Python 3.10 无生产依赖基线执行 695 项测试，636 项通过、59 项门控跳过；安装固定 FastAPI 0.115.12/Pydantic 2.13.4/LangGraph 1.2.9/psycopg/MCP 依赖并连接 PostgreSQL 16 后，同一套测试为 689 项通过、6 项环境互斥门控跳过；再连接本机真实 Qwen/vLLM 后达到 694 项通过、仅 1 项“依赖已安装”反向测试按设计跳过。
+生产依赖与三个本地服务就绪后，可运行真实 HTTP 组合演示：
+
+```bash
+cp deploy/local-demo/.env.example deploy/local-demo/.env
+chmod 600 deploy/local-demo/.env
+# 填写本机 PostgreSQL DSN、OpenSearch 密码/CA 文件路径并显式启用 opt-in
+./deploy/local-demo/run_demo.sh
+```
+
+该入口实际连接 FastAPI、PostgreSQL、Qwen/vLLM、OpenSearch、Agent 图与 SSE，
+同时保留确定性合成算法工具；边界、配置和现场结果见
+[本地全栈说明](deploy/local-demo/README.md)与
+[本机现场证据](deploy/local-demo/evidence/local-full-stack-validation.md)。
+
+当前本地 Python 3.10 无生产依赖基线执行 701 项测试，642 项通过、59 项门控跳过；安装固定 FastAPI 0.115.12/Pydantic 2.13.4/LangGraph 1.2.9/psycopg/MCP 依赖并连接 PostgreSQL 16 后，同一套测试为 695 项通过、6 项环境互斥门控跳过；再连接本机真实 Qwen/vLLM 后达到 700 项通过、仅 1 项“依赖已安装”反向测试按设计跳过。
 
 graph/eval 定向套件分别为 135 项（128 通过、6 项 PostgreSQL 和 1 项反向依赖门控跳过）和 10 项全通过，其中 10 项测试实际执行真实 `StateGraph`（9 项 graph 集成/故障测试和 1 项 Eval）。完整关键失败矩阵与 20 路并发隔离现已在真实 `StateGraph` 上验证，确定性的 Fake API 仍保留为快速参考门。14 项租约测试覆盖 SQLite 双 manager 竞争/续租/过期接管、PostgreSQL 参数化 advisory-lock 协议、跨 Runtime `run/resume/stream` 互斥、不同 thread 并行和 lease-lost 人工核对路径；新增 9 项 API Run worker 测试覆盖 heartbeat、TTL reclaim、停机 grace、supervisor 故障和重复 owner 防御。可信 Artifact 校验测试覆盖输入/输出的 case、状态、类型、完整几何、生产者版本和直接父链。5 项 PostgreSQL checkpoint benchmark 合同测试固定 P50 median/P95 nearest-rank、50/150 ms 阈值、阶段计时、无秘密 schema 和缺 DSN fail-closed 行为。
 
