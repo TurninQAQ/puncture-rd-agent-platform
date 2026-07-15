@@ -58,6 +58,9 @@ was made mandatory in `run_demo.sh`.
   both retrievals ran through the production OpenSearch search adapter.
 - No company document, patient data, image volume, or proprietary algorithm was
   used.
+- The final configured repository regression ran 701 tests in 43.272 seconds:
+  700 passed and the single reverse dependency-presence test skipped by design.
+  PostgreSQL composition and all five live vLLM tests executed in that run.
 
 ## Deliberate limitations
 

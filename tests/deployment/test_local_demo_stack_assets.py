@@ -192,6 +192,13 @@ class LocalDemoStackAssetTests(unittest.TestCase):
             "deploy/local-demo/doctor.py --quiet",
             (DEPLOY / "run_demo.sh").read_text(encoding="utf-8"),
         )
+        root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for name in (
+            "learning-and-interview-guide.md",
+            "project-status.md",
+        ):
+            self.assertTrue((ROOT / "docs" / name).is_file())
+            self.assertIn(f"docs/{name}", root_readme)
 
 
 if __name__ == "__main__":

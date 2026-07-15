@@ -114,3 +114,8 @@ evidence.
 
 Delete only the local schema and ignored files when you deliberately want a
 fresh demonstration. Never point the demo at a shared production schema.
+
+After the first successful round trip, follow the repository's
+`docs/learning-and-interview-guide.md` to trace the request through the model,
+RAG, graph, PostgreSQL events, and SSE instead of treating the JSON as a black
+box.
